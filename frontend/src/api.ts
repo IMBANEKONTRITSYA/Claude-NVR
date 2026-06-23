@@ -76,6 +76,8 @@ export const api = {
   users: () => req("/api/users"),
   userAdd: (b: any) => req("/api/users", { method: "POST", body: JSON.stringify(b) }),
   userDel: (id: number) => req(`/api/users/${id}`, { method: "DELETE" }),
+  getSettings: () => req("/api/settings"),
+  putSettings: (b: any) => req("/api/settings", { method: "PUT", body: JSON.stringify(b) }),
 };
 
 export function mediaUrl(rel: string | null | undefined): string {

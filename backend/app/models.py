@@ -59,3 +59,9 @@ class VideoSegment(Base):
     file_path: Mapped[str] = mapped_column(String(500))
     event_type: Mapped[str] = mapped_column(String(20))  # motion|face
     duration_sec: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class Setting(Base):
+    __tablename__ = "settings"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(255))

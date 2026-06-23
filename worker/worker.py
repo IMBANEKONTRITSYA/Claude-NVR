@@ -34,17 +34,47 @@ FERNET_KEY = os.environ.get("RTSP_ENCRYPTION_KEY", "ZmFjZXdhdGNoLWRldi1rZXktMzJi
 MEDIAMTX_HOST = os.environ.get("MEDIAMTX_HOST", "mediamtx")
 MEDIAMTX_PORT = int(os.environ.get("MEDIAMTX_PORT", "8554"))
 
-TARGET_FPS = 5
-SIM_THRESHOLD = 0.45            # 1 - cosine_similarity; ниже — совпадение
 DBSCAN_EPS = 0.35
 DBSCAN_MIN_SAMPLES = 3
 SEGMENT_MAX_SEC = 60
+
+# Рантайм-конфиг, обновляется из таблицы settings (см. refresh_config)
+CONFIG = {
+    "retention_days": RETENTION_DAYS,
+    "motion_threshold": 1500,
+    "similarity_threshold": 0.45,   # 1 - cosine_similarity; ниже — совпадение
+    "detection_fps": 5,
+}
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 Session = sessionmaker(bind=engine)
 Base = declarative_base()
 fernet = Fernet(FERNET_KEY.encode())
 r = redis.from_url(REDIS_URL, decode_responses=True)
+
+
+class Setting(Base):
+    __tablename__ = "settings"
+    key = Column(String, primary_key=True)
+    value = Column(String)
+
+
+def refresh_config():
+    """Подтягивает настройки из БД в CONFIG (вызывается периодически из manager)."""
+    try:
+        with Session() as s:
+            rows = s.execute(select(Setting)).scalars().all()
+            for row in rows:
+                if row.key == "retention_days":
+                    CONFIG["retention_days"] = int(row.value)
+                elif row.key == "motion_threshold":
+                    CONFIG["motion_threshold"] = int(row.value)
+                elif row.key == "similarity_threshold":
+                    CONFIG["similarity_threshold"] = float(row.value)
+                elif row.key == "detection_fps":
+                    CONFIG["detection_fps"] = int(row.value)
+    except Exception as e:
+        print(f"[worker] не удалось прочитать настройки: {e}", flush=True)
 
 
 class Camera(Base):
@@ -155,7 +185,7 @@ def find_or_create_person(s, emb: np.ndarray) -> tuple[int, bool]:
         "SELECT id, 1 - (centroid <=> CAST(:e AS vector)) AS sim FROM persons "
         "WHERE centroid IS NOT NULL ORDER BY centroid <=> CAST(:e AS vector) LIMIT 1"
     ), {"e": str(emb.tolist())}).first()
-    if res and res.sim is not None and (1 - res.sim) < SIM_THRESHOLD:
+    if res and res.sim is not None and (1 - res.sim) < CONFIG["similarity_threshold"]:
         return res.id, True
     p = Person(name="", status="unknown", centroid=emb.tolist(), created_at=datetime.utcnow())
     s.add(p)
@@ -203,7 +233,6 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
     last_proc = 0.0
     last_latest_save = 0.0
     last_roi_reload = 0.0
-    interval = 1.0 / TARGET_FPS
     roi = reload_roi(cam_id)
     roi_mask = None
     roi_mask_shape = None
@@ -232,6 +261,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
             republish = start_republish(cam_id, rtsp_url)
 
         now = time.time()
+        interval = 1.0 / max(1, CONFIG["detection_fps"])
         if now - last_proc < interval:
             if writer:
                 writer.write(frame)
@@ -257,7 +287,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
             small_mask = cv2.resize(roi_mask, (640, 360), interpolation=cv2.INTER_NEAREST)
             fg = cv2.bitwise_and(fg, fg, mask=small_mask)
         motion_pixels = int(np.count_nonzero(fg))
-        motion = motion_pixels > 1500
+        motion = motion_pixels > CONFIG["motion_threshold"]
 
         faces = []
         try:
@@ -399,7 +429,7 @@ def recluster_unknowns():
 
 
 def cleanup_old():
-    cutoff = datetime.utcnow() - timedelta(days=RETENTION_DAYS)
+    cutoff = datetime.utcnow() - timedelta(days=CONFIG["retention_days"])
     with Session() as s:
         old = s.execute(select(VideoSegment).where(VideoSegment.started_at < cutoff)).scalars().all()
         for seg in old:
@@ -441,8 +471,12 @@ def manager():
     last_cleanup = 0.0
     last_recluster = 0.0
 
+    refresh_config()
+    print(f"[worker] конфиг: {CONFIG}", flush=True)
+
     while True:
         try:
+            refresh_config()
             with Session() as s:
                 cams = s.execute(select(Camera).where(Camera.enabled == True)).scalars().all()
                 for cam in cams:

@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     ADMIN_PASSWORD: str = "admin"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 12
     WORKER_URL: str = "http://worker:9000"
+    RETENTION_DAYS_DEFAULT: int = 30
 
     class Config:
         env_file = ".env"

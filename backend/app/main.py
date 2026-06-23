@@ -14,6 +14,7 @@ from .routers import auth as r_auth, users as r_users, cameras as r_cameras
 from .routers import persons as r_persons, events as r_events, archive as r_archive
 from .routers import stats as r_stats, reports as r_reports, ws as r_ws
 from .routers import search as r_search
+from .routers import settings as r_settings
 
 
 @asynccontextmanager
@@ -32,11 +33,35 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE face_events ADD COLUMN IF NOT EXISTS enhanced boolean DEFAULT false"
         ))
+        # HNSW-индексы pgvector для быстрого поиска по эмбеддингам (≤5с на 100k лиц)
+        for stmt in (
+            "CREATE INDEX IF NOT EXISTS idx_face_events_embedding ON face_events "
+            "USING hnsw (embedding vector_cosine_ops)",
+            "CREATE INDEX IF NOT EXISTS idx_persons_centroid ON persons "
+            "USING hnsw (centroid vector_cosine_ops)",
+        ):
+            try:
+                await conn.execute(text(stmt))
+            except Exception as e:
+                print(f"[startup] не удалось создать HNSW-индекс: {e}", flush=True)
     async with SessionLocal() as db:
         r = await db.execute(select(User).where(User.username == "admin"))
         if not r.scalar_one_or_none():
             db.add(User(username="admin", password_hash=hash_password(settings.ADMIN_PASSWORD), role="admin"))
             await db.commit()
+        # Сид системных настроек по умолчанию
+        from .models import Setting
+        defaults = {
+            "retention_days": str(settings.RETENTION_DAYS_DEFAULT),
+            "motion_threshold": "1500",
+            "similarity_threshold": "0.45",
+            "detection_fps": "5",
+        }
+        existing = {s.key for s in (await db.execute(select(Setting))).scalars().all()}
+        for k, v in defaults.items():
+            if k not in existing:
+                db.add(Setting(key=k, value=v))
+        await db.commit()
     yield
 
 
@@ -59,6 +84,7 @@ app.include_router(r_archive.router)
 app.include_router(r_stats.router)
 app.include_router(r_reports.router)
 app.include_router(r_search.router)
+app.include_router(r_settings.router)
 app.include_router(r_ws.router)
 
 
