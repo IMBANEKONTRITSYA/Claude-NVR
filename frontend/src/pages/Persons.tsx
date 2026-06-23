@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, mediaUrl } from "../api";
+import { useWebSocket } from "../useWebSocket";
 
 export function Persons() {
   const [persons, setPersons] = useState<any[]>([]);
@@ -7,12 +8,25 @@ export function Persons() {
   const [sel, setSel] = useState<any | null>(null);
   const [gallery, setGallery] = useState<any[]>([]);
   const [mergeTarget, setMergeTarget] = useState<number | null>(null);
+  const [enhMsg, setEnhMsg] = useState("");
+  const selRef = useRef<any>(null);
+  selRef.current = sel;
 
   const load = () => api.persons(filter || undefined).then(setPersons).catch(() => {});
   useEffect(() => { load(); }, [filter]);
 
+  // Обновляем галерею/аватар при готовности апскейла
+  useWebSocket("/ws/faces", (msg) => {
+    if (msg.type !== "enhanced") return;
+    if (selRef.current && msg.person_id === selRef.current.id) {
+      api.personGallery(selRef.current.id).then(setGallery).catch(() => {});
+    }
+    load();
+  });
+
   const open = async (p: any) => {
     setSel(p);
+    setEnhMsg("");
     setGallery(await api.personGallery(p.id));
   };
 
@@ -22,6 +36,14 @@ export function Persons() {
     const u = await api.personUpdate(sel.id, { name });
     setSel(u);
     load();
+  };
+
+  const enhance = async () => {
+    setEnhMsg("Поставлено в очередь...");
+    try {
+      const r = await api.personEnhance(sel.id);
+      setEnhMsg(`В очереди на улучшение: ${r.queued} снимков`);
+    } catch (e: any) { setEnhMsg(`Ошибка: ${e.message}`); }
   };
 
   const merge = async () => {
@@ -64,13 +86,18 @@ export function Persons() {
               <div className="muted">ID {sel.id} · {sel.status}</div>
               <div className="row" style={{ marginTop: 8 }}>
                 <button className="btn" onClick={rename}>Назначить имя</button>
+                <button className="btn secondary" onClick={enhance}>Улучшить качество</button>
                 <input type="number" placeholder="ID для слияния" value={mergeTarget ?? ""} onChange={e => setMergeTarget(parseInt(e.target.value) || null)} style={{ width: 160 }} />
                 <button className="btn secondary" onClick={merge} disabled={!mergeTarget}>Слить</button>
               </div>
+              {enhMsg && <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>{enhMsg}</div>}
               <h4 style={{ marginTop: 16 }}>Галерея ({gallery.length})</h4>
               <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(90px, 1fr))" }}>
                 {gallery.map(g => (
-                  <img key={g.id} src={mediaUrl(g.snapshot_path)} style={{ width: "100%", aspectRatio: "1/1", objectFit: "cover", borderRadius: 4 }} />
+                  <div key={g.id} style={{ position: "relative" }}>
+                    <img src={mediaUrl(g.snapshot_path)} style={{ width: "100%", aspectRatio: "1/1", objectFit: "cover", borderRadius: 4 }} />
+                    {g.enhanced && <span style={{ position: "absolute", top: 2, right: 2, fontSize: 9, background: "var(--green)", color: "#000", padding: "0 4px", borderRadius: 3 }}>HD</span>}
+                  </div>
                 ))}
               </div>
             </>

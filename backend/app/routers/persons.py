@@ -1,3 +1,4 @@
+import json
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, update, func
@@ -5,6 +6,7 @@ from ..db import get_db
 from ..models import Person, FaceEvent
 from ..auth import require_role
 from ..schemas import PersonOut, PersonUpdate
+from ..services.pubsub import get_redis
 
 router = APIRouter(prefix="/api/persons", tags=["persons"])
 
@@ -62,9 +64,25 @@ async def merge_persons(src_id: int, dst_id: int, _=Depends(require_role("admin"
 @router.get("/{pid}/gallery", response_model=list[dict])
 async def gallery(pid: int, limit: int = 50, _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
     r = await db.execute(
-        select(FaceEvent.id, FaceEvent.ts, FaceEvent.snapshot_path, FaceEvent.camera_id)
+        select(FaceEvent.id, FaceEvent.ts, FaceEvent.snapshot_path, FaceEvent.camera_id, FaceEvent.enhanced)
         .where(FaceEvent.person_id == pid)
         .order_by(FaceEvent.ts.desc())
         .limit(limit)
     )
-    return [{"id": x[0], "ts": x[1], "snapshot_path": x[2], "camera_id": x[3]} for x in r.all()]
+    return [{"id": x[0], "ts": x[1], "snapshot_path": x[2], "camera_id": x[3], "enhanced": x[4]} for x in r.all()]
+
+
+@router.post("/{pid}/enhance")
+async def enhance_person(pid: int, limit: int = 20, _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
+    """Принудительный нейросетевой апскейл снимков персоны (ставит в очередь)."""
+    person = await db.get(Person, pid)
+    if not person:
+        raise HTTPException(404, "Персона не найдена")
+    r = await db.execute(
+        select(FaceEvent.id).where(FaceEvent.person_id == pid).order_by(FaceEvent.ts.desc()).limit(limit)
+    )
+    ids = [x[0] for x in r.all()]
+    redis = get_redis()
+    for eid in ids:
+        await redis.lpush("upscale:queue", json.dumps({"event_id": eid, "force": True}))
+    return {"ok": True, "queued": len(ids)}

@@ -20,8 +20,12 @@ export function Wall() {
   }, []);
 
   useWebSocket("/ws/faces", (msg) => {
-    if (msg.type !== "face") return;
-    setItems(prev => pausedRef.current ? prev : [msg, ...prev].slice(0, 200));
+    if (msg.type === "face") {
+      setItems(prev => pausedRef.current ? prev : [msg, ...prev].slice(0, 200));
+    } else if (msg.type === "enhanced") {
+      // Подменяем фото на улучшенное по event_id
+      setItems(prev => prev.map(i => i.event_id === msg.event_id ? { ...i, snapshot: msg.snapshot } : i));
+    }
   });
 
   const ago = (iso: string) => {

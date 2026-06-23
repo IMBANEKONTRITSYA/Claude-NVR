@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi import HTTPException
 from jose import jwt, JWTError
-from sqlalchemy import select
+from sqlalchemy import select, text
 from .db import engine, Base, SessionLocal
 from .models import User
 from .auth import hash_password
@@ -13,6 +13,7 @@ from .config import settings
 from .routers import auth as r_auth, users as r_users, cameras as r_cameras
 from .routers import persons as r_persons, events as r_events, archive as r_archive
 from .routers import stats as r_stats, reports as r_reports, ws as r_ws
+from .routers import search as r_search
 
 
 @asynccontextmanager
@@ -21,8 +22,16 @@ async def lifespan(app: FastAPI):
     os.makedirs(os.path.join(settings.MEDIA_PATH, "snapshots"), exist_ok=True)
     os.makedirs(os.path.join(settings.MEDIA_PATH, "segments"), exist_ok=True)
     os.makedirs(os.path.join(settings.MEDIA_PATH, "avatars"), exist_ok=True)
+    os.makedirs(os.path.join(settings.MEDIA_PATH, "uploads"), exist_ok=True)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Лёгкие миграции для существующих БД (create_all не добавляет колонки)
+        await conn.execute(text(
+            "ALTER TABLE face_events ADD COLUMN IF NOT EXISTS orig_snapshot_path varchar(500)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE face_events ADD COLUMN IF NOT EXISTS enhanced boolean DEFAULT false"
+        ))
     async with SessionLocal() as db:
         r = await db.execute(select(User).where(User.username == "admin"))
         if not r.scalar_one_or_none():
@@ -49,6 +58,7 @@ app.include_router(r_events.router)
 app.include_router(r_archive.router)
 app.include_router(r_stats.router)
 app.include_router(r_reports.router)
+app.include_router(r_search.router)
 app.include_router(r_ws.router)
 
 

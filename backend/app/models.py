@@ -42,7 +42,9 @@ class FaceEvent(Base):
     camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="CASCADE"), index=True)
     person_id: Mapped[int | None] = mapped_column(ForeignKey("persons.id", ondelete="SET NULL"), nullable=True, index=True)
     ts: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
-    snapshot_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    snapshot_path: Mapped[str | None] = mapped_column(String(500), nullable=True)       # текущий лучший (улучшенный, если готов)
+    orig_snapshot_path: Mapped[str | None] = mapped_column(String(500), nullable=True)  # исходный скриншот
+    enhanced: Mapped[bool] = mapped_column(Boolean, default=False)                       # апскейл выполнен
     embedding: Mapped[list[float] | None] = mapped_column(Vector(512), nullable=True)
     bbox: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     is_known: Mapped[bool] = mapped_column(Boolean, default=False)

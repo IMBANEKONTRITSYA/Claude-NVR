@@ -12,6 +12,7 @@ const Archive = lazy(() => import("./pages/Archive").then(m => ({ default: m.Arc
 const ROI = lazy(() => import("./pages/ROI").then(m => ({ default: m.ROI })));
 const Users = lazy(() => import("./pages/Users").then(m => ({ default: m.Users })));
 const Reports = lazy(() => import("./pages/Reports").then(m => ({ default: m.Reports })));
+const Search = lazy(() => import("./pages/Search").then(m => ({ default: m.Search })));
 const Profile = lazy(() => import("./pages/Profile").then(m => ({ default: m.Profile })));
 
 function Layout({ children }: { children: any }) {
@@ -29,6 +30,7 @@ function Layout({ children }: { children: any }) {
           <NavLink to="/live">Камеры онлайн</NavLink>
           <NavLink to="/wall">Стена распознавания</NavLink>
           {can("admin", "operator") && <NavLink to="/persons">Карточки персон</NavLink>}
+          {can("admin", "operator") && <NavLink to="/search">Поиск по фото</NavLink>}
           {can("admin", "operator") && <NavLink to="/archive">Архив</NavLink>}
           {can("admin", "operator") && <NavLink to="/roi">Зоны детекции</NavLink>}
           {can("admin", "operator") && <NavLink to="/reports">Отчёты</NavLink>}
@@ -65,6 +67,7 @@ export function App() {
       <Route path="/archive" element={<Private roles={["admin", "operator"]}><Archive /></Private>} />
       <Route path="/roi" element={<Private roles={["admin", "operator"]}><ROI /></Private>} />
       <Route path="/reports" element={<Private roles={["admin", "operator"]}><Reports /></Private>} />
+      <Route path="/search" element={<Private roles={["admin", "operator"]}><Search /></Private>} />
       <Route path="/cameras" element={<Private roles={["admin"]}><Cameras /></Private>} />
       <Route path="/users" element={<Private roles={["admin"]}><Users /></Private>} />
       <Route path="/profile" element={<Private><Profile /></Private>} />

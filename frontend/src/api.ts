@@ -61,6 +61,8 @@ export const api = {
   personUpdate: (id: number, b: any) => req(`/api/persons/${id}`, { method: "PATCH", body: JSON.stringify(b) }),
   personMerge: (src: number, dst: number) => req(`/api/persons/${src}/merge/${dst}`, { method: "POST" }),
   personGallery: (id: number) => req(`/api/persons/${id}/gallery`),
+  personEnhance: (id: number) => req(`/api/persons/${id}/enhance`, { method: "POST" }),
+  searchFace: (form: FormData) => req("/api/search/face", { method: "POST", body: form }),
   events: (limit = 100) => req(`/api/events?limit=${limit}`),
   archive: (params: Record<string, string>) => {
     const q = new URLSearchParams(params).toString();

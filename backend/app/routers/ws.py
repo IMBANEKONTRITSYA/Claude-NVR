@@ -21,7 +21,7 @@ async def ws_faces(ws: WebSocket, token: str = Query(...)):
     await ws.accept()
     r = get_redis()
     pubsub = r.pubsub()
-    await pubsub.subscribe("faces:new")
+    await pubsub.subscribe("faces:new", "faces:enhanced")
     try:
         while True:
             msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30)
@@ -32,7 +32,7 @@ async def ws_faces(ws: WebSocket, token: str = Query(...)):
     except WebSocketDisconnect:
         pass
     finally:
-        await pubsub.unsubscribe("faces:new")
+        await pubsub.unsubscribe("faces:new", "faces:enhanced")
         await pubsub.close()
 
 

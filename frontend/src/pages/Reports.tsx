@@ -2,23 +2,32 @@ import { useState } from "react";
 import { getToken } from "../api";
 
 export function Reports() {
-  const [days, setDays] = useState(7);
-  const url = (ext: string) => `/api/reports/appearances.${ext}?days=${days}&token=${getToken()}`;
+  const [days, setDays] = useState(30);
+  const url = (name: string, ext: string) => `/api/reports/${name}.${ext}?days=${days}&token=${getToken()}`;
+
+  const Block = ({ title, desc, name }: { title: string; desc: string; name: string }) => (
+    <div className="card" style={{ marginBottom: 12 }}>
+      <h3 style={{ marginTop: 0 }}>{title}</h3>
+      <p className="muted" style={{ marginTop: 0 }}>{desc}</p>
+      <div className="row">
+        <a className="btn" href={url(name, "xlsx")}>Excel</a>
+        <a className="btn secondary" href={url(name, "csv")}>CSV</a>
+      </div>
+    </div>
+  );
 
   return (
     <div>
       <h2>Отчёты</h2>
-      <div className="card">
-        <p>История появлений за период.</p>
-        <div className="toolbar">
-          <label style={{ margin: 0 }}>Дней:&nbsp;
-            <input type="number" min={1} max={365} value={days} onChange={e => setDays(parseInt(e.target.value) || 7)} style={{ width: 100 }} />
-          </label>
-          <a className="btn" href={url("xlsx")}>Скачать Excel</a>
-          <a className="btn secondary" href={url("csv")}>Скачать CSV</a>
-        </div>
-        <p className="muted">Примечание: текущая ссылка использует токен в query — оптимально для внутренней сети.</p>
+      <div className="toolbar">
+        <label style={{ margin: 0 }}>Период (дней):&nbsp;
+          <input type="number" min={1} max={365} value={days} onChange={e => setDays(parseInt(e.target.value) || 30)} style={{ width: 100 }} />
+        </label>
       </div>
+      <Block title="История появлений" desc="Все события обнаружения лиц: время, камера, персона." name="appearances" />
+      <Block title="Сводка по персонам" desc="Число появлений, первое и последнее обнаружение по каждой персоне." name="persons" />
+      <Block title="Активность по камерам" desc="Количество обнаружений и уникальных персон по каждой камере." name="cameras" />
+      <p className="muted">Результаты поиска по фото экспортируются кнопкой «Экспорт CSV» на странице «Поиск по фото».</p>
     </div>
   );
 }

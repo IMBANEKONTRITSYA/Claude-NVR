@@ -318,6 +318,8 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
                     person_id=pid,
                     ts=datetime.utcnow(),
                     snapshot_path=snap_rel,
+                    orig_snapshot_path=snap_rel,
+                    enhanced=False,
                     embedding=emb.tolist(),
                     bbox={"x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3]},
                     is_known=(person.status == "known"),
@@ -342,6 +344,8 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
                         "frame_w": fw,
                         "frame_h": fh,
                     }))
+                    # Ставим скриншот в очередь на нейросетевой апскейл (асинхронно)
+                    r.lpush("upscale:queue", json.dumps({"event_id": ev.id}))
                 except Exception:
                     pass
 
@@ -424,6 +428,14 @@ def manager():
     print("[worker] загрузка модели InsightFace...", flush=True)
     face_app = load_face_app()
     print("[worker] модель готова", flush=True)
+
+    # Внутренний HTTP-API для извлечения эмбеддинга (поиск по фото)
+    try:
+        from embed_api import start_embed_api
+        start_embed_api(face_app, port=9000)
+        print("[worker] embed-API запущен на :9000", flush=True)
+    except Exception as e:
+        print(f"[worker] не удалось запустить embed-API: {e}", flush=True)
 
     threads: dict[int, threading.Thread] = {}
     last_cleanup = 0.0

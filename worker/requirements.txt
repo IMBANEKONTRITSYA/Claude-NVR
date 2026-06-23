@@ -9,3 +9,6 @@ redis==5.0.8
 cryptography==43.0.1
 scikit-learn==1.5.2
 pillow==10.4.0
+fastapi==0.115.0
+uvicorn==0.30.6
+python-multipart==0.0.9

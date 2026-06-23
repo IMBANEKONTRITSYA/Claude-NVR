@@ -10,6 +10,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY worker.py .
+COPY worker.py embed_api.py ./
 
 CMD ["python", "worker.py"]

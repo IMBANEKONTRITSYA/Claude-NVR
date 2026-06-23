@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     MEDIA_PATH: str = "/media"
     ADMIN_PASSWORD: str = "admin"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 12
+    WORKER_URL: str = "http://worker:9000"
 
     class Config:
         env_file = ".env"

@@ -51,6 +51,7 @@ services:
       RTSP_ENCRYPTION_KEY: ${RTSP_ENCRYPTION_KEY:-changeme-fernet-key-32bytes-base64=}
       MEDIA_PATH: /media
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      WORKER_URL: http://worker:9000
     volumes:
       - media:/media
     ports:
@@ -68,6 +69,23 @@ services:
       REDIS_URL: redis://redis:6379/0
       MEDIA_PATH: /media
       RETENTION_DAYS: ${RETENTION_DAYS:-30}
+    volumes:
+      - media:/media
+    restart: unless-stopped
+
+  upscaler:
+    build: ./upscaler
+    container_name: facewatch-upscaler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-facewatch}:${POSTGRES_PASSWORD:-facewatch}@postgres:5432/${POSTGRES_DB:-facewatch}
+      REDIS_URL: redis://redis:6379/0
+      MEDIA_PATH: /media
+      UPSCALE_BACKEND: ${UPSCALE_BACKEND:-gfpgan}
     volumes:
       - media:/media
     restart: unless-stopped
