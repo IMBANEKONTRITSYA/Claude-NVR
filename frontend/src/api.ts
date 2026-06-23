@@ -78,6 +78,11 @@ export const api = {
   userDel: (id: number) => req(`/api/users/${id}`, { method: "DELETE" }),
   getSettings: () => req("/api/settings"),
   putSettings: (b: any) => req("/api/settings", { method: "PUT", body: JSON.stringify(b) }),
+  health: async () => {
+    const r = await fetch("/api/health");
+    try { return await r.json(); } catch { return { ok: false, db: "?", redis: "?" }; }
+  },
+  raw: (path: string) => req(path),
 };
 
 export function mediaUrl(rel: string | null | undefined): string {

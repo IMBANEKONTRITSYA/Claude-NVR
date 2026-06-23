@@ -17,6 +17,7 @@ def test_core_routes_present():
         "/api/reports/persons.csv",
         "/api/reports/cameras.csv",
         "/api/settings",
+        "/api/audit",
         "/ws/faces",
     ]:
         assert p in paths, f"Отсутствует маршрут {p}"

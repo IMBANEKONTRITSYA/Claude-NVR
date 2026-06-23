@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { useUI } from "../ui";
 
 export function Cameras() {
+  const { toast, confirm } = useUI();
   const [cams, setCams] = useState<any[]>([]);
   const [form, setForm] = useState({ name: "", rtsp_url: "", location: "", enabled: true });
   const [editing, setEditing] = useState<number | null>(null);
@@ -18,13 +20,17 @@ export function Cameras() {
       setForm({ name: "", rtsp_url: "", location: "", enabled: true });
       setEditing(null);
       load();
-    } catch (e: any) { alert(e.message); }
+      toast(editing ? "Камера обновлена" : "Камера добавлена", "ok");
+    } catch (e: any) { toast(e.message, "err"); }
   };
 
   const remove = async (id: number) => {
-    if (!confirm("Удалить камеру?")) return;
-    await api.camDelete(id);
-    load();
+    if (!(await confirm("Удалить камеру?"))) return;
+    try {
+      await api.camDelete(id);
+      load();
+      toast("Камера удалена", "ok");
+    } catch (e: any) { toast(e.message, "err"); }
   };
 
   return (

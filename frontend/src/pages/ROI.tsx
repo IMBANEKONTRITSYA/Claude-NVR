@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { api, camSnapshotUrl } from "../api";
+import { useUI } from "../ui";
 
 export function ROI() {
+  const { toast } = useUI();
   const [cams, setCams] = useState<any[]>([]);
   const [camId, setCamId] = useState<number | null>(null);
   const [poly, setPoly] = useState<number[][]>([]);
@@ -65,7 +67,7 @@ export function ROI() {
     if (camId == null) return;
     const norm = polys.map(p => p.map(([x, y]) => [x / W, y / H]));
     await api.camRoiPut(camId, norm);
-    alert("Зоны сохранены");
+    toast("Зоны сохранены", "ok");
   };
 
   return (

@@ -1,6 +1,6 @@
 import { NavLink, Route, Routes, Navigate, useNavigate } from "react-router-dom";
-import { Suspense, lazy } from "react";
-import { clearAuth, getRole, getToken, getUser } from "./api";
+import { Suspense, lazy, useEffect, useState } from "react";
+import { api, clearAuth, getRole, getToken, getUser } from "./api";
 import { Login } from "./pages/Login";
 
 const Dashboard = lazy(() => import("./pages/Dashboard").then(m => ({ default: m.Dashboard })));
@@ -14,7 +14,21 @@ const Users = lazy(() => import("./pages/Users").then(m => ({ default: m.Users }
 const Reports = lazy(() => import("./pages/Reports").then(m => ({ default: m.Reports })));
 const Search = lazy(() => import("./pages/Search").then(m => ({ default: m.Search })));
 const SettingsPage = lazy(() => import("./pages/Settings").then(m => ({ default: m.Settings })));
+const Audit = lazy(() => import("./pages/Audit").then(m => ({ default: m.Audit })));
 const Profile = lazy(() => import("./pages/Profile").then(m => ({ default: m.Profile })));
+
+function HealthBadge() {
+  const [h, setH] = useState<any>({ ok: true, db: "?", redis: "?" });
+  useEffect(() => {
+    const tick = () => api.health().then(setH).catch(() => setH({ ok: false, db: "down", redis: "down" }));
+    tick();
+    const t = setInterval(tick, 15000);
+    return () => clearInterval(t);
+  }, []);
+  const dot = h.ok ? "ok" : "err";
+  const text = h.ok ? "Система в норме" : `Проблема: ${h.db !== "ok" ? "БД" : ""} ${h.redis !== "ok" ? "Redis" : ""}`.trim();
+  return <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}><span className={`dot ${dot}`} />{text}</div>;
+}
 
 function Layout({ children }: { children: any }) {
   const nav = useNavigate();
@@ -38,8 +52,10 @@ function Layout({ children }: { children: any }) {
           {can("admin") && <NavLink to="/cameras">Управление камерами</NavLink>}
           {can("admin") && <NavLink to="/users">Пользователи</NavLink>}
           {can("admin") && <NavLink to="/settings">Настройки</NavLink>}
+          {can("admin") && <NavLink to="/audit">Журнал действий</NavLink>}
         </nav>
         <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
+          <HealthBadge />
           <NavLink to="/profile" style={{ display: "block", fontSize: 12, marginBottom: 8 }}>
             {user} · {role}
           </NavLink>
@@ -73,6 +89,7 @@ export function App() {
       <Route path="/cameras" element={<Private roles={["admin"]}><Cameras /></Private>} />
       <Route path="/users" element={<Private roles={["admin"]}><Users /></Private>} />
       <Route path="/settings" element={<Private roles={["admin"]}><SettingsPage /></Private>} />
+      <Route path="/audit" element={<Private roles={["admin"]}><Audit /></Private>} />
       <Route path="/profile" element={<Private><Profile /></Private>} />
       <Route path="*" element={<Navigate to={getToken() ? "/dashboard" : "/login"} replace />} />
     </Routes>

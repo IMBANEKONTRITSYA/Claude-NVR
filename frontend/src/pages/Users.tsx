@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { useUI } from "../ui";
 
 export function Users() {
+  const { toast, confirm } = useUI();
   const [users, setUsers] = useState<any[]>([]);
   const [form, setForm] = useState({ username: "", password: "", role: "viewer" });
   const load = () => api.users().then(setUsers);
@@ -12,13 +14,17 @@ export function Users() {
       await api.userAdd(form);
       setForm({ username: "", password: "", role: "viewer" });
       load();
-    } catch (e: any) { alert(e.message); }
+      toast("Пользователь создан", "ok");
+    } catch (e: any) { toast(e.message, "err"); }
   };
 
   const del = async (id: number) => {
-    if (!confirm("Удалить пользователя?")) return;
-    await api.userDel(id);
-    load();
+    if (!(await confirm("Удалить пользователя?"))) return;
+    try {
+      await api.userDel(id);
+      load();
+      toast("Пользователь удалён", "ok");
+    } catch (e: any) { toast(e.message, "err"); }
   };
 
   return (

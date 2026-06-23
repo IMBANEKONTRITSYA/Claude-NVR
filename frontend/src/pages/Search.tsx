@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { api, mediaUrl, getToken } from "../api";
+import { useUI } from "../ui";
 
 export function Search() {
+  const { toast } = useUI();
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string>("");
   const [threshold, setThreshold] = useState(0.4);
@@ -35,7 +37,7 @@ export function Search() {
   };
 
   const openSegment = (segId: number | null) => {
-    if (!segId) { alert("Для этого появления нет видеофрагмента"); return; }
+    if (!segId) { toast("Для этого появления нет видеофрагмента", "warn"); return; }
     window.open(`/api/archive/file/${segId}?token=${getToken()}`, "_blank");
   };
 

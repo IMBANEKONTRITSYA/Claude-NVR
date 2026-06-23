@@ -15,6 +15,8 @@ from .routers import persons as r_persons, events as r_events, archive as r_arch
 from .routers import stats as r_stats, reports as r_reports, ws as r_ws
 from .routers import search as r_search
 from .routers import settings as r_settings
+from .routers import audit as r_audit
+from .audit import AuditMiddleware
 
 
 @asynccontextmanager
@@ -74,6 +76,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(AuditMiddleware)
 
 app.include_router(r_auth.router)
 app.include_router(r_users.router)
@@ -85,12 +88,28 @@ app.include_router(r_stats.router)
 app.include_router(r_reports.router)
 app.include_router(r_search.router)
 app.include_router(r_settings.router)
+app.include_router(r_audit.router)
 app.include_router(r_ws.router)
 
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True}
+    """Глубокая проверка: БД и Redis должны отвечать."""
+    from fastapi.responses import JSONResponse
+    from .services.pubsub import get_redis
+    status = {"ok": True, "db": "ok", "redis": "ok"}
+    try:
+        async with SessionLocal() as db:
+            await db.execute(text("SELECT 1"))
+    except Exception as e:
+        status["ok"] = False
+        status["db"] = f"error: {str(e)[:80]}"
+    try:
+        await get_redis().ping()
+    except Exception as e:
+        status["ok"] = False
+        status["redis"] = f"error: {str(e)[:80]}"
+    return JSONResponse(status, status_code=200 if status["ok"] else 503)
 
 
 @app.get("/api/media/{kind}/{name}")
