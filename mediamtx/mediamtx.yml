@@ -3,6 +3,12 @@ rtspAddress: :8554
 hlsAddress: :8888
 webrtcAddress: :8889
 
+hls: yes
+hlsAlwaysRemux: yes
+hlsSegmentCount: 5
+hlsSegmentDuration: 1s
+hlsAllowOrigin: '*'
+
 paths:
   all_others:
     source: publisher

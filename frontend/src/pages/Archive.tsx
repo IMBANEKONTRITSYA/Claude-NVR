@@ -4,7 +4,7 @@ import { api, getToken } from "../api";
 export function Archive() {
   const [cams, setCams] = useState<any[]>([]);
   const [segs, setSegs] = useState<any[]>([]);
-  const [f, setF] = useState({ camera_id: "", event_type: "", date_from: "", date_to: "" });
+  const [f, setF] = useState({ camera_id: "", event_type: "", date_from: "", date_to: "", person_id: "" });
   const [sel, setSel] = useState<any | null>(null);
 
   useEffect(() => { api.cameras().then(setCams); search(); }, []);
@@ -39,6 +39,10 @@ export function Archive() {
           </div>
           <div><label>С</label><input type="datetime-local" value={f.date_from} onChange={e => setF({ ...f, date_from: e.target.value })} /></div>
           <div><label>По</label><input type="datetime-local" value={f.date_to} onChange={e => setF({ ...f, date_to: e.target.value })} /></div>
+        </div>
+        <div style={{ marginTop: 8 }}>
+          <label>ID персоны (опционально)</label>
+          <input type="number" value={f.person_id} onChange={e => setF({ ...f, person_id: e.target.value })} style={{ width: 200 }} />
         </div>
         <button className="btn" style={{ marginTop: 8 }} onClick={search}>Найти</button>
       </div>

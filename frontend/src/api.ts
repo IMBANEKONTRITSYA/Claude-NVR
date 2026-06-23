@@ -51,6 +51,7 @@ export const api = {
   camRoiGet: (id: number) => req(`/api/cameras/${id}/roi`),
   camRoiPut: (id: number, polygons: number[][][]) =>
     req(`/api/cameras/${id}/roi`, { method: "PUT", body: JSON.stringify({ polygons }) }),
+  camHls: (id: number) => req(`/api/cameras/${id}/hls`),
   persons: (status?: string) => req(`/api/persons${status ? `?status=${status}` : ""}`),
   personGet: (id: number) => req(`/api/persons/${id}`),
   personUpdate: (id: number, b: any) => req(`/api/persons/${id}`, { method: "PATCH", body: JSON.stringify(b) }),
@@ -75,6 +76,10 @@ export function mediaUrl(rel: string | null | undefined): string {
   const [kind, name] = rel.split("/");
   const t = getToken();
   return `/api/media/${kind}/${name}?token=${t}`;
+}
+
+export function camSnapshotUrl(id: number): string {
+  return `/api/cameras/${id}/snapshot?token=${getToken()}&t=${Date.now()}`;
 }
 
 export function wsUrl(path: string): string {

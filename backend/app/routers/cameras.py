@@ -1,6 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException
+import os
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
+from jose import jwt, JWTError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
+from ..config import settings
 from ..db import get_db
 from ..models import Camera
 from ..auth import require_role, get_current_user
@@ -80,3 +84,21 @@ async def put_roi(cam_id: int, payload: ROIIn, _=Depends(require_role("admin", "
     cam.roi = payload.model_dump()
     await db.commit()
     return {"ok": True}
+
+
+@router.get("/{cam_id}/snapshot")
+async def snapshot(cam_id: int, token: str = Query(...)):
+    try:
+        jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+    except JWTError:
+        raise HTTPException(401, "Не авторизован")
+    path = os.path.join(settings.MEDIA_PATH, "snapshots", f"cam{cam_id}_latest.jpg")
+    if not os.path.exists(path):
+        raise HTTPException(404, "Нет кадра")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@router.get("/{cam_id}/hls")
+async def hls_url(cam_id: int, _=Depends(get_current_user)):
+    """URL HLS-плейлиста MediaMTX, прокидываемого через nginx."""
+    return {"url": f"/hls/cam{cam_id}/index.m3u8"}

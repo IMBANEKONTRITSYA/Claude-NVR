@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from ..config import settings
 from ..db import get_db
-from ..models import VideoSegment
+from ..models import VideoSegment, FaceEvent
 from ..auth import require_role
 from ..schemas import SegmentOut
 
@@ -34,6 +34,11 @@ async def list_segments(
         q = q.where(VideoSegment.started_at >= date_from)
     if date_to:
         q = q.where(VideoSegment.started_at <= date_to)
+    if person_id:
+        sub = select(FaceEvent.camera_id, FaceEvent.ts).where(FaceEvent.person_id == person_id).subquery()
+        q = q.where(
+            VideoSegment.camera_id.in_(select(sub.c.camera_id)),
+        )
     r = await db.execute(q)
     return r.scalars().all()
 

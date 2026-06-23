@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api } from "../api";
+import { api, camSnapshotUrl } from "../api";
 
 export function ROI() {
   const [cams, setCams] = useState<any[]>([]);
@@ -12,17 +12,18 @@ export function ROI() {
   useEffect(() => { api.cameras().then(setCams); }, []);
   useEffect(() => {
     if (camId == null) return;
-    api.camRoiGet(camId).then(r => setPolys(r.polygons || []));
+    api.camRoiGet(camId).then(r => {
+      const ps = (r.polygons || []) as number[][][];
+      setPolys(ps.map(p => p.map(([x, y]) => [x * W, y * H])));
+    });
     setPoly([]);
   }, [camId]);
 
+  const [snapKey, setSnapKey] = useState(0);
   useEffect(() => {
     const c = canvasRef.current;
     if (!c) return;
     const ctx = c.getContext("2d")!;
-    ctx.fillStyle = "#222"; ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = "#666"; ctx.font = "14px sans-serif";
-    ctx.fillText("Стоп-кадр камеры (заглушка)", 16, 24);
     const draw = (p: number[][], color: string) => {
       if (p.length === 0) return;
       ctx.strokeStyle = color; ctx.fillStyle = color + "33"; ctx.lineWidth = 2;
@@ -30,9 +31,24 @@ export function ROI() {
       p.forEach((pt, i) => i === 0 ? ctx.moveTo(pt[0], pt[1]) : ctx.lineTo(pt[0], pt[1]));
       ctx.closePath(); ctx.fill(); ctx.stroke();
     };
-    polys.forEach(p => draw(p, "#3fb950"));
-    draw(poly, "#2f81f7");
-  }, [poly, polys]);
+    const render = (bg?: HTMLImageElement) => {
+      if (bg) ctx.drawImage(bg, 0, 0, W, H);
+      else { ctx.fillStyle = "#222"; ctx.fillRect(0, 0, W, H); ctx.fillStyle = "#666"; ctx.font = "14px sans-serif"; ctx.fillText("Кадр недоступен — выберите камеру", 16, 24); }
+      polys.forEach(p => draw(p, "#3fb950"));
+      draw(poly, "#2f81f7");
+    };
+    if (camId == null) { render(); return; }
+    const img = new Image();
+    img.onload = () => render(img);
+    img.onerror = () => render();
+    img.src = camSnapshotUrl(camId);
+  }, [poly, polys, camId, snapKey]);
+
+  useEffect(() => {
+    if (camId == null) return;
+    const t = setInterval(() => setSnapKey(k => k + 1), 5000);
+    return () => clearInterval(t);
+  }, [camId]);
 
   const click = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const r = canvasRef.current!.getBoundingClientRect();
@@ -47,7 +63,8 @@ export function ROI() {
 
   const save = async () => {
     if (camId == null) return;
-    await api.camRoiPut(camId, polys);
+    const norm = polys.map(p => p.map(([x, y]) => [x / W, y / H]));
+    await api.camRoiPut(camId, norm);
     alert("Зоны сохранены");
   };
 

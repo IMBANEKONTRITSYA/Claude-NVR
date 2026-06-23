@@ -1,22 +1,27 @@
 """
-FaceWatch worker: читает RTSP-потоки активных камер, делает детекцию движения,
-извлекает эмбеддинги лиц через InsightFace, сравнивает с базой персон (pgvector),
-публикует события в Redis и пишет видеосегменты при движении/лице.
-
-Минимальная рабочая реализация. Производительность зависит от железа и числа камер.
+FaceWatch worker: для каждой включённой камеры —
+- репабликация RTSP в MediaMTX (ffmpeg, copy) → доступно по HLS;
+- детекция движения (MOG2) с применением ROI-маски;
+- InsightFace эмбеддинги, кластеризация через ближайший центроид (pgvector);
+- запись видеосегментов при движении/лице, ротация по RETENTION_DAYS;
+- сохранение последнего кадра камеры (snapshots/cam{id}_latest.jpg);
+- периодическая DBSCAN-перекластеризация (раз в час) для слияния дублирующихся неизвестных.
 """
 import os
 import sys
 import time
 import json
+import shlex
 import threading
+import subprocess
 from datetime import datetime, timedelta
 
 import cv2
 import numpy as np
 import redis
 from cryptography.fernet import Fernet
-from sqlalchemy import create_engine, select, text, delete
+from sklearn.cluster import DBSCAN
+from sqlalchemy import create_engine, select, text, delete, update
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, JSON, Text
 from pgvector.sqlalchemy import Vector
@@ -26,9 +31,13 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 MEDIA_PATH = os.environ.get("MEDIA_PATH", "/media")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 FERNET_KEY = os.environ.get("RTSP_ENCRYPTION_KEY", "ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ=")
+MEDIAMTX_HOST = os.environ.get("MEDIAMTX_HOST", "mediamtx")
+MEDIAMTX_PORT = int(os.environ.get("MEDIAMTX_PORT", "8554"))
 
 TARGET_FPS = 5
-SIM_THRESHOLD = 0.45  # косинусное расстояние для совпадения
+SIM_THRESHOLD = 0.45            # 1 - cosine_similarity; ниже — совпадение
+DBSCAN_EPS = 0.35
+DBSCAN_MIN_SAMPLES = 3
 SEGMENT_MAX_SEC = 60
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -101,6 +110,46 @@ def update_status(cam_id: int, status: str):
         pass
 
 
+def start_republish(cam_id: int, rtsp_url: str) -> subprocess.Popen | None:
+    """ffmpeg: TCP-копирование RTSP → MediaMTX (без перекодирования)."""
+    out = f"rtsp://{MEDIAMTX_HOST}:{MEDIAMTX_PORT}/cam{cam_id}"
+    cmd = [
+        "ffmpeg", "-nostdin", "-loglevel", "error",
+        "-rtsp_transport", "tcp",
+        "-i", rtsp_url,
+        "-c", "copy", "-an",
+        "-f", "rtsp", "-rtsp_transport", "tcp", out,
+    ]
+    try:
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        print(f"[cam {cam_id}] ffmpeg не найден, репабликация пропущена", flush=True)
+        return None
+
+
+def build_roi_mask(roi: dict | None, shape) -> np.ndarray | None:
+    """Полигоны хранятся в нормализованных координатах [0..1]."""
+    if not roi or not roi.get("polygons"):
+        return None
+    h, w = shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for poly in roi["polygons"]:
+        pts = np.array([[p[0] * w, p[1] * h] for p in poly], dtype=np.int32)
+        if pts.shape[0] >= 3:
+            cv2.fillPoly(mask, [pts], 255)
+    return mask
+
+
+def bbox_in_roi(bbox, mask: np.ndarray | None) -> bool:
+    if mask is None:
+        return True
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    if 0 <= cy < mask.shape[0] and 0 <= cx < mask.shape[1]:
+        return bool(mask[cy, cx])
+    return False
+
+
 def find_or_create_person(s, emb: np.ndarray) -> tuple[int, bool]:
     res = s.execute(text(
         "SELECT id, 1 - (centroid <=> CAST(:e AS vector)) AS sim FROM persons "
@@ -114,30 +163,50 @@ def find_or_create_person(s, emb: np.ndarray) -> tuple[int, bool]:
     return p.id, False
 
 
-def save_snapshot(frame, cam_id: int, bbox) -> str:
+def save_face_snapshot(frame, cam_id: int, bbox) -> str:
     x1, y1, x2, y2 = [int(v) for v in bbox]
     x1, y1 = max(0, x1), max(0, y1)
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
         crop = frame
-    fname = f"cam{cam_id}_{int(time.time()*1000)}.jpg"
+    fname = f"cam{cam_id}_{int(time.time() * 1000)}.jpg"
     fpath = os.path.join(MEDIA_PATH, "snapshots", fname)
     cv2.imwrite(fpath, crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return f"snapshots/{fname}"
 
 
+def save_latest_frame(frame, cam_id: int):
+    fpath = os.path.join(MEDIA_PATH, "snapshots", f"cam{cam_id}_latest.jpg")
+    cv2.imwrite(fpath, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+
+
+def reload_roi(cam_id: int) -> dict | None:
+    with Session() as s:
+        cam = s.get(Camera, cam_id)
+        return cam.roi if cam else None
+
+
 def camera_worker(cam_id: int, rtsp_url: str, face_app):
-    print(f"[cam {cam_id}] старт {rtsp_url[:40]}...", flush=True)
-    cap = cv2.VideoCapture(rtsp_url)
+    print(f"[cam {cam_id}] старт", flush=True)
+    republish = start_republish(cam_id, rtsp_url)
+
+    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         print(f"[cam {cam_id}] не удалось открыть RTSP", flush=True)
         update_status(cam_id, "offline")
+        if republish:
+            republish.terminate()
         return
     update_status(cam_id, "online")
 
     bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=False)
     last_proc = 0.0
+    last_latest_save = 0.0
+    last_roi_reload = 0.0
     interval = 1.0 / TARGET_FPS
+    roi = reload_roi(cam_id)
+    roi_mask = None
+    roi_mask_shape = None
 
     writer = None
     seg_path = None
@@ -152,7 +221,9 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
             update_status(cam_id, "offline")
             time.sleep(2)
             cap.release()
-            cap = cv2.VideoCapture(rtsp_url)
+            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            if cap.isOpened():
+                update_status(cam_id, "online")
             continue
 
         now = time.time()
@@ -162,15 +233,32 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
             continue
         last_proc = now
 
+        if now - last_latest_save > 2.0:
+            save_latest_frame(frame, cam_id)
+            last_latest_save = now
+
+        if now - last_roi_reload > 30.0:
+            roi = reload_roi(cam_id)
+            roi_mask = None
+            last_roi_reload = now
+
+        if roi_mask is None or roi_mask_shape != frame.shape[:2]:
+            roi_mask = build_roi_mask(roi, frame.shape)
+            roi_mask_shape = frame.shape[:2]
+
         small = cv2.resize(frame, (640, 360))
-        mask = bg.apply(small)
-        motion_pixels = int(np.count_nonzero(mask))
+        fg = bg.apply(small)
+        if roi_mask is not None:
+            small_mask = cv2.resize(roi_mask, (640, 360), interpolation=cv2.INTER_NEAREST)
+            fg = cv2.bitwise_and(fg, fg, mask=small_mask)
+        motion_pixels = int(np.count_nonzero(fg))
         motion = motion_pixels > 1500
 
         faces = []
         try:
             if motion:
-                faces = face_app.get(frame)
+                detected = face_app.get(frame)
+                faces = [f for f in detected if bbox_in_roi(f.bbox.tolist(), roi_mask)]
         except Exception as e:
             print(f"[cam {cam_id}] ошибка распознавания: {e}", flush=True)
             faces = []
@@ -185,7 +273,10 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
                 writer = cv2.VideoWriter(seg_path, fourcc, fps_out, (w, h))
             writer.write(frame)
 
-        if writer and ((now - last_motion > 5) or (seg_started and (datetime.utcnow() - seg_started).total_seconds() > SEGMENT_MAX_SEC)):
+        if writer and (
+            (now - last_motion > 5)
+            or (seg_started and (datetime.utcnow() - seg_started).total_seconds() > SEGMENT_MAX_SEC)
+        ):
             writer.release()
             try:
                 with Session() as s:
@@ -216,7 +307,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
                 bbox = f.bbox.tolist()
                 pid, matched = find_or_create_person(s, emb)
                 person = s.get(Person, pid)
-                snap_rel = save_snapshot(frame, cam_id, bbox)
+                snap_rel = save_face_snapshot(frame, cam_id, bbox)
                 ev = FaceEvent(
                     camera_id=cam_id,
                     person_id=pid,
@@ -246,13 +337,77 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
                     pass
 
 
+def recluster_unknowns():
+    """DBSCAN по эмбеддингам последних событий неизвестных персон.
+    Сливает кластеры в одну персону, обновляет центроид, перенаправляет события."""
+    since = datetime.utcnow() - timedelta(days=7)
+    with Session() as s:
+        rows = s.execute(text("""
+            SELECT person_id, embedding FROM face_events
+            WHERE ts >= :since AND embedding IS NOT NULL
+              AND person_id IN (SELECT id FROM persons WHERE status='unknown')
+        """), {"since": since}).fetchall()
+        if len(rows) < DBSCAN_MIN_SAMPLES * 2:
+            return
+        pids = np.array([r[0] for r in rows])
+        embs = np.array([list(r[1]) for r in rows], dtype=np.float32)
+        labels = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES, metric="cosine").fit_predict(embs)
+        merged = 0
+        for label in set(labels):
+            if label < 0:
+                continue
+            cluster_pids = sorted(set(int(p) for p, l in zip(pids, labels) if l == label))
+            if len(cluster_pids) < 2:
+                continue
+            target = cluster_pids[0]
+            others = cluster_pids[1:]
+            cluster_embs = embs[labels == label]
+            centroid = cluster_embs.mean(axis=0)
+            centroid /= (np.linalg.norm(centroid) + 1e-9)
+            s.execute(update(FaceEvent).where(FaceEvent.person_id.in_(others)).values(person_id=target))
+            s.execute(delete(Person).where(Person.id.in_(others)))
+            s.execute(text("UPDATE persons SET centroid = CAST(:c AS vector) WHERE id = :id"),
+                      {"c": str(centroid.tolist()), "id": target})
+            merged += len(others)
+        if merged:
+            s.commit()
+            print(f"[recluster] объединено персон: {merged}", flush=True)
+
+
+def cleanup_old():
+    cutoff = datetime.utcnow() - timedelta(days=RETENTION_DAYS)
+    with Session() as s:
+        old = s.execute(select(VideoSegment).where(VideoSegment.started_at < cutoff)).scalars().all()
+        for seg in old:
+            try:
+                if seg.file_path and os.path.exists(seg.file_path):
+                    os.remove(seg.file_path)
+            except Exception:
+                pass
+            s.delete(seg)
+        s.execute(delete(FaceEvent).where(FaceEvent.ts < cutoff))
+        s.commit()
+    snap_dir = os.path.join(MEDIA_PATH, "snapshots")
+    if os.path.isdir(snap_dir):
+        for f in os.listdir(snap_dir):
+            if f.endswith("_latest.jpg"):
+                continue
+            p = os.path.join(snap_dir, f)
+            try:
+                if datetime.fromtimestamp(os.path.getmtime(p)) < cutoff:
+                    os.remove(p)
+            except Exception:
+                pass
+
+
 def manager():
     print("[worker] загрузка модели InsightFace...", flush=True)
     face_app = load_face_app()
     print("[worker] модель готова", flush=True)
 
     threads: dict[int, threading.Thread] = {}
-    last_cleanup = time.time()
+    last_cleanup = 0.0
+    last_recluster = 0.0
 
     while True:
         try:
@@ -270,29 +425,20 @@ def manager():
                     t.start()
                     threads[cam.id] = t
 
-            if time.time() - last_cleanup > 3600:
-                last_cleanup = time.time()
-                cutoff = datetime.utcnow() - timedelta(days=RETENTION_DAYS)
-                with Session() as s:
-                    old = s.execute(select(VideoSegment).where(VideoSegment.started_at < cutoff)).scalars().all()
-                    for seg in old:
-                        try:
-                            if seg.file_path and os.path.exists(seg.file_path):
-                                os.remove(seg.file_path)
-                        except Exception:
-                            pass
-                        s.delete(seg)
-                    s.execute(delete(FaceEvent).where(FaceEvent.ts < cutoff))
-                    s.commit()
-                snap_dir = os.path.join(MEDIA_PATH, "snapshots")
-                if os.path.isdir(snap_dir):
-                    for f in os.listdir(snap_dir):
-                        p = os.path.join(snap_dir, f)
-                        try:
-                            if datetime.fromtimestamp(os.path.getmtime(p)) < cutoff:
-                                os.remove(p)
-                        except Exception:
-                            pass
+            now = time.time()
+            if now - last_cleanup > 3600:
+                last_cleanup = now
+                try:
+                    cleanup_old()
+                except Exception as e:
+                    print(f"[worker] cleanup ошибка: {e}", flush=True)
+
+            if now - last_recluster > 3600:
+                last_recluster = now
+                try:
+                    recluster_unknowns()
+                except Exception as e:
+                    print(f"[worker] recluster ошибка: {e}", flush=True)
 
         except Exception as e:
             print(f"[worker] ошибка цикла: {e}", flush=True)
