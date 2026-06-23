@@ -1,0 +1,70 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete, update, func
+from ..db import get_db
+from ..models import Person, FaceEvent
+from ..auth import require_role
+from ..schemas import PersonOut, PersonUpdate
+
+router = APIRouter(prefix="/api/persons", tags=["persons"])
+
+
+@router.get("", response_model=list[PersonOut])
+async def list_persons(status: str | None = None, _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
+    q = select(Person).order_by(Person.id.desc())
+    if status:
+        q = q.where(Person.status == status)
+    r = await db.execute(q)
+    return r.scalars().all()
+
+
+@router.get("/{pid}", response_model=PersonOut)
+async def get_person(pid: int, _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
+    p = await db.get(Person, pid)
+    if not p:
+        raise HTTPException(404, "Персона не найдена")
+    return p
+
+
+@router.patch("/{pid}", response_model=PersonOut)
+async def update_person(pid: int, payload: PersonUpdate, _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
+    p = await db.get(Person, pid)
+    if not p:
+        raise HTTPException(404, "Персона не найдена")
+    if payload.name is not None:
+        p.name = payload.name
+        if payload.name.strip():
+            p.status = "known"
+    if payload.status is not None:
+        p.status = payload.status
+    await db.commit()
+    await db.refresh(p)
+    return p
+
+
+@router.delete("/{pid}")
+async def delete_person(pid: int, _=Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
+    await db.execute(delete(Person).where(Person.id == pid))
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/{src_id}/merge/{dst_id}")
+async def merge_persons(src_id: int, dst_id: int, _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
+    if src_id == dst_id:
+        raise HTTPException(400, "Нельзя слить с самой собой")
+    await db.execute(update(FaceEvent).where(FaceEvent.person_id == src_id).values(person_id=dst_id))
+    await db.execute(delete(Person).where(Person.id == src_id))
+    await db.commit()
+    return {"ok": True}
+
+
+@router.get("/{pid}/gallery", response_model=list[dict])
+async def gallery(pid: int, limit: int = 50, _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
+    r = await db.execute(
+        select(FaceEvent.id, FaceEvent.ts, FaceEvent.snapshot_path, FaceEvent.camera_id)
+        .where(FaceEvent.person_id == pid)
+        .order_by(FaceEvent.ts.desc())
+        .limit(limit)
+    )
+    return [{"id": x[0], "ts": x[1], "snapshot_path": x[2], "camera_id": x[3]} for x in r.all()]

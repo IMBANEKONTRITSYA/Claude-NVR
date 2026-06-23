@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: facewatch-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-facewatch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-facewatch}
+      POSTGRES_DB: ${POSTGRES_DB:-facewatch}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-facewatch}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: facewatch-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: facewatch-mediamtx
+    ports:
+      - "8554:8554"   # RTSP
+      - "8888:8888"   # HLS
+      - "8889:8889"   # WebRTC
+    volumes:
+      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    container_name: facewatch-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-facewatch}:${POSTGRES_PASSWORD:-facewatch}@postgres:5432/${POSTGRES_DB:-facewatch}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      RTSP_ENCRYPTION_KEY: ${RTSP_ENCRYPTION_KEY:-changeme-fernet-key-32bytes-base64=}
+      MEDIA_PATH: /media
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+    volumes:
+      - media:/media
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  worker:
+    build: ./worker
+    container_name: facewatch-worker
+    depends_on:
+      backend:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-facewatch}:${POSTGRES_PASSWORD:-facewatch}@postgres:5432/${POSTGRES_DB:-facewatch}
+      REDIS_URL: redis://redis:6379/0
+      MEDIA_PATH: /media
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
+    volumes:
+      - media:/media
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: facewatch-frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  media:
