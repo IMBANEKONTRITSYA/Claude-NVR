@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
-import { api, camSnapshotUrl, wsUrl } from "../api";
+import { api, camSnapshotUrl } from "../api";
+import { useWebSocket } from "../useWebSocket";
 
 type Box = { id: number; name: string; is_known: boolean; x: number; y: number; w: number; h: number; ts: number };
 
@@ -61,7 +62,6 @@ export function LiveGrid() {
   const [cams, setCams] = useState<any[]>([]);
   const [full, setFull] = useState<number | null>(null);
   const [boxesByCam, setBoxesByCam] = useState<Record<number, Box[]>>({});
-  const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
     api.cameras().then(setCams).catch(() => {});
@@ -69,23 +69,17 @@ export function LiveGrid() {
     return () => clearInterval(t);
   }, []);
 
-  useEffect(() => {
-    const ws = new WebSocket(wsUrl("/ws/faces"));
-    wsRef.current = ws;
-    ws.onmessage = (m) => {
-      const msg = JSON.parse(m.data);
-      if (msg.type !== "face" || !msg.bbox || !msg.frame_w) return;
-      const b: Box = {
-        id: msg.event_id, name: msg.name, is_known: msg.is_known,
-        x: msg.bbox.x1 / msg.frame_w, y: msg.bbox.y1 / msg.frame_h,
-        w: (msg.bbox.x2 - msg.bbox.x1) / msg.frame_w,
-        h: (msg.bbox.y2 - msg.bbox.y1) / msg.frame_h,
-        ts: Date.now(),
-      };
-      setBoxesByCam(prev => ({ ...prev, [msg.camera_id]: [...(prev[msg.camera_id] || []), b].slice(-10) }));
+  useWebSocket("/ws/faces", (msg) => {
+    if (msg.type !== "face" || !msg.bbox || !msg.frame_w) return;
+    const b: Box = {
+      id: msg.event_id, name: msg.name, is_known: msg.is_known,
+      x: msg.bbox.x1 / msg.frame_w, y: msg.bbox.y1 / msg.frame_h,
+      w: (msg.bbox.x2 - msg.bbox.x1) / msg.frame_w,
+      h: (msg.bbox.y2 - msg.bbox.y1) / msg.frame_h,
+      ts: Date.now(),
     };
-    return () => ws.close();
-  }, []);
+    setBoxesByCam(prev => ({ ...prev, [msg.camera_id]: [...(prev[msg.camera_id] || []), b].slice(-10) }));
+  });
 
   // Удаляем устаревшие рамки (старше 3 сек)
   useEffect(() => {

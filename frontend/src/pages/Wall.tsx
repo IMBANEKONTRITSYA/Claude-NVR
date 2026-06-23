@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { api, mediaUrl, wsUrl } from "../api";
+import { api, mediaUrl } from "../api";
+import { useWebSocket } from "../useWebSocket";
 
 export function Wall() {
   const [items, setItems] = useState<any[]>([]);
   const [paused, setPaused] = useState(false);
   const [filter, setFilter] = useState<"all" | "known" | "unknown">("all");
-  const wsRef = useRef<WebSocket | null>(null);
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
 
   useEffect(() => {
     api.events(60).then((evs: any[]) => {
@@ -15,15 +17,12 @@ export function Wall() {
         is_known: e.is_known, snapshot: e.snapshot_path, ts: e.ts,
       })));
     });
-    const ws = new WebSocket(wsUrl("/ws/faces"));
-    wsRef.current = ws;
-    ws.onmessage = (m) => {
-      const msg = JSON.parse(m.data);
-      if (msg.type !== "face") return;
-      setItems(prev => paused ? prev : [msg, ...prev].slice(0, 200));
-    };
-    return () => ws.close();
-  }, [paused]);
+  }, []);
+
+  useWebSocket("/ws/faces", (msg) => {
+    if (msg.type !== "face") return;
+    setItems(prev => pausedRef.current ? prev : [msg, ...prev].slice(0, 200));
+  });
 
   const ago = (iso: string) => {
     const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));

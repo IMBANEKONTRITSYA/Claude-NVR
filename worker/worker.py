@@ -226,6 +226,11 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
                 update_status(cam_id, "online")
             continue
 
+        # Авто-перезапуск ffmpeg-репабликации, если он умер
+        if republish and republish.poll() is not None:
+            print(f"[cam {cam_id}] ffmpeg-репабликация упала, перезапускаю", flush=True)
+            republish = start_republish(cam_id, rtsp_url)
+
         now = time.time()
         if now - last_proc < interval:
             if writer:

@@ -5,6 +5,8 @@ export function Cameras() {
   const [cams, setCams] = useState<any[]>([]);
   const [form, setForm] = useState({ name: "", rtsp_url: "", location: "", enabled: true });
   const [editing, setEditing] = useState<number | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<string>("");
 
   const load = () => api.cameras().then(setCams).catch(() => {});
   useEffect(() => { load(); }, []);
@@ -40,7 +42,17 @@ export function Cameras() {
           Активна
         </label>
         <button className="btn" onClick={submit}>{editing ? "Сохранить" : "Добавить"}</button>
-        {editing && <button className="btn secondary" onClick={() => { setEditing(null); setForm({ name: "", rtsp_url: "", location: "", enabled: true }); }} style={{ marginLeft: 8 }}>Отмена</button>}
+        <button className="btn secondary" style={{ marginLeft: 8 }} disabled={!form.rtsp_url || testing}
+          onClick={async () => {
+            setTesting(true); setTestResult("");
+            try {
+              const r = await api.testRtsp(form.rtsp_url);
+              setTestResult(r.ok ? `OK — ${r.info?.split("\n")[0] || "поток доступен"}` : `Ошибка: ${r.error}`);
+            } catch (e: any) { setTestResult(`Ошибка: ${e.message}`); }
+            finally { setTesting(false); }
+          }}>{testing ? "Проверка..." : "Проверить RTSP"}</button>
+        {editing && <button className="btn secondary" onClick={() => { setEditing(null); setForm({ name: "", rtsp_url: "", location: "", enabled: true }); setTestResult(""); }} style={{ marginLeft: 8 }}>Отмена</button>}
+        {testResult && <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>{testResult}</div>}
       </div>
 
       <div className="card">

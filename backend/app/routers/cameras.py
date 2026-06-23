@@ -8,7 +8,7 @@ from ..config import settings
 from ..db import get_db
 from ..models import Camera
 from ..auth import require_role, get_current_user
-from ..schemas import CameraIn, CameraOut, ROIIn
+from ..schemas import CameraIn, CameraOut, ROIIn, RtspTest
 from ..services.encryption import encrypt, decrypt
 from ..services.pubsub import get_redis
 
@@ -102,3 +102,28 @@ async def snapshot(cam_id: int, token: str = Query(...)):
 async def hls_url(cam_id: int, _=Depends(get_current_user)):
     """URL HLS-плейлиста MediaMTX, прокидываемого через nginx."""
     return {"url": f"/hls/cam{cam_id}/index.m3u8"}
+
+
+@router.post("/test")
+async def test_rtsp(payload: RtspTest, _=Depends(require_role("admin"))):
+    """Проверка RTSP-подключения: открытие потока через ffprobe с таймаутом 10с."""
+    import asyncio
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-rtsp_transport", "tcp",
+            "-timeout", "5000000",
+            "-show_entries", "stream=codec_type,codec_name,width,height",
+            "-of", "default=nw=1", payload.rtsp_url,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return {"ok": False, "error": "Таймаут подключения (10 сек)"}
+        if proc.returncode != 0:
+            return {"ok": False, "error": (err.decode(errors="ignore").strip() or "Не удалось подключиться")[:300]}
+        info = out.decode(errors="ignore").strip()
+        return {"ok": True, "info": info}
+    except FileNotFoundError:
+        return {"ok": False, "error": "ffprobe недоступен на сервере"}

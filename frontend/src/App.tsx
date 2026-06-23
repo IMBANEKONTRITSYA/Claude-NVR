@@ -11,6 +11,7 @@ import { Archive } from "./pages/Archive";
 import { ROI } from "./pages/ROI";
 import { Users } from "./pages/Users";
 import { Reports } from "./pages/Reports";
+import { Profile } from "./pages/Profile";
 
 function Layout({ children }: { children: any }) {
   const nav = useNavigate();
@@ -34,8 +35,10 @@ function Layout({ children }: { children: any }) {
           {can("admin") && <NavLink to="/users">Пользователи</NavLink>}
         </nav>
         <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
-          <div className="muted" style={{ fontSize: 12 }}>{user} · {role}</div>
-          <button className="btn secondary" style={{ marginTop: 8, width: "100%" }} onClick={logout}>Выйти</button>
+          <NavLink to="/profile" style={{ display: "block", fontSize: 12, marginBottom: 8 }}>
+            {user} · {role}
+          </NavLink>
+          <button className="btn secondary" style={{ width: "100%" }} onClick={logout}>Выйти</button>
         </div>
       </aside>
       <main className="main">{children}</main>
@@ -62,6 +65,7 @@ export function App() {
       <Route path="/reports" element={<Private roles={["admin", "operator"]}><Reports /></Private>} />
       <Route path="/cameras" element={<Private roles={["admin"]}><Cameras /></Private>} />
       <Route path="/users" element={<Private roles={["admin"]}><Users /></Private>} />
+      <Route path="/profile" element={<Private><Profile /></Private>} />
       <Route path="*" element={<Navigate to={getToken() ? "/dashboard" : "/login"} replace />} />
     </Routes>
   );

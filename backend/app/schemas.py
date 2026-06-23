@@ -24,6 +24,15 @@ class UserCreate(BaseModel):
     role: str = Field(pattern="^(admin|operator|viewer)$")
 
 
+class PasswordChange(BaseModel):
+    old_password: str
+    new_password: str = Field(min_length=6)
+
+
+class RtspTest(BaseModel):
+    rtsp_url: str
+
+
 class CameraIn(BaseModel):
     name: str
     rtsp_url: str
