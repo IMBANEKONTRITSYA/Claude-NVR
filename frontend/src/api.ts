@@ -65,6 +65,7 @@ export const api = {
   kpi: () => req("/api/stats/kpi"),
   byDay: () => req("/api/stats/by-day"),
   byHour: () => req("/api/stats/by-hour"),
+  heatmap: () => req("/api/stats/heatmap"),
   topPersons: () => req("/api/stats/top-persons"),
   users: () => req("/api/users"),
   userAdd: (b: any) => req("/api/users", { method: "POST", body: JSON.stringify(b) }),

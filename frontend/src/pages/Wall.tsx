@@ -11,7 +11,7 @@ export function Wall() {
     api.events(60).then((evs: any[]) => {
       setItems(evs.map(e => ({
         event_id: e.id, camera_id: e.camera_id, person_id: e.person_id,
-        name: e.is_known ? `Персона #${e.person_id}` : `Неизвестный #${e.person_id}`,
+        name: e.name,
         is_known: e.is_known, snapshot: e.snapshot_path, ts: e.ts,
       })));
     });

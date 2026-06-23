@@ -7,13 +7,23 @@ export function Dashboard() {
   const [byDay, setByDay] = useState<any[]>([]);
   const [byHour, setByHour] = useState<any[]>([]);
   const [top, setTop] = useState<any[]>([]);
+  const [grid, setGrid] = useState<number[][]>([]);
 
   useEffect(() => {
     api.kpi().then(setKpi).catch(() => {});
     api.byDay().then(setByDay).catch(() => {});
     api.byHour().then(setByHour).catch(() => {});
+    api.heatmap().then((r: any) => setGrid(r.grid || [])).catch(() => {});
     api.topPersons().then(setTop).catch(() => {});
   }, []);
+
+  const maxCell = Math.max(1, ...grid.flat());
+  const days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+  const cellColor = (v: number) => {
+    if (v === 0) return "#161b22";
+    const t = v / maxCell;
+    return `rgba(47, 129, 247, ${0.15 + t * 0.85})`;
+  };
 
   const Tile = ({ label, value }: any) => (
     <div className="card" style={{ flex: 1, minWidth: 180 }}>
@@ -57,6 +67,32 @@ export function Dashboard() {
             </BarChart>
           </ResponsiveContainer>
         </div>
+      </div>
+
+      <div className="card" style={{ marginBottom: 16, overflowX: "auto" }}>
+        <h3>Тепловая карта часов пик (30 дней)</h3>
+        <table style={{ borderCollapse: "separate", borderSpacing: 2, width: "auto" }}>
+          <thead>
+            <tr>
+              <th style={{ padding: 2 }}></th>
+              {Array.from({ length: 24 }, (_, h) => (
+                <th key={h} style={{ padding: 0, fontSize: 9, textAlign: "center", width: 18, border: 0 }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {grid.map((row, di) => (
+              <tr key={di}>
+                <td style={{ padding: "0 6px 0 0", fontSize: 11, border: 0, color: "var(--muted)" }}>{days[di]}</td>
+                {row.map((v, hi) => (
+                  <td key={hi} title={`${days[di]} ${hi}:00 — ${v}`}
+                    style={{ width: 18, height: 18, background: cellColor(v), border: 0, borderRadius: 2 }} />
+                ))}
+              </tr>
+            ))}
+            {grid.length === 0 && <tr><td colSpan={25} className="empty" style={{ border: 0 }}>Нет данных</td></tr>}
+          </tbody>
+        </table>
       </div>
 
       <div className="card">

@@ -70,6 +70,17 @@ class FaceEventOut(BaseModel):
         from_attributes = True
 
 
+class FaceEventRich(BaseModel):
+    id: int
+    camera_id: int
+    person_id: int | None
+    name: str
+    ts: datetime
+    snapshot_path: str | None
+    is_known: bool
+    bbox: dict | None = None
+
+
 class ROIIn(BaseModel):
     polygons: list[list[list[float]]]
 

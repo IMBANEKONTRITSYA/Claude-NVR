@@ -322,6 +322,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
                     person.avatar_path = snap_rel
                 s.commit()
 
+                fh, fw = frame.shape[:2]
                 try:
                     r.publish("faces:new", json.dumps({
                         "type": "face",
@@ -332,6 +333,9 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
                         "is_known": person.status == "known",
                         "snapshot": snap_rel,
                         "ts": ev.ts.isoformat(),
+                        "bbox": {"x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3]},
+                        "frame_w": fw,
+                        "frame_h": fh,
                     }))
                 except Exception:
                     pass

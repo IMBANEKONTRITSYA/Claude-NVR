@@ -49,6 +49,25 @@ async def by_hour(_=Depends(get_current_user), db: AsyncSession = Depends(get_db
     return [{"hour": h, "count": data.get(h, 0)} for h in range(24)]
 
 
+@router.get("/heatmap")
+async def heatmap(days: int = 30, _=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Тепловая карта: день недели (0=Пн..6=Вс) × час (0..23)."""
+    since = datetime.utcnow() - timedelta(days=days)
+    r = await db.execute(
+        select(
+            func.extract("isodow", FaceEvent.ts).label("dow"),
+            func.extract("hour", FaceEvent.ts).label("h"),
+            func.count(FaceEvent.id),
+        )
+        .where(FaceEvent.ts >= since)
+        .group_by("dow", "h")
+    )
+    grid = [[0] * 24 for _ in range(7)]
+    for dow, h, c in r.all():
+        grid[int(dow) - 1][int(h)] = c
+    return {"grid": grid}
+
+
 @router.get("/top-persons")
 async def top_persons(days: int = 30, limit: int = 10, _=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     since = datetime.utcnow() - timedelta(days=days)
