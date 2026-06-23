@@ -1,17 +1,18 @@
 import { NavLink, Route, Routes, Navigate, useNavigate } from "react-router-dom";
-import { useEffect, useState } from "react";
+import { Suspense, lazy } from "react";
 import { clearAuth, getRole, getToken, getUser } from "./api";
 import { Login } from "./pages/Login";
-import { Dashboard } from "./pages/Dashboard";
-import { LiveGrid } from "./pages/LiveGrid";
-import { Wall } from "./pages/Wall";
-import { Cameras } from "./pages/Cameras";
-import { Persons } from "./pages/Persons";
-import { Archive } from "./pages/Archive";
-import { ROI } from "./pages/ROI";
-import { Users } from "./pages/Users";
-import { Reports } from "./pages/Reports";
-import { Profile } from "./pages/Profile";
+
+const Dashboard = lazy(() => import("./pages/Dashboard").then(m => ({ default: m.Dashboard })));
+const LiveGrid = lazy(() => import("./pages/LiveGrid").then(m => ({ default: m.LiveGrid })));
+const Wall = lazy(() => import("./pages/Wall").then(m => ({ default: m.Wall })));
+const Cameras = lazy(() => import("./pages/Cameras").then(m => ({ default: m.Cameras })));
+const Persons = lazy(() => import("./pages/Persons").then(m => ({ default: m.Persons })));
+const Archive = lazy(() => import("./pages/Archive").then(m => ({ default: m.Archive })));
+const ROI = lazy(() => import("./pages/ROI").then(m => ({ default: m.ROI })));
+const Users = lazy(() => import("./pages/Users").then(m => ({ default: m.Users })));
+const Reports = lazy(() => import("./pages/Reports").then(m => ({ default: m.Reports })));
+const Profile = lazy(() => import("./pages/Profile").then(m => ({ default: m.Profile })));
 
 function Layout({ children }: { children: any }) {
   const nav = useNavigate();
@@ -54,6 +55,7 @@ function Private({ children, roles }: { children: any; roles?: string[] }) {
 
 export function App() {
   return (
+    <Suspense fallback={<div className="empty">Загрузка...</div>}>
     <Routes>
       <Route path="/login" element={<Login />} />
       <Route path="/dashboard" element={<Private><Dashboard /></Private>} />
@@ -68,5 +70,6 @@ export function App() {
       <Route path="/profile" element={<Private><Profile /></Private>} />
       <Route path="*" element={<Navigate to={getToken() ? "/dashboard" : "/login"} replace />} />
     </Routes>
+    </Suspense>
   );
 }
