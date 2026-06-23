@@ -136,6 +136,23 @@ docker run --rm python:3.11-slim sh -c "pip install cryptography -q && python -c
 - Кластеризация работает в двух режимах одновременно: онлайн (ближайший центроид) + фоновый DBSCAN
   раз в час (объединяет дубликаты неизвестных за последние 7 дней).
 
+## Разработка
+
+```bash
+# Бэкенд: тесты безопасности (шифрование RTSP, JWT, пароли)
+cd backend
+python -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
+.venv/bin/pytest -q
+
+# Фронтенд: сборка и проверка типов
+cd frontend
+npm ci --legacy-peer-deps
+npm run build
+```
+
+CI (GitHub Actions, `.github/workflows/ci.yml`) на каждый push прогоняет тесты бэкенда
+и сборку фронтенда.
+
 ## Безопасность
 
 - Пароли пользователей: bcrypt (passlib).
