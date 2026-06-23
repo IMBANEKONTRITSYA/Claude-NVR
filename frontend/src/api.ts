@@ -52,11 +52,17 @@ export const api = {
   camAdd: (b: any) => req("/api/cameras", { method: "POST", body: JSON.stringify(b) }),
   camUpdate: (id: number, b: any) => req(`/api/cameras/${id}`, { method: "PUT", body: JSON.stringify(b) }),
   camDelete: (id: number) => req(`/api/cameras/${id}`, { method: "DELETE" }),
+  camToggle: (id: number, enabled: boolean) =>
+    req(`/api/cameras/${id}/enabled?enabled=${enabled}`, { method: "PATCH" }),
   camRoiGet: (id: number) => req(`/api/cameras/${id}/roi`),
   camRoiPut: (id: number, polygons: number[][][]) =>
     req(`/api/cameras/${id}/roi`, { method: "PUT", body: JSON.stringify({ polygons }) }),
   camHls: (id: number) => req(`/api/cameras/${id}/hls`),
-  persons: (status?: string) => req(`/api/persons${status ? `?status=${status}` : ""}`),
+  persons: (params: { status?: string; q?: string; page?: number; page_size?: number } = {}) => {
+    const usp = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== "") usp.set(k, String(v)); });
+    return req(`/api/persons?${usp.toString()}`);
+  },
   personGet: (id: number) => req(`/api/persons/${id}`),
   personUpdate: (id: number, b: any) => req(`/api/persons/${id}`, { method: "PATCH", body: JSON.stringify(b) }),
   personMerge: (src: number, dst: number) => req(`/api/persons/${src}/merge/${dst}`, { method: "POST" }),

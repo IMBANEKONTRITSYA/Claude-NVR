@@ -1,10 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { api, mediaUrl } from "../api";
 import { useWebSocket } from "../useWebSocket";
+import { Pager } from "../Pager";
 
 export function Persons() {
   const [persons, setPersons] = useState<any[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 48;
   const [filter, setFilter] = useState<string>("");
+  const [q, setQ] = useState("");
   const [sel, setSel] = useState<any | null>(null);
   const [gallery, setGallery] = useState<any[]>([]);
   const [mergeTarget, setMergeTarget] = useState<number | null>(null);
@@ -12,8 +17,11 @@ export function Persons() {
   const selRef = useRef<any>(null);
   selRef.current = sel;
 
-  const load = () => api.persons(filter || undefined).then(setPersons).catch(() => {});
-  useEffect(() => { load(); }, [filter]);
+  const load = () => api.persons({ status: filter || undefined, q: q || undefined, page, page_size: PAGE_SIZE })
+    .then((r: any) => { setPersons(r.items); setTotal(r.total); })
+    .catch(() => {});
+  useEffect(() => { load(); }, [filter, q, page]);
+  useEffect(() => { setPage(1); }, [filter, q]);
 
   // Обновляем галерею/аватар при готовности апскейла
   useWebSocket("/ws/faces", (msg) => {
@@ -63,11 +71,12 @@ export function Persons() {
           <option value="known">Известные</option>
           <option value="unknown">Неизвестные</option>
         </select>
+        <input placeholder="Поиск по имени" value={q} onChange={e => setQ(e.target.value)} style={{ width: 240 }} />
       </div>
 
       <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 16 }}>
         <div className="card">
-          <h3>Список ({persons.length})</h3>
+          <h3>Список (всего: {total})</h3>
           <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))" }}>
             {persons.map(p => (
               <div key={p.id} className={`tile ${p.status}`} style={{ cursor: "pointer", flexDirection: "column", textAlign: "center" }} onClick={() => open(p)}>
@@ -77,6 +86,7 @@ export function Persons() {
             ))}
             {persons.length === 0 && <div className="empty">Пусто</div>}
           </div>
+          <Pager page={page} pageSize={PAGE_SIZE} total={total} onPage={setPage} />
         </div>
 
         <div className="card">

@@ -71,7 +71,15 @@ export function Cameras() {
                 <td>{c.name}</td>
                 <td>{c.location}</td>
                 <td><span className={`badge ${c.status}`}>{c.status}</span></td>
-                <td>{c.enabled ? "да" : "нет"}</td>
+                <td>
+                  <label style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                    <input type="checkbox" style={{ width: "auto" }} checked={c.enabled} onChange={async e => {
+                      try { await api.camToggle(c.id, e.target.checked); load(); toast(e.target.checked ? "Камера включена" : "Камера отключена", "ok"); }
+                      catch (err: any) { toast(err.message, "err"); }
+                    }} />
+                    {c.enabled ? "да" : "нет"}
+                  </label>
+                </td>
                 <td>
                   <button className="btn secondary" onClick={() => { setEditing(c.id); setForm({ name: c.name, rtsp_url: "", location: c.location, enabled: c.enabled }); }}>Изм.</button>
                   <button className="btn danger" onClick={() => remove(c.id)} style={{ marginLeft: 4 }}>Удалить</button>

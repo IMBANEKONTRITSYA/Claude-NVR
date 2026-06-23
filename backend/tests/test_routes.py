@@ -18,6 +18,8 @@ def test_core_routes_present():
         "/api/reports/cameras.csv",
         "/api/settings",
         "/api/audit",
+        "/api/audit/export.csv",
+        "/api/cameras/{cam_id}/enabled",
         "/ws/faces",
     ]:
         assert p in paths, f"Отсутствует маршрут {p}"

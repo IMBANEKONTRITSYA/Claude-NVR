@@ -13,6 +13,7 @@ ACTIONS = {
     ("POST", "/api/cameras"): "Добавлена камера",
     ("PUT", "/api/cameras/"): "Изменена камера",
     ("DELETE", "/api/cameras/"): "Удалена камера",
+    ("PATCH", "/api/cameras/", "/enabled"): "Камера включена/отключена",
     ("PUT", "/api/cameras/", "/roi"): "Изменены зоны детекции",
     ("POST", "/api/cameras/test"): "Тест RTSP-подключения",
     ("POST", "/api/users"): "Создан пользователь",

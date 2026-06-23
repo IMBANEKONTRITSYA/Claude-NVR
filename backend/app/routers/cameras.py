@@ -60,6 +60,20 @@ async def delete_camera(cam_id: int, _=Depends(require_role("admin")), db: Async
     return {"ok": True}
 
 
+@router.patch("/{cam_id}/enabled")
+async def toggle_enabled(cam_id: int, enabled: bool, _=Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
+    cam = await db.get(Camera, cam_id)
+    if not cam:
+        raise HTTPException(404, "Камера не найдена")
+    cam.enabled = enabled
+    if not enabled:
+        cam.status = "disabled"
+    await db.commit()
+    await db.refresh(cam)
+    await get_redis().publish("cameras:changed", str(cam.id))
+    return {"id": cam.id, "enabled": cam.enabled, "status": cam.status}
+
+
 @router.get("/{cam_id}/rtsp")
 async def get_rtsp(cam_id: int, _=Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
     cam = await db.get(Camera, cam_id)

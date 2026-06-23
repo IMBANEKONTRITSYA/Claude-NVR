@@ -6,18 +6,43 @@ from ..db import get_db
 from ..models import Person, FaceEvent
 from ..auth import require_role
 from ..schemas import PersonOut, PersonUpdate
+from ..pagination import PageParams
 from ..services.pubsub import get_redis
 
 router = APIRouter(prefix="/api/persons", tags=["persons"])
 
 
-@router.get("", response_model=list[PersonOut])
-async def list_persons(status: str | None = None, _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
-    q = select(Person).order_by(Person.id.desc())
+@router.get("")
+async def list_persons(
+    status: str | None = None,
+    q: str | None = None,
+    page: PageParams = Depends(),
+    _=Depends(require_role("admin", "operator")),
+    db: AsyncSession = Depends(get_db),
+):
+    base = select(Person)
     if status:
-        q = q.where(Person.status == status)
-    r = await db.execute(q)
-    return r.scalars().all()
+        base = base.where(Person.status == status)
+    if q:
+        base = base.where(Person.name.ilike(f"%{q}%"))
+
+    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0
+    rows = (await db.execute(
+        base.order_by(Person.id.desc()).limit(page.page_size).offset(page.offset)
+    )).scalars().all()
+    return {
+        "items": [
+            {
+                "id": p.id, "name": p.name, "status": p.status,
+                "avatar_path": p.avatar_path,
+                "created_at": p.created_at.isoformat() if p.created_at else None,
+            }
+            for p in rows
+        ],
+        "total": total,
+        "page": page.page,
+        "page_size": page.page_size,
+    }
 
 
 @router.get("/{pid}", response_model=PersonOut)
