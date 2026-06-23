@@ -35,10 +35,19 @@ async def list_segments(
     if date_to:
         q = q.where(VideoSegment.started_at <= date_to)
     if person_id:
-        sub = select(FaceEvent.camera_id, FaceEvent.ts).where(FaceEvent.person_id == person_id).subquery()
-        q = q.where(
-            VideoSegment.camera_id.in_(select(sub.c.camera_id)),
+        # Сегмент относится к персоне, если на той же камере есть событие лица
+        # этой персоны во временном диапазоне сегмента.
+        exists_q = (
+            select(FaceEvent.id)
+            .where(
+                FaceEvent.person_id == person_id,
+                FaceEvent.camera_id == VideoSegment.camera_id,
+                FaceEvent.ts >= VideoSegment.started_at,
+                FaceEvent.ts <= VideoSegment.ended_at,
+            )
+            .exists()
         )
+        q = q.where(exists_q)
     r = await db.execute(q)
     return r.scalars().all()
 

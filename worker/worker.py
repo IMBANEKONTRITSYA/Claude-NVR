@@ -346,6 +346,14 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
                     pass
 
 
+def _to_vec(val) -> np.ndarray:
+    """pgvector через psycopg2 без register_vector возвращает строку '[a,b,...]';
+    через ORM — список. Приводим оба варианта к np.ndarray."""
+    if isinstance(val, str):
+        return np.fromstring(val.strip("[]"), sep=",", dtype=np.float32)
+    return np.asarray(val, dtype=np.float32)
+
+
 def recluster_unknowns():
     """DBSCAN по эмбеддингам последних событий неизвестных персон.
     Сливает кластеры в одну персону, обновляет центроид, перенаправляет события."""
@@ -359,7 +367,10 @@ def recluster_unknowns():
         if len(rows) < DBSCAN_MIN_SAMPLES * 2:
             return
         pids = np.array([r[0] for r in rows])
-        embs = np.array([list(r[1]) for r in rows], dtype=np.float32)
+        embs = np.array([_to_vec(r[1]) for r in rows], dtype=np.float32)
+        if embs.ndim != 2 or embs.shape[1] != 512:
+            print(f"[recluster] неожиданная форма эмбеддингов: {embs.shape}", flush=True)
+            return
         labels = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES, metric="cosine").fit_predict(embs)
         merged = 0
         for label in set(labels):
