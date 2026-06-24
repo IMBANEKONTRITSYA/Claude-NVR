@@ -44,6 +44,9 @@ CONFIG = {
     "motion_threshold": 1500,
     "similarity_threshold": 0.45,   # 1 - cosine_similarity; ниже — совпадение
     "detection_fps": 5,
+    "alert_cooldown_sec": 300,
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
 }
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -73,8 +76,40 @@ def refresh_config():
                     CONFIG["similarity_threshold"] = float(row.value)
                 elif row.key == "detection_fps":
                     CONFIG["detection_fps"] = int(row.value)
+                elif row.key == "alert_cooldown_sec":
+                    CONFIG["alert_cooldown_sec"] = int(row.value)
+                elif row.key == "telegram_bot_token":
+                    CONFIG["telegram_bot_token"] = row.value or ""
+                elif row.key == "telegram_chat_id":
+                    CONFIG["telegram_chat_id"] = row.value or ""
     except Exception as e:
         print(f"[worker] не удалось прочитать настройки: {e}", flush=True)
+
+
+def send_telegram_alert(person_id: int, name: str, camera_id: int, snapshot_path: str):
+    """Telegram-оповещение с cooldown через Redis (один алерт на персону за период)."""
+    token = CONFIG["telegram_bot_token"]
+    chat = CONFIG["telegram_chat_id"]
+    if not token or not chat:
+        return
+    cooldown_key = f"alert_cooldown:{person_id}"
+    try:
+        if r.set(cooldown_key, "1", ex=CONFIG["alert_cooldown_sec"], nx=True) is None:
+            return  # cooldown активен
+    except Exception:
+        pass
+    text_msg = f"⚠️ FaceWatch: обнаружена персона «{name}» на камере #{camera_id}"
+    try:
+        import urllib.request
+        import urllib.parse
+        data = urllib.parse.urlencode({"chat_id": chat, "text": text_msg}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=data, method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        print(f"[alert] telegram error: {e}", flush=True)
 
 
 class Camera(Base):
@@ -95,6 +130,7 @@ class Person(Base):
     status = Column(String)
     avatar_path = Column(String)
     centroid = Column(Vector(512))
+    alert_on_detection = Column(Boolean, default=False)
     created_at = Column(DateTime)
 
 
@@ -378,6 +414,10 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
                     r.lpush("upscale:queue", json.dumps({"event_id": ev.id}))
                 except Exception:
                     pass
+
+                # Watchlist-оповещение
+                if person.status == "known" and getattr(person, "alert_on_detection", False):
+                    send_telegram_alert(pid, person.name or f"#{pid}", cam_id, snap_rel)
 
 
 def _to_vec(val) -> np.ndarray:

@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { api, mediaUrl } from "../api";
 import { useWebSocket } from "../useWebSocket";
 import { Pager } from "../Pager";
+import { useUI } from "../ui";
 
 export function Persons() {
+  const { toast } = useUI();
   const [persons, setPersons] = useState<any[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -72,6 +74,23 @@ export function Persons() {
           <option value="unknown">Неизвестные</option>
         </select>
         <input placeholder="Поиск по имени" value={q} onChange={e => setQ(e.target.value)} style={{ width: 240 }} />
+        <label className="btn" style={{ cursor: "pointer" }}>
+          Создать персону
+          <input type="file" accept="image/*" style={{ display: "none" }} onChange={async e => {
+            const file = e.target.files?.[0]; if (!file) return;
+            const name = prompt("Имя новой персоны:");
+            if (!name) { e.target.value = ""; return; }
+            try {
+              const fd = new FormData();
+              fd.append("name", name);
+              fd.append("file", file);
+              await api.personCreate(fd);
+              load();
+              toast("Персона создана", "ok");
+            } catch (err: any) { toast(err.message, "err"); }
+            finally { e.target.value = ""; }
+          }} />
+        </label>
       </div>
 
       <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 16 }}>
@@ -79,9 +98,10 @@ export function Persons() {
           <h3>Список (всего: {total})</h3>
           <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))" }}>
             {persons.map(p => (
-              <div key={p.id} className={`tile ${p.status}`} style={{ cursor: "pointer", flexDirection: "column", textAlign: "center" }} onClick={() => open(p)}>
+              <div key={p.id} className={`tile ${p.status}`} style={{ cursor: "pointer", flexDirection: "column", textAlign: "center", position: "relative" }} onClick={() => open(p)}>
                 {p.avatar_path ? <img src={mediaUrl(p.avatar_path)} /> : <div style={{ width: 64, height: 64, background: "#000" }} />}
                 <div style={{ fontSize: 12 }}>{p.name || `Неизвестный #${p.id}`}</div>
+                {p.alert_on_detection && <span title="В watchlist" style={{ position: "absolute", top: 4, right: 4, fontSize: 12 }}>⚠️</span>}
               </div>
             ))}
             {persons.length === 0 && <div className="empty">Пусто</div>}
@@ -101,6 +121,22 @@ export function Persons() {
                 <button className="btn secondary" onClick={merge} disabled={!mergeTarget}>Слить</button>
               </div>
               {enhMsg && <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>{enhMsg}</div>}
+              <div style={{ marginTop: 12 }}>
+                <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                  <input type="checkbox" style={{ width: "auto" }} checked={!!sel.alert_on_detection} onChange={async e => {
+                    const u = await api.personUpdate(sel.id, { alert_on_detection: e.target.checked });
+                    setSel({ ...sel, ...u });
+                  }} />
+                  В watchlist (Telegram-оповещение при детекции)
+                </label>
+                <label>Заметки</label>
+                <textarea rows={3} defaultValue={sel.notes || ""} onBlur={async e => {
+                  if (e.target.value !== (sel.notes || "")) {
+                    const u = await api.personUpdate(sel.id, { notes: e.target.value });
+                    setSel({ ...sel, ...u });
+                  }
+                }} />
+              </div>
               <h4 style={{ marginTop: 16 }}>Галерея ({gallery.length})</h4>
               <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(90px, 1fr))" }}>
                 {gallery.map(g => (

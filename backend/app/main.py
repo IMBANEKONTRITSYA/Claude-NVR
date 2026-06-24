@@ -35,6 +35,12 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE face_events ADD COLUMN IF NOT EXISTS enhanced boolean DEFAULT false"
         ))
+        await conn.execute(text(
+            "ALTER TABLE persons ADD COLUMN IF NOT EXISTS notes text"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE persons ADD COLUMN IF NOT EXISTS alert_on_detection boolean DEFAULT false"
+        ))
         # HNSW-индексы pgvector для быстрого поиска по эмбеддингам (≤5с на 100k лиц)
         for stmt in (
             "CREATE INDEX IF NOT EXISTS idx_face_events_embedding ON face_events "
@@ -58,6 +64,9 @@ async def lifespan(app: FastAPI):
             "motion_threshold": "1500",
             "similarity_threshold": "0.45",
             "detection_fps": "5",
+            "telegram_bot_token": "",
+            "telegram_chat_id": "",
+            "alert_cooldown_sec": "300",
         }
         existing = {s.key for s in (await db.execute(select(Setting))).scalars().all()}
         for k, v in defaults.items():

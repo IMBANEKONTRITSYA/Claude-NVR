@@ -33,6 +33,8 @@ class Person(Base):
     status: Mapped[str] = mapped_column(String(20), default="unknown")  # known|unknown
     avatar_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     centroid: Mapped[list[float] | None] = mapped_column(Vector(512), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    alert_on_detection: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

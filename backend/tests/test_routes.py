@@ -17,6 +17,7 @@ def test_core_routes_present():
         "/api/reports/persons.csv",
         "/api/reports/cameras.csv",
         "/api/settings",
+        "/api/settings/test-telegram",
         "/api/audit",
         "/api/audit/export.csv",
         "/api/cameras/{cam_id}/enabled",

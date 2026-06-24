@@ -56,6 +56,8 @@ class PersonOut(BaseModel):
     name: str
     status: str
     avatar_path: str | None
+    notes: str | None = None
+    alert_on_detection: bool = False
     created_at: datetime
 
     class Config:
@@ -65,6 +67,8 @@ class PersonOut(BaseModel):
 class PersonUpdate(BaseModel):
     name: str | None = None
     status: str | None = None
+    notes: str | None = None
+    alert_on_detection: bool | None = None
 
 
 class FaceEventOut(BaseModel):

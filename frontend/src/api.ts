@@ -63,6 +63,7 @@ export const api = {
     Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== "") usp.set(k, String(v)); });
     return req(`/api/persons?${usp.toString()}`);
   },
+  personCreate: (form: FormData) => req("/api/persons", { method: "POST", body: form }),
   personGet: (id: number) => req(`/api/persons/${id}`),
   personUpdate: (id: number, b: any) => req(`/api/persons/${id}`, { method: "PATCH", body: JSON.stringify(b) }),
   personMerge: (src: number, dst: number) => req(`/api/persons/${src}/merge/${dst}`, { method: "POST" }),
@@ -84,6 +85,7 @@ export const api = {
   userDel: (id: number) => req(`/api/users/${id}`, { method: "DELETE" }),
   getSettings: () => req("/api/settings"),
   putSettings: (b: any) => req("/api/settings", { method: "PUT", body: JSON.stringify(b) }),
+  testTelegram: () => req("/api/settings/test-telegram", { method: "POST" }),
   health: async () => {
     const r = await fetch("/api/health");
     try { return await r.json(); } catch { return { ok: false, db: "?", redis: "?" }; }

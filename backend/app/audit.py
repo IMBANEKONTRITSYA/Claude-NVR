@@ -18,6 +18,7 @@ ACTIONS = {
     ("POST", "/api/cameras/test"): "Тест RTSP-подключения",
     ("POST", "/api/users"): "Создан пользователь",
     ("DELETE", "/api/users/"): "Удалён пользователь",
+    ("POST", "/api/persons"): "Создана персона (вручную)",
     ("PATCH", "/api/persons/"): "Изменена персона",
     ("DELETE", "/api/persons/"): "Удалена персона",
     ("POST", "/api/persons/", "/merge/"): "Слияние персон",
