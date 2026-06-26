@@ -1,5 +1,4 @@
 @echo off
-chcp 65001 >nul
-echo Остановка FaceWatch...
+echo Stopping FaceWatch...
 docker compose down
 pause

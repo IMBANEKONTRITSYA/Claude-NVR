@@ -1,40 +1,39 @@
 @echo off
-chcp 65001 >nul
 setlocal
 
-echo === FaceWatch — запуск ===
+echo === FaceWatch - startup ===
 
 where docker >nul 2>nul
 if errorlevel 1 (
-  echo [ОШИБКА] Docker Desktop не найден. Установите Docker Desktop for Windows и запустите его.
+  echo [ERROR] Docker Desktop not found. Install Docker Desktop for Windows and start it.
   echo https://www.docker.com/products/docker-desktop/
   pause
   exit /b 1
 )
 
 if not exist .env (
-  echo Создаю .env из шаблона...
+  echo Creating .env from template...
   copy .env.example .env >nul
 )
 
-echo Сборка и запуск контейнеров...
+echo Building and starting containers...
 docker compose up -d --build
 if errorlevel 1 (
-  echo [ОШИБКА] Не удалось запустить docker compose
+  echo [ERROR] docker compose failed to start
   pause
   exit /b 1
 )
 
-echo Ожидание готовности сервиса...
+echo Waiting for services to become ready...
 timeout /t 8 /nobreak >nul
 
 start "" "http://localhost:8080"
 
 echo.
-echo === FaceWatch запущен ===
-echo Веб-интерфейс: http://localhost:8080
-echo API:          http://localhost:8000/docs
-echo Логин: admin    Пароль: см. ADMIN_PASSWORD в .env (по умолчанию admin)
+echo === FaceWatch is running ===
+echo Web UI:  http://localhost:8080
+echo API:     http://localhost:8000/docs
+echo Login: admin   Password: see ADMIN_PASSWORD in .env (default: admin)
 echo.
-echo Остановить: docker compose down
+echo To stop: docker compose down  (or run stop.bat)
 pause
