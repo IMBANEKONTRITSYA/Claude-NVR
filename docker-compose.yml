@@ -53,7 +53,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-facewatch}:${POSTGRES_PASSWORD:-facewatch}@postgres:5432/${POSTGRES_DB:-facewatch}
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
-      RTSP_ENCRYPTION_KEY: ${RTSP_ENCRYPTION_KEY:-changeme-fernet-key-32bytes-base64=}
+      RTSP_ENCRYPTION_KEY: ${RTSP_ENCRYPTION_KEY:-ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ=}
       MEDIA_PATH: /media
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
       WORKER_URL: http://worker:9000
@@ -78,6 +78,7 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-facewatch}:${POSTGRES_PASSWORD:-facewatch}@postgres:5432/${POSTGRES_DB:-facewatch}
       REDIS_URL: redis://redis:6379/0
+      RTSP_ENCRYPTION_KEY: ${RTSP_ENCRYPTION_KEY:-ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ=}
       MEDIA_PATH: /media
       RETENTION_DAYS: ${RETENTION_DAYS:-30}
     volumes:

@@ -17,6 +17,8 @@ import subprocess
 from datetime import datetime, timedelta
 
 import cv2
+import base64
+import hashlib
 import numpy as np
 import redis
 from cryptography.fernet import Fernet
@@ -52,7 +54,17 @@ CONFIG = {
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 Session = sessionmaker(bind=engine)
 Base = declarative_base()
-fernet = Fernet(FERNET_KEY.encode())
+def _normalize_fernet_key(raw: str) -> bytes:
+    """Должно совпадать с backend/app/services/encryption.py."""
+    raw_bytes = raw.encode()
+    try:
+        Fernet(raw_bytes)
+        return raw_bytes
+    except Exception:
+        return base64.urlsafe_b64encode(hashlib.sha256(raw_bytes).digest())
+
+
+fernet = Fernet(_normalize_fernet_key(FERNET_KEY))
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
 
