@@ -32,6 +32,7 @@ export function Settings() {
         motion_threshold: parseInt(s.motion_threshold),
         similarity_threshold: parseFloat(s.similarity_threshold),
         detection_fps: parseInt(s.detection_fps),
+        event_cooldown_sec: parseInt(s.event_cooldown_sec),
         alert_cooldown_sec: parseInt(s.alert_cooldown_sec),
         telegram_bot_token: s.telegram_bot_token || "",
         telegram_chat_id: s.telegram_chat_id || "",
@@ -61,6 +62,7 @@ export function Settings() {
         <Field label="Частота детекции (FPS на канал)" value={s.detection_fps} onChange={upd("detection_fps")} hint="Рекомендуется 5; выше — больше нагрузка на CPU" />
         <Field label="Порог движения (пикселей)" value={s.motion_threshold} onChange={upd("motion_threshold")} hint="Чувствительность детектора движения; меньше — чувствительнее" />
         <Field label="Порог схожести лиц" value={s.similarity_threshold} onChange={upd("similarity_threshold")} step={0.05} hint="0.1–0.9; меньше → строже сопоставление с известными" />
+        <Field label="Интервал между событиями (сек)" value={s.event_cooldown_sec} onChange={upd("event_cooldown_sec")} hint="Одна персона на одной камере создаёт событие не чаще раза за интервал (защита от спама на Стене и в БД)" />
       </div>
       <div className="card" style={{ maxWidth: 520, marginBottom: 16 }}>
         <h3 style={{ marginTop: 0 }}>Telegram-оповещения (watchlist)</h3>

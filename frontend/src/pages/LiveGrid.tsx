@@ -78,9 +78,10 @@ export function LiveGrid() {
   }, []);
 
   useWebSocket("/ws/faces", (msg) => {
-    if (msg.type !== "face" || !msg.bbox || !msg.frame_w) return;
+    // "face" — полноценное событие, "box" — лёгкий оверлей между событиями
+    if ((msg.type !== "face" && msg.type !== "box") || !msg.bbox || !msg.frame_w) return;
     const b: Box = {
-      id: msg.event_id, name: msg.name, is_known: msg.is_known,
+      id: msg.event_id ?? Math.random(), name: msg.name, is_known: msg.is_known,
       x: msg.bbox.x1 / msg.frame_w, y: msg.bbox.y1 / msg.frame_h,
       w: (msg.bbox.x2 - msg.bbox.x1) / msg.frame_w,
       h: (msg.bbox.y2 - msg.bbox.y1) / msg.frame_h,

@@ -16,6 +16,7 @@ SCHEMA: dict[str, tuple] = {
     "motion_threshold": (int, 100, 1_000_000),
     "similarity_threshold": (float, 0.1, 0.9),
     "detection_fps": (int, 1, 30),
+    "event_cooldown_sec": (int, 1, 300),
     "alert_cooldown_sec": (int, 10, 86400),
     "telegram_bot_token": (str,),     # просто строка, может быть пустой
     "telegram_chat_id": (str,),
@@ -27,6 +28,7 @@ class SettingsUpdate(BaseModel):
     motion_threshold: int | None = None
     similarity_threshold: float | None = None
     detection_fps: int | None = None
+    event_cooldown_sec: int | None = None
     alert_cooldown_sec: int | None = None
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None

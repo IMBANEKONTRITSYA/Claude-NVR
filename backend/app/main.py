@@ -64,6 +64,7 @@ async def lifespan(app: FastAPI):
             "motion_threshold": "1500",
             "similarity_threshold": "0.45",
             "detection_fps": "5",
+            "event_cooldown_sec": "10",
             "telegram_bot_token": "",
             "telegram_chat_id": "",
             "alert_cooldown_sec": "300",
