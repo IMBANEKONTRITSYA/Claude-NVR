@@ -64,7 +64,9 @@ export function Wall() {
 
   useWebSocket("/ws/faces", (msg) => {
     if (msg.type === "face") {
-      setItems(prev => pausedRef.current ? prev : [msg, ...prev]);
+      // Дедуп: событие могло уже прийти в начальной странице истории
+      setItems(prev => (pausedRef.current || prev.some(i => i.event_id === msg.event_id))
+        ? prev : [msg, ...prev]);
     } else if (msg.type === "enhanced") {
       // Подменяем фото на улучшенное по event_id
       setItems(prev => prev.map(i => i.event_id === msg.event_id ? { ...i, snapshot: msg.snapshot } : i));
@@ -95,8 +97,8 @@ export function Wall() {
         <span className="muted">Показано: {visible.length}</span>
       </div>
       <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))" }}>
-        {visible.map((i, k) => (
-          <div key={`${i.event_id}-${k}`} className={`tile ${i.is_known ? "known" : "unknown"}`}>
+        {visible.map(i => (
+          <div key={i.event_id} className={`tile ${i.is_known ? "known" : "unknown"}`}>
             {i.snapshot ? <img src={mediaUrl(i.snapshot)} loading="lazy" /> : <div style={{ width: 64, height: 64, background: "#000" }} />}
             <div>
               <div>{i.name}</div>

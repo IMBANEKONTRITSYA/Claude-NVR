@@ -129,7 +129,10 @@ async def media_file(kind: str, name: str, token: str = Query(...)):
         raise HTTPException(401, "Не авторизован")
     if kind not in ("snapshots", "avatars", "segments"):
         raise HTTPException(404)
+    name = os.path.basename(name)  # защита от ../ в имени
     path = os.path.join(settings.MEDIA_PATH, kind, name)
     if not os.path.exists(path):
         raise HTTPException(404)
-    return FileResponse(path)
+    # Снимки иммутабельны (улучшенная версия получает новое имя enh_*),
+    # так что браузер может кэшировать — Стена и галереи не перекачивают JPEG.
+    return FileResponse(path, headers={"Cache-Control": "private, max-age=86400"})

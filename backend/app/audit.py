@@ -94,7 +94,8 @@ class AuditMiddleware(BaseHTTPMiddleware):
                     username=username, role=role, action=action,
                     method=request.method, path=request.url.path,
                     status_code=response.status_code,
-                    ip=(request.client.host if request.client else None),
+                    ip=(request.headers.get("x-real-ip")
+                        or (request.client.host if request.client else None)),
                 ))
                 await db.commit()
         except Exception:

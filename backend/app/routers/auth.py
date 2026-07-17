@@ -14,10 +14,15 @@ MAX_ATTEMPTS = 10        # попыток за окно
 WINDOW_SEC = 300         # окно блокировки, сек
 
 
+def real_ip(request: Request) -> str:
+    """За nginx request.client.host — это адрес прокси; читаем X-Real-IP."""
+    return request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
+
+
 @router.post("/login", response_model=Token)
 async def login(request: Request, form: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
     redis = get_redis()
-    ip = request.client.host if request.client else "unknown"
+    ip = real_ip(request)
     key = f"login_fail:{ip}:{form.username}"
     try:
         attempts = int(await redis.get(key) or 0)

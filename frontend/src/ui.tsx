@@ -17,21 +17,22 @@ export function useUI(): Ctx {
   return v;
 }
 
+// Модульный счётчик: useState(0)[0] в замыкании всегда давал бы id=1 для всех
+// тостов — дублирующиеся ключи, и первый таймер закрывал бы все тосты разом.
+let seq = 0;
+
 export function UIProvider({ children }: { children: any }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [confirms, setConfirms] = useState<Confirm[]>([]);
-  let counter = useState(0)[0];
 
   const toast = useCallback((text: string, type: ToastType = "info") => {
-    const id = ++counter;
+    const id = ++seq;
     setToasts(t => [...t, { id, type, text }]);
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4000);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const confirm = useCallback((text: string) => new Promise<boolean>(resolve => {
-    setConfirms(c => [...c, { id: ++counter, text, resolve }]);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    setConfirms(c => [...c, { id: ++seq, text, resolve }]);
   }), []);
 
   const close = (id: number, value: boolean) => {
