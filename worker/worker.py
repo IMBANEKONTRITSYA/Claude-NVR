@@ -344,7 +344,11 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
     seg_had_face = False   # было ли лицо хоть в одном кадре сегмента
     last_event_at: dict[int, float] = {}  # person_id -> время последнего события (тротлинг)
     last_motion = 0.0
-    fps_out = 10
+    # В сегмент пишутся ВСЕ кадры потока, поэтому fps контейнера должен
+    # совпадать с fps камеры — иначе видео играет с неверной скоростью
+    # (с жёстким fps=10 запись с 25-fps камеры шла в 2.5 раза медленнее).
+    cam_fps = cap.get(cv2.CAP_PROP_FPS)
+    fps_out = cam_fps if (cam_fps and 1.0 <= cam_fps <= 60.0) else 25.0
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
     def close_segment(reason_ended):

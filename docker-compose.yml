@@ -88,7 +88,8 @@ services:
       interval: 30s
       timeout: 5s
       retries: 5
-      start_period: 120s
+      # Первый старт качает модель InsightFace (~30 МБ) — даём запас
+      start_period: 300s
     restart: unless-stopped
 
   upscaler:
