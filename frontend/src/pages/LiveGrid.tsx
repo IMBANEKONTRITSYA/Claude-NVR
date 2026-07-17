@@ -8,7 +8,14 @@ type Box = { id: number; name: string; is_known: boolean; x: number; y: number; 
 function CameraTile({ cam, boxes, onClick }: any) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const tileRef = useRef<HTMLDivElement | null>(null);
   const [error, setError] = useState(false);
+
+  // Двойной клик — настоящий браузерный полноэкранный режим
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else tileRef.current?.requestFullscreen().catch(() => {});
+  };
 
   useEffect(() => {
     if (cam.status !== "online" || !videoRef.current) return;
@@ -32,7 +39,8 @@ function CameraTile({ cam, boxes, onClick }: any) {
   const online = cam.status === "online";
 
   return (
-    <div className="cam-tile" onClick={onClick}>
+    <div className="cam-tile" ref={tileRef} onClick={onClick} onDoubleClick={toggleFullscreen}
+      title="Клик — развернуть в сетке, двойной клик — на весь экран">
       <div className="lbl">
         {cam.name} <span className={`badge ${cam.status}`}>{cam.status}</span>
       </div>

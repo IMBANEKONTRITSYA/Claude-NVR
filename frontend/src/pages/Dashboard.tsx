@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line, CartesianGrid } from "recharts";
 import { api } from "../api";
+import { useWebSocket } from "../useWebSocket";
 
 export function Dashboard() {
   const [kpi, setKpi] = useState<any>({});
@@ -8,13 +9,31 @@ export function Dashboard() {
   const [byHour, setByHour] = useState<any[]>([]);
   const [top, setTop] = useState<any[]>([]);
   const [grid, setGrid] = useState<number[][]>([]);
+  const dirtyRef = useRef(false);
 
-  useEffect(() => {
+  const loadAll = () => {
     api.kpi().then(setKpi).catch(() => {});
     api.byDay().then(setByDay).catch(() => {});
     api.byHour().then(setByHour).catch(() => {});
     api.heatmap().then((r: any) => setGrid(r.grid || [])).catch(() => {});
     api.topPersons().then(setTop).catch(() => {});
+  };
+
+  useEffect(() => { loadAll(); }, []);
+
+  // Обновление в реальном времени: новые события лиц помечают дашборд «грязным»,
+  // рефетч не чаще раза в 5 секунд, чтобы не заваливать API при потоке детекций.
+  useWebSocket("/ws/faces", (msg) => {
+    if (msg.type === "face") dirtyRef.current = true;
+  });
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (dirtyRef.current) {
+        dirtyRef.current = false;
+        loadAll();
+      }
+    }, 5000);
+    return () => clearInterval(t);
   }, []);
 
   const maxCell = Math.max(1, ...grid.flat());
