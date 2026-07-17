@@ -106,11 +106,13 @@ def abspath(rel: str) -> str:
     return os.path.join(MEDIA_PATH, rel)
 
 
-def process_event(event_id: int):
+def process_event(event_id: int, force: bool = False):
     with Session() as s:
         ev = s.get(FaceEvent, event_id)
         if not ev:
             return
+        if ev.enhanced and not force:
+            return  # уже улучшено; повтор только по явному запросу
         src_rel = ev.orig_snapshot_path or ev.snapshot_path
         if not src_rel:
             return
@@ -167,7 +169,7 @@ def main():
             payload = json.loads(item[1])
             eid = payload.get("event_id")
             if eid is not None:
-                process_event(int(eid))
+                process_event(int(eid), force=bool(payload.get("force")))
         except Exception as e:
             print(f"[upscaler] ошибка: {e}", flush=True)
             time.sleep(1)

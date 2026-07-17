@@ -176,7 +176,15 @@ def load_face_app():
     return app
 
 
+_last_status: dict[int, str] = {}
+
+
 def update_status(cam_id: int, status: str):
+    # Пишем в БД/паблишим только при фактической смене статуса,
+    # иначе офлайн-камера спамит запись каждые 2 секунды.
+    if _last_status.get(cam_id) == status:
+        return
+    _last_status[cam_id] = status
     with Session() as s:
         cam = s.get(Camera, cam_id)
         if cam:
@@ -258,10 +266,51 @@ def save_latest_frame(frame, cam_id: int):
     cv2.imwrite(fpath, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
 
 
-def reload_roi(cam_id: int) -> dict | None:
+def load_cam_state(cam_id: int) -> tuple[dict | None, bool]:
+    """(roi, active). active=False — камера удалена или отключена: поток должен завершиться."""
     with Session() as s:
         cam = s.get(Camera, cam_id)
-        return cam.roi if cam else None
+        if cam is None or not cam.enabled:
+            return None, False
+        return cam.roi, True
+
+
+def finalize_segment(cam_id: int, tmp_path: str, final_path: str,
+                     started, ended, event_type: str):
+    """Транскод mp4v → H.264 (браузеры не играют mp4v в <video>) + запись в БД.
+    Выполняется в отдельной короткоживущей нити, чтобы не блокировать цикл камеры."""
+    ok = False
+    try:
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", tmp_path,
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-movflags", "+faststart", "-an", final_path],
+            timeout=300, check=True,
+        )
+        os.remove(tmp_path)
+        ok = True
+    except Exception as e:
+        print(f"[cam {cam_id}] транскод не удался ({e}), оставляю исходник", flush=True)
+        try:
+            os.replace(tmp_path, final_path)
+            ok = True
+        except Exception:
+            pass
+    if not ok:
+        return
+    try:
+        with Session() as s:
+            s.add(VideoSegment(
+                camera_id=cam_id,
+                started_at=started,
+                ended_at=ended,
+                file_path=final_path,
+                event_type=event_type,
+                duration_sec=int((ended - started).total_seconds()),
+            ))
+            s.commit()
+    except Exception as e:
+        print(f"[cam {cam_id}] не удалось сохранить сегмент: {e}", flush=True)
 
 
 def camera_worker(cam_id: int, rtsp_url: str, face_app):
@@ -280,17 +329,34 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
     bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=False)
     last_proc = 0.0
     last_latest_save = 0.0
-    last_roi_reload = 0.0
-    roi = reload_roi(cam_id)
+    last_state_reload = 0.0
+    roi, active = load_cam_state(cam_id)
     roi_mask = None
     roi_mask_shape = None
 
     writer = None
     seg_path = None
+    seg_tmp = None
     seg_started = None
+    seg_had_face = False   # было ли лицо хоть в одном кадре сегмента
     last_motion = 0.0
     fps_out = 10
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+    def close_segment(reason_ended):
+        nonlocal writer, seg_path, seg_tmp, seg_started, seg_had_face
+        writer.release()
+        etype = "face" if seg_had_face else "motion"
+        threading.Thread(
+            target=finalize_segment,
+            args=(cam_id, seg_tmp, seg_path, seg_started, reason_ended, etype),
+            daemon=True,
+        ).start()
+        writer = None
+        seg_path = None
+        seg_tmp = None
+        seg_started = None
+        seg_had_face = False
 
     while True:
         ok, frame = cap.read()
@@ -320,10 +386,20 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
             save_latest_frame(frame, cam_id)
             last_latest_save = now
 
-        if now - last_roi_reload > 30.0:
-            roi = reload_roi(cam_id)
+        if now - last_state_reload > 10.0:
+            roi, active = load_cam_state(cam_id)
             roi_mask = None
-            last_roi_reload = now
+            last_state_reload = now
+            if not active:
+                # Камера отключена или удалена — корректно останавливаем поток
+                print(f"[cam {cam_id}] отключена, останавливаю обработку", flush=True)
+                if writer:
+                    close_segment(datetime.utcnow())
+                cap.release()
+                if republish:
+                    republish.terminate()
+                update_status(cam_id, "disabled")
+                return
 
         if roi_mask is None or roi_mask_shape != frame.shape[:2]:
             roi_mask = build_roi_mask(roi, frame.shape)
@@ -352,32 +428,19 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
                 seg_started = datetime.utcnow()
                 fname = f"cam{cam_id}_{int(time.time())}.mp4"
                 seg_path = os.path.join(MEDIA_PATH, "segments", fname)
+                seg_tmp = seg_path.replace(".mp4", "_tmp.mp4")
+                seg_had_face = False
                 h, w = frame.shape[:2]
-                writer = cv2.VideoWriter(seg_path, fourcc, fps_out, (w, h))
+                writer = cv2.VideoWriter(seg_tmp, fourcc, fps_out, (w, h))
+            if faces:
+                seg_had_face = True
             writer.write(frame)
 
         if writer and (
             (now - last_motion > 5)
             or (seg_started and (datetime.utcnow() - seg_started).total_seconds() > SEGMENT_MAX_SEC)
         ):
-            writer.release()
-            try:
-                with Session() as s:
-                    seg = VideoSegment(
-                        camera_id=cam_id,
-                        started_at=seg_started,
-                        ended_at=datetime.utcnow(),
-                        file_path=seg_path,
-                        event_type="face" if faces else "motion",
-                        duration_sec=int((datetime.utcnow() - seg_started).total_seconds()),
-                    )
-                    s.add(seg)
-                    s.commit()
-            except Exception as e:
-                print(f"[cam {cam_id}] не удалось сохранить сегмент: {e}", flush=True)
-            writer = None
-            seg_path = None
-            seg_started = None
+            close_segment(datetime.utcnow())
 
         if not faces:
             continue
@@ -422,8 +485,10 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
                         "frame_w": fw,
                         "frame_h": fh,
                     }))
-                    # Ставим скриншот в очередь на нейросетевой апскейл (асинхронно)
-                    r.lpush("upscale:queue", json.dumps({"event_id": ev.id}))
+                    # Ставим скриншот в очередь на нейросетевой апскейл (асинхронно).
+                    # Ограничиваем очередь, чтобы медленный CPU-апскейл не копил бэклог часами.
+                    if r.llen("upscale:queue") < 500:
+                        r.lpush("upscale:queue", json.dumps({"event_id": ev.id}))
                 except Exception:
                     pass
 
@@ -501,6 +566,19 @@ def cleanup_old():
             p = os.path.join(snap_dir, f)
             try:
                 if datetime.fromtimestamp(os.path.getmtime(p)) < cutoff:
+                    os.remove(p)
+            except Exception:
+                pass
+    # Осиротевшие временные сегменты (например, после падения процесса)
+    seg_dir = os.path.join(MEDIA_PATH, "segments")
+    hour_ago = datetime.utcnow() - timedelta(hours=1)
+    if os.path.isdir(seg_dir):
+        for f in os.listdir(seg_dir):
+            if not f.endswith("_tmp.mp4"):
+                continue
+            p = os.path.join(seg_dir, f)
+            try:
+                if datetime.fromtimestamp(os.path.getmtime(p)) < hour_ago:
                     os.remove(p)
             except Exception:
                 pass

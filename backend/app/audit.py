@@ -31,9 +31,12 @@ ACTIONS = {
 def _action_for(method: str, path: str) -> str | None:
     if (method, path) in ACTIONS:
         return ACTIONS[(method, path)]
+    # Сначала специфичные шаблоны (3-туплы), иначе /api/persons/5/merge/3
+    # матчился бы префиксом ("POST", "/api/persons") как "Создана персона".
     for key, label in ACTIONS.items():
         if len(key) == 3 and key[0] == method and key[1] in path and key[2] in path:
             return label
+    for key, label in ACTIONS.items():
         if len(key) == 2 and key[0] == method and path.startswith(key[1]):
             return label
     return None

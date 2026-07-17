@@ -22,8 +22,12 @@ export function Persons() {
   const load = () => api.persons({ status: filter || undefined, q: q || undefined, page, page_size: PAGE_SIZE })
     .then((r: any) => { setPersons(r.items); setTotal(r.total); })
     .catch(() => {});
-  useEffect(() => { load(); }, [filter, q, page]);
-  useEffect(() => { setPage(1); }, [filter, q]);
+  useEffect(() => { load(); }, [page]);
+  useEffect(() => {
+    if (page !== 1) setPage(1);
+    else load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, q]);
 
   // Обновляем галерею/аватар при готовности апскейла
   useWebSocket("/ws/faces", (msg) => {

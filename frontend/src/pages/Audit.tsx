@@ -24,7 +24,13 @@ export function Audit() {
   };
 
   useEffect(() => { load(); }, [page]);
-  useEffect(() => { setPage(1); load(); }, [user, action, from, to]); // фильтры — сбрасываем на 1-ю страницу
+  // Смена фильтров: возвращаемся на 1-ю страницу; если уже на ней —
+  // загружаем напрямую (setPage(1) не вызвал бы эффект выше).
+  useEffect(() => {
+    if (page !== 1) setPage(1);
+    else load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, action, from, to]);
 
   const exportUrl = (ext: string) => {
     const usp = new URLSearchParams({ token: getToken() || "" });
