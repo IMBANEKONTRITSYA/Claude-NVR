@@ -90,10 +90,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="FaceWatch API", lifespan=lifespan)
 
+_cors_origins = [o.strip() for o in settings.CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    # Список источников из настроек, а не "*": в production фронтенд и API
+    # ходят через один nginx (same-origin), CORS нужен только для dev-сервера.
+    # Auth — Bearer-токен в заголовке (не cookie), поэтому credentials не нужны.
+    allow_origins=_cors_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
