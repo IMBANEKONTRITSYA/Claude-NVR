@@ -9,7 +9,7 @@ from sqlalchemy import select, text
 from .db import engine, Base, SessionLocal
 from .models import User
 from .auth import hash_password
-from .config import settings
+from .config import settings, insecure_secret_problems
 from .profiles import DEFAULT_PROFILE, profile_settings
 from .routers import auth as r_auth, users as r_users, cameras as r_cameras
 from .routers import persons as r_persons, events as r_events, archive as r_archive
@@ -23,6 +23,17 @@ from .audit import AuditMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not settings.ALLOW_INSECURE_DEFAULT_SECRETS:
+        problems = insecure_secret_problems()
+        if problems:
+            for p in problems:
+                print(f"[startup] КРИТИЧНО: {p}", flush=True)
+            raise RuntimeError(
+                "Запуск остановлен: обнаружены секреты по умолчанию из публичного репозитория "
+                "(см. сообщения выше). Заполните .env реальными значениями "
+                "(start.bat делает это автоматически при первом запуске) или, только для "
+                "локальной отладки, установите ALLOW_INSECURE_DEFAULT_SECRETS=true."
+            )
     os.makedirs(settings.MEDIA_PATH, exist_ok=True)
     os.makedirs(os.path.join(settings.MEDIA_PATH, "snapshots"), exist_ok=True)
     os.makedirs(os.path.join(settings.MEDIA_PATH, "segments"), exist_ok=True)
