@@ -52,3 +52,41 @@ jobs:
       - name: Build
         working-directory: frontend
         run: npm run build
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pip-audit
+        run: pip install pip-audit
+      # -r читает requirements.txt напрямую (без установки тяжёлых ML-пакетов
+      # воркера) и резолвит версии против БД уязвимостей PyPI/OSV.
+      - name: Audit backend dependencies
+        run: |
+          pip-audit -r backend/requirements.txt --ignore-vuln PYSEC-2026-1325
+      - name: Audit worker dependencies
+        run: |
+          pip-audit -r worker/requirements.txt --ignore-vuln PYSEC-2026-1325
+      # PYSEC-2026-1325 — таймингова атака Minerva в чистом Python-бэкенде
+      # пакета ecdsa (транзитивная зависимость python-jose). Апстрим не
+      # выпускает фикс (архитектурное ограничение), а FaceWatch подписывает
+      # JWT только алгоритмом HS256 (симметричный HMAC) — код ecdsa вообще
+      # не выполняется. Игнорируем предметно, а не глобально.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+      # npm audit не блокирует сборку: оставшиеся находки — esbuild/vite
+      # (уязвимость только dev-сервера, не собранного билда) и react-router
+      # RSC-режим (проект не использует React Server Components/framework
+      # mode, только клиентский declarative-роутинг) — не применимы к
+      # продакшен-развёртыванию, но остаются видимыми в логе CI.
+      - name: Audit frontend dependencies (report only)
+        working-directory: frontend
+        continue-on-error: true
+        run: npm audit --audit-level=moderate
