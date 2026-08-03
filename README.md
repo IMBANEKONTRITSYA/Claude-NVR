@@ -32,7 +32,7 @@
 - **Медиасервер:** MediaMTX (RTSP/HLS/WebRTC)
 - **Фронтенд:** React 18 + TypeScript + Vite + Recharts
 - **Веб-сервер:** Nginx (alpine)
-- **Оркестрация:** Docker Compose (7 сервисов)
+- **Оркестрация:** Docker Compose (8 сервисов)
 
 ## Запуск под Windows
 
@@ -199,6 +199,15 @@ pgvector-поиск по `face_events` с сортировкой по косин
 Раздел «Мониторинг» (админ и оператор): загрузка CPU и RAM, заполнение диска архива,
 температура, число камер в сети, фактический FPS детекции по каждой камере, длина
 очереди апскейла. Метрики для Grafana — `GET /api/system/prometheus` (только админ).
+
+## Резервное копирование
+
+Сервис `backup` (образ `postgres:16-alpine` + cron) снимает дамп PostgreSQL
+раз в сутки (по умолчанию 03:00, `BACKUP_SCHEDULE` в `.env`) в том `backups`,
+хранит `BACKUP_RETENTION_DAYS` (по умолчанию 14) дней и удаляет более старые
+дампы автоматически. Ручной запуск: `scripts\backup_now.bat` (Windows) или
+`docker compose exec backup /backup/run.sh`. Подробности и процедура
+восстановления — [docs/BACKUP.md](docs/BACKUP.md).
 
 ## Разработка
 

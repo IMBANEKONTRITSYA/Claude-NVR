@@ -142,6 +142,44 @@ services:
           cpus: '2.0'
           memory: 3G
 
+  backup:
+    # Официальный образ postgres:16-alpine — версия pg_dump совпадает с
+    # сервером (pgvector/pg16), плюс встроенный busybox crond, отдельный
+    # Dockerfile/образ не нужен (ТЗ 12: ежедневный автобэкап + ручной запуск).
+    image: postgres:16-alpine
+    container_name: facewatch-backup
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-facewatch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-facewatch}
+      POSTGRES_DB: ${POSTGRES_DB:-facewatch}
+      # Cron-выражение расписания бэкапа (по умолчанию — раз в сутки, 03:00).
+      BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 3 * * *}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - ./backup:/backup:ro
+      # По умолчанию именованный том Docker. Для хранения на отдельном диске
+      # или сетевом хранилище (ТЗ 12) переопределите путь через
+      # docker-compose.override.yml, например:
+      #   volumes: { backups: { driver: local, driver_opts: { type: none, o: bind, device: D:/facewatch-backups } } }
+      - backups:/backups
+    entrypoint: ["/backup/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep crond >/dev/null"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
   frontend:
     build: ./frontend
     container_name: facewatch-frontend
@@ -159,3 +197,4 @@ services:
 volumes:
   pgdata:
   media:
+  backups:
