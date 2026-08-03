@@ -22,7 +22,12 @@ class Settings(BaseSettings):
     RTSP_ENCRYPTION_KEY: str = "ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ="
     MEDIA_PATH: str = "/media"
     ADMIN_PASSWORD: str = "admin"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 12
+    # ТЗ 13: "JWT-токены с refresh-механизмом" — короткий access-токен
+    # (был 12 часов, невозможно отозвать до истечения) + долгоживущий
+    # refresh-токен, который можно отозвать на сервере (logout, смена
+    # пароля, обнаружение повторного использования).
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 14
     WORKER_URL: str = "http://worker:9000"
     RETENTION_DAYS_DEFAULT: int = 30
     # В production фронтенд и backend живут за одним nginx (same-origin, см.

@@ -14,6 +14,23 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class RefreshToken(Base):
+    """ТЗ 13: JWT с refresh-механизмом. Хранится только хэш токена (не сам
+    секрет) — как пароль, чтобы утечка БД не давала готовые refresh-токены."""
+    __tablename__ = "refresh_tokens"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Отличает "потрачен нормальной ротацией" от "отозван logout'ом/сменой
+    # пароля/массовым revoke": повторное предъявление ПЕРВОГО — сигнал кражи
+    # (кто-то ещё владеет уже провёрнутым токеном), второго — ожидаемо и не
+    # должно обрушивать остальные сессии пользователя.
+    rotated: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class Camera(Base):
     __tablename__ = "cameras"
     id: Mapped[int] = mapped_column(primary_key=True)

@@ -1,6 +1,6 @@
 import { NavLink, Route, Routes, Navigate, useNavigate } from "react-router-dom";
 import { Suspense, lazy, useEffect, useState } from "react";
-import { api, clearAuth, getRole, getToken, getUser } from "./api";
+import { api, getRole, getToken, getUser } from "./api";
 import { Login } from "./pages/Login";
 
 const Dashboard = lazy(() => import("./pages/Dashboard").then(m => ({ default: m.Dashboard })));
@@ -36,7 +36,7 @@ function Layout({ children }: { children: any }) {
   const role = getRole();
   const user = getUser();
   const can = (...roles: string[]) => roles.includes(role);
-  const logout = () => { clearAuth(); nav("/login"); };
+  const logout = () => { api.logout().then(() => nav("/login")); };
   return (
     <div className="layout">
       <aside className="sidebar">

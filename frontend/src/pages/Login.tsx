@@ -14,7 +14,7 @@ export function Login() {
     setErr(""); setBusy(true);
     try {
       const r = await api.login(u, p);
-      setAuth(r.access_token, r.role, r.username);
+      setAuth(r.access_token, r.refresh_token, r.role, r.username);
       nav("/dashboard");
     } catch (e: any) { setErr(e.message); }
     finally { setBusy(false); }
