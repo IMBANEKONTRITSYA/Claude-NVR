@@ -14,6 +14,7 @@ import json
 import shlex
 import threading
 import subprocess
+import traceback
 from datetime import datetime, timedelta
 
 import cv2
@@ -156,6 +157,8 @@ class FaceEvent(Base):
     person_id = Column(Integer, ForeignKey("persons.id"), nullable=True)
     ts = Column(DateTime)
     snapshot_path = Column(String)
+    orig_snapshot_path = Column(String)
+    enhanced = Column(Boolean, default=False)
     embedding = Column(Vector(512))
     bbox = Column(JSON)
     is_known = Column(Boolean)
@@ -252,15 +255,24 @@ def find_or_create_person(s, emb: np.ndarray) -> tuple[int, bool]:
     return p.id, False
 
 
-def save_face_snapshot(frame, cam_id: int, bbox) -> str:
+def save_face_snapshot(frame, cam_id: int, bbox) -> str | None:
+    """Кроп лица с запасом по краям (вплотную по bbox лицо выглядит обрезанным).
+    Возвращает None, если записать файл не удалось."""
+    h, w = frame.shape[:2]
     x1, y1, x2, y2 = [int(v) for v in bbox]
-    x1, y1 = max(0, x1), max(0, y1)
-    crop = frame[y1:y2, x1:x2]
+    pad_x = int((x2 - x1) * 0.25)
+    pad_y = int((y2 - y1) * 0.25)
+    x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+    x2, y2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
+    crop = frame[y1:y2, x1:x2] if (x2 > x1 and y2 > y1) else frame
     if crop.size == 0:
         crop = frame
+
     fname = f"cam{cam_id}_{int(time.time() * 1000)}.jpg"
     fpath = os.path.join(MEDIA_PATH, "snapshots", fname)
-    cv2.imwrite(fpath, crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not cv2.imwrite(fpath, crop, [cv2.IMWRITE_JPEG_QUALITY, 85]):
+        print(f"[cam {cam_id}] не удалось записать снимок {fpath}", flush=True)
+        return None
     return f"snapshots/{fname}"
 
 
@@ -454,91 +466,99 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
             continue
 
         fh, fw = frame.shape[:2]
-        with Session() as s:
-            for f in faces:
-                emb = np.asarray(f.normed_embedding, dtype=np.float32)
-                if emb.shape[0] != 512:
-                    continue
-                bbox = f.bbox.tolist()
-                pid, matched = find_or_create_person(s, emb)
-                person = s.get(Person, pid)
-                s.commit()  # фиксируем возможную новую персону сразу
+        try:
+            process_faces(cam_id, frame, faces, fw, fh, now, last_event_at)
+        except Exception:
+            # Любой сбой на одном кадре не должен убивать нить камеры
+            print(f"[cam {cam_id}] ошибка обработки лиц:\n{traceback.format_exc()}", flush=True)
 
-                name = person.name or f"Неизвестный #{pid}"
-                is_known = person.status == "known"
-                bbox_json = {"x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3]}
 
-                # Watchlist-оповещение: свой redis-cooldown, шлём из фоновой нити,
-                # чтобы HTTP к Telegram (до 5с) не тормозил обработку кадров
-                if is_known and getattr(person, "alert_on_detection", False):
-                    threading.Thread(
-                        target=send_telegram_alert,
-                        args=(pid, person.name or f"#{pid}", cam_id, ""),
-                        daemon=True,
-                    ).start()
+def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at):
+    with Session() as s:
+        for f in faces:
+            emb = np.asarray(f.normed_embedding, dtype=np.float32)
+            if emb.shape[0] != 512:
+                continue
+            bbox = f.bbox.tolist()
+            pid, matched = find_or_create_person(s, emb)
+            person = s.get(Person, pid)
+            s.commit()  # фиксируем возможную новую персону сразу
 
-                # Тротлинг событий: при 5 FPS человек в кадре генерировал бы
-                # 18k событий/час (снимок + 4КБ вектор + задача апскейла на кадр).
-                # Событие — не чаще раза в event_cooldown_sec на персону на камеру;
-                # для live-оверлея каждый кадр уходит лёгкое сообщение type=box.
-                if now - last_event_at.get(pid, 0.0) < CONFIG["event_cooldown_sec"]:
-                    try:
-                        r.publish("faces:new", json.dumps({
-                            "type": "box",
-                            "camera_id": cam_id,
-                            "person_id": pid,
-                            "name": name,
-                            "is_known": is_known,
-                            "bbox": bbox_json,
-                            "frame_w": fw,
-                            "frame_h": fh,
-                        }))
-                    except Exception:
-                        pass
-                    continue
-                last_event_at[pid] = now
-                if len(last_event_at) > 500:
-                    cutoff_t = now - 300
-                    for k in [k for k, v in last_event_at.items() if v < cutoff_t]:
-                        del last_event_at[k]
+            name = person.name or f"Неизвестный #{pid}"
+            is_known = person.status == "known"
+            bbox_json = {"x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3]}
 
-                snap_rel = save_face_snapshot(frame, cam_id, bbox)
-                ev = FaceEvent(
-                    camera_id=cam_id,
-                    person_id=pid,
-                    ts=datetime.utcnow(),
-                    snapshot_path=snap_rel,
-                    orig_snapshot_path=snap_rel,
-                    enhanced=False,
-                    embedding=emb.tolist(),
-                    bbox=bbox_json,
-                    is_known=is_known,
-                )
-                s.add(ev)
-                if person.avatar_path is None:
-                    person.avatar_path = snap_rel
-                s.commit()
+            # Watchlist-оповещение: свой redis-cooldown, шлём из фоновой нити,
+            # чтобы HTTP к Telegram (до 5с) не тормозил обработку кадров
+            if is_known and getattr(person, "alert_on_detection", False):
+                threading.Thread(
+                    target=send_telegram_alert,
+                    args=(pid, person.name or f"#{pid}", cam_id, ""),
+                    daemon=True,
+                ).start()
 
+            # Тротлинг событий: при 5 FPS человек в кадре генерировал бы
+            # 18k событий/час (снимок + 4КБ вектор + задача апскейла на кадр).
+            # Событие — не чаще раза в event_cooldown_sec на персону на камеру;
+            # для live-оверлея каждый кадр уходит лёгкое сообщение type=box.
+            if now - last_event_at.get(pid, 0.0) < CONFIG["event_cooldown_sec"]:
                 try:
                     r.publish("faces:new", json.dumps({
-                        "type": "face",
-                        "event_id": ev.id,
+                        "type": "box",
                         "camera_id": cam_id,
                         "person_id": pid,
                         "name": name,
                         "is_known": is_known,
-                        "snapshot": snap_rel,
-                        "ts": ev.ts.isoformat(),
                         "bbox": bbox_json,
                         "frame_w": fw,
                         "frame_h": fh,
                     }))
-                    # Ставим скриншот в очередь на нейросетевой апскейл (асинхронно).
-                    # Ограничиваем очередь, чтобы медленный CPU-апскейл не копил бэклог часами.
-                    if r.llen("upscale:queue") < 500:
-                        r.lpush("upscale:queue", json.dumps({"event_id": ev.id}))
                 except Exception:
                     pass
+                continue
+            last_event_at[pid] = now
+            if len(last_event_at) > 500:
+                cutoff_t = now - 300
+                for k in [k for k, v in last_event_at.items() if v < cutoff_t]:
+                    del last_event_at[k]
+
+            snap_rel = save_face_snapshot(frame, cam_id, bbox)
+            ev = FaceEvent(
+                camera_id=cam_id,
+                person_id=pid,
+                ts=datetime.utcnow(),
+                snapshot_path=snap_rel,
+                orig_snapshot_path=snap_rel,
+                enhanced=False,
+                embedding=emb.tolist(),
+                bbox=bbox_json,
+                is_known=is_known,
+            )
+            s.add(ev)
+            if person.avatar_path is None and snap_rel:
+                person.avatar_path = snap_rel
+            s.commit()
+
+            try:
+                r.publish("faces:new", json.dumps({
+                    "type": "face",
+                    "event_id": ev.id,
+                    "camera_id": cam_id,
+                    "person_id": pid,
+                    "name": name,
+                    "is_known": is_known,
+                    "snapshot": snap_rel,
+                    "ts": ev.ts.isoformat(),
+                    "bbox": bbox_json,
+                    "frame_w": fw,
+                    "frame_h": fh,
+                }))
+                # Ставим скриншот в очередь на нейросетевой апскейл (асинхронно).
+                # Ограничиваем очередь, чтобы медленный CPU-апскейл не копил бэклог часами.
+                if r.llen("upscale:queue") < 500:
+                    r.lpush("upscale:queue", json.dumps({"event_id": ev.id}))
+            except Exception:
+                pass
 
 
 def _to_vec(val) -> np.ndarray:
@@ -687,4 +707,7 @@ def manager():
 
 if __name__ == "__main__":
     time.sleep(5)
+    # Не полагаемся на то, что backend уже создал структуру каталогов
+    for sub in ("snapshots", "segments", "avatars", "uploads"):
+        os.makedirs(os.path.join(MEDIA_PATH, sub), exist_ok=True)
     manager()

@@ -69,6 +69,7 @@ export const api = {
   personMerge: (src: number, dst: number) => req(`/api/persons/${src}/merge/${dst}`, { method: "POST" }),
   personGallery: (id: number) => req(`/api/persons/${id}/gallery`),
   personEnhance: (id: number) => req(`/api/persons/${id}/enhance`, { method: "POST" }),
+  personDelete: (id: number) => req(`/api/persons/${id}`, { method: "DELETE" }),
   searchFace: (form: FormData) => req("/api/search/face", { method: "POST", body: form }),
   events: (limit = 100) => req(`/api/events?limit=${limit}`),
   archive: (params: Record<string, string>) => {

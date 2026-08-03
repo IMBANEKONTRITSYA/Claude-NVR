@@ -5,7 +5,7 @@ import { Pager } from "../Pager";
 import { useUI } from "../ui";
 
 export function Persons() {
-  const { toast } = useUI();
+  const { toast, confirm } = useUI();
   const [persons, setPersons] = useState<any[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -68,6 +68,16 @@ export function Persons() {
     load();
   };
 
+  const remove = async () => {
+    if (!(await confirm(`Удалить персону «${sel.name || `Неизвестный #${sel.id}`}» и все её снимки?`))) return;
+    try {
+      await api.personDelete(sel.id);
+      setSel(null);
+      load();
+      toast("Персона удалена", "ok");
+    } catch (e: any) { toast(e.message, "err"); }
+  };
+
   return (
     <div>
       <h2>Карточки персон</h2>
@@ -123,6 +133,7 @@ export function Persons() {
                 <button className="btn secondary" onClick={enhance}>Улучшить качество</button>
                 <input type="number" placeholder="ID для слияния" value={mergeTarget ?? ""} onChange={e => setMergeTarget(parseInt(e.target.value) || null)} style={{ width: 160 }} />
                 <button className="btn secondary" onClick={merge} disabled={!mergeTarget}>Слить</button>
+                <button className="btn danger" onClick={remove}>Удалить</button>
               </div>
               {enhMsg && <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>{enhMsg}</div>}
               <div style={{ marginTop: 12 }}>
