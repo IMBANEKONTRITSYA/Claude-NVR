@@ -38,6 +38,19 @@ def test_jwt_contains_role_and_subject():
     assert "exp" in payload
 
 
+def test_cors_does_not_allow_wildcard_with_credentials():
+    """allow_origins=['*'] + allow_credentials=True — небезопасная комбинация
+    (и запрещена спецификацией fetch: браузер такой ответ отклонит).
+    CORS должен ограничиваться конкретным списком источников."""
+    from app.main import app
+    from starlette.middleware.cors import CORSMiddleware
+
+    cors = next(m for m in app.user_middleware if m.cls is CORSMiddleware)
+    origins = cors.kwargs.get("allow_origins")
+    assert origins != ["*"], "Список источников не должен быть '*'"
+    assert cors.kwargs.get("allow_credentials") is not True or origins != ["*"]
+
+
 def test_jwt_rejects_tampered_signature():
     token = create_token("admin", "admin")
     from jose import JWTError
