@@ -10,7 +10,12 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      - "5432:5432"
+      # Только на loopback: backend/worker/upscaler ходят по внутренней
+      # docker-сети (хост "postgres"), порт наружу нужен лишь для локальной
+      # отладки psql с той же машины. POSTGRES_PASSWORD по умолчанию —
+      # публично известное значение "facewatch" (ТЗ 13), поэтому открывать
+      # порт на все интерфейсы означало бы БД без реальной защиты.
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-facewatch}"]
       interval: 5s
@@ -22,7 +27,9 @@ services:
     image: redis:7-alpine
     container_name: facewatch-redis
     ports:
-      - "6379:6379"
+      # Redis не требует пароля по умолчанию — публикация на все интерфейсы
+      # дала бы любому в локальной сети полный доступ к очередям/кэшу.
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -34,9 +41,14 @@ services:
     image: bluenviron/mediamtx:latest
     container_name: facewatch-mediamtx
     ports:
-      - "8554:8554"   # RTSP
-      - "8888:8888"   # HLS
-      - "8889:8889"   # WebRTC
+      # MediaMTX не требует аутентификации по умолчанию (ТЗ 13). Worker
+      # публикует камеры и nginx проксирует HLS через внутреннюю docker-сеть
+      # (хост "mediamtx") — публикация наружу никому не нужна и означала бы,
+      # что любой в локальной сети смотрит камеры без входа в систему.
+      # Оставлено на loopback только для локальной отладки через VLC/ffplay.
+      - "127.0.0.1:8554:8554"   # RTSP
+      - "127.0.0.1:8888:8888"   # HLS
+      - "127.0.0.1:8889:8889"   # WebRTC
     volumes:
       - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
     restart: unless-stopped
