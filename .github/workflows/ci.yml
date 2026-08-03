@@ -17,10 +17,16 @@ jobs:
         working-directory: backend
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest
-      - name: Run tests
+          pip install -r requirements.txt pytest pytest-cov
+      - name: Run tests with coverage
         working-directory: backend
-        run: pytest -q
+        # Текущие тесты — юнит-логика (auth/шифрование/валидация/роутинг),
+        # без реальных Postgres/Redis в CI, поэтому обработчики роутеров
+        # почти не покрыты. Порог ниже цели ТЗ (≥70%) — фиксирует текущий
+        # уровень (не даёт покрытию просесть незаметно), а не заявляет
+        # соответствие цели. Поднять порог к 70% — задача следующего цикла
+        # (нужны интеграционные тесты с БД в CI).
+        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=45 -q
 
   worker:
     runs-on: ubuntu-latest
