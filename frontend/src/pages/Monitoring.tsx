@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, getToken } from "../api";
-import { getRole } from "../api";
+import { api, getToken, getRole } from "../api";
 
 function Bar({ percent, warn = 75, crit = 90 }: { percent: number; warn?: number; crit?: number }) {
   const color = percent >= crit ? "var(--red)" : percent >= warn ? "var(--orange)" : "var(--green)";
@@ -83,7 +82,7 @@ export function Monitoring() {
         <div className="card">
           <h3 style={{ marginTop: 0 }}>Prometheus</h3>
           <p className="muted">Метрики в формате Prometheus для внешнего мониторинга (Grafana).</p>
-          <a className="btn secondary" href={`/api/system/prometheus`} target="_blank" rel="noreferrer">
+          <a className="btn secondary" href={`/api/system/prometheus?token=${getToken()}`} target="_blank" rel="noreferrer">
             Открыть /api/system/prometheus
           </a>
         </div>

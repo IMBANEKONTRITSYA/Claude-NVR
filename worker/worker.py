@@ -208,11 +208,14 @@ def detect_providers() -> list[str]:
 
 
 ACCELERATOR = "CPU"
+# Глобальная ссылка на модель: нити камер читают её каждый кадр, поэтому
+# смена модели в профиле применяется без перезапуска контейнера.
+FACE_APP = None
 
 
 def load_face_app(model_name: str | None = None):
     """Загружает модель детекции/распознавания с учётом профиля (ТЗ 18.5)."""
-    global ACCELERATOR
+    global ACCELERATOR, FACE_APP
     from insightface.app import FaceAnalysis
     name = model_name or CONFIG["face_model"]
     providers = detect_providers()
@@ -221,6 +224,7 @@ def load_face_app(model_name: str | None = None):
     print(f"[worker] модель={name} ускоритель={ACCELERATOR} det_size={size}", flush=True)
     app = FaceAnalysis(name=name, providers=providers)
     app.prepare(ctx_id=0, det_size=(size, size))
+    FACE_APP = app
     return app
 
 
@@ -515,7 +519,8 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         faces = []
         try:
             if run_detector:
-                detected = face_app.get(frame)
+                # Читаем глобальную модель, чтобы подхватить её горячую замену
+                detected = (FACE_APP or face_app).get(frame)
                 faces = [f for f in detected if bbox_in_roi(f.bbox.tolist(), roi_mask)]
         except Exception as e:
             print(f"[cam {cam_id}] ошибка распознавания: {e}", flush=True)
@@ -750,9 +755,13 @@ def cleanup_old():
 
 
 def manager():
+    # Настройки читаем ДО загрузки модели: профиль задаёт face_model и
+    # detect_width, иначе выбор в админке не применялся бы до перезапуска.
+    refresh_config()
     print("[worker] загрузка модели InsightFace...", flush=True)
     face_app = load_face_app()
     print("[worker] модель готова", flush=True)
+    loaded_model = (CONFIG["face_model"], CONFIG["detect_width"])
 
     # Внутренний HTTP-API для извлечения эмбеддинга (поиск по фото)
     try:
@@ -766,12 +775,19 @@ def manager():
     last_cleanup = 0.0
     last_recluster = 0.0
 
-    refresh_config()
     print(f"[worker] конфиг: {CONFIG}", flush=True)
 
     while True:
         try:
             refresh_config()
+            # Смена модели/разрешения в профиле применяется без перезапуска
+            if (CONFIG["face_model"], CONFIG["detect_width"]) != loaded_model:
+                print("[worker] параметры модели изменились, перезагружаю", flush=True)
+                try:
+                    load_face_app()  # обновляет глобальный FACE_APP
+                    loaded_model = (CONFIG["face_model"], CONFIG["detect_width"])
+                except Exception as e:
+                    print(f"[worker] не удалось сменить модель: {e}", flush=True)
             with Session() as s:
                 cams = s.execute(select(Camera).where(Camera.enabled == True)).scalars().all()
                 for cam in cams:

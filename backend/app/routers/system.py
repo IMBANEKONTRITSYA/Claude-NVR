@@ -1,16 +1,14 @@
 """Системный мониторинг (ТЗ 12): метрики хоста, состояние сервисов, Prometheus."""
-import os
 import shutil
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import psutil
-from fastapi import APIRouter, Depends, Response
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from jose import jwt, JWTError
 from sqlalchemy import select, func
 
 from ..config import settings
-from ..db import get_db, SessionLocal
+from ..db import SessionLocal
 from ..models import Camera, FaceEvent, VideoSegment
 from ..auth import require_role
 from ..services.pubsub import get_redis
@@ -90,8 +88,18 @@ async def system_metrics(_=Depends(require_role("admin", "operator"))):
 
 
 @router.get("/prometheus")
-async def prometheus_metrics(_=Depends(require_role("admin"))):
-    """Экспорт в формате Prometheus (ТЗ 12: интеграция с Prometheus + Grafana)."""
+async def prometheus_metrics(token: str = Query(...)):
+    """Экспорт в формате Prometheus (ТЗ 12: интеграция с Prometheus + Grafana).
+
+    Скрейперы не умеют слать Bearer-заголовок, поэтому токен передаётся
+    в query — как и для остальных «ссылочных» эндпоинтов (отчёты, медиа).
+    """
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        if payload.get("role") != "admin":
+            raise HTTPException(403, "Только для администратора")
+    except JWTError:
+        raise HTTPException(401, "Не авторизован")
     m = await _collect()
     lines = [
         "# HELP facewatch_cpu_percent Загрузка CPU, %",
