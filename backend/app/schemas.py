@@ -35,9 +35,11 @@ class RtspTest(BaseModel):
 
 class CameraIn(BaseModel):
     name: str
-    rtsp_url: str
+    rtsp_url: str                      # основной поток: запись и просмотр
+    sub_rtsp_url: str | None = None    # субпоток: детекция (ТЗ 18.1)
     location: str = ""
     enabled: bool = True
+    motion_sensitivity: int | None = None
 
 
 class CameraOut(BaseModel):
@@ -46,6 +48,8 @@ class CameraOut(BaseModel):
     location: str
     enabled: bool
     status: str
+    has_substream: bool = False
+    motion_sensitivity: int | None = None
 
     class Config:
         from_attributes = True

@@ -10,12 +10,14 @@ from .db import engine, Base, SessionLocal
 from .models import User
 from .auth import hash_password
 from .config import settings
+from .profiles import DEFAULT_PROFILE, profile_settings
 from .routers import auth as r_auth, users as r_users, cameras as r_cameras
 from .routers import persons as r_persons, events as r_events, archive as r_archive
 from .routers import stats as r_stats, reports as r_reports, ws as r_ws
 from .routers import search as r_search
 from .routers import settings as r_settings
 from .routers import audit as r_audit
+from .routers import system as r_system
 from .audit import AuditMiddleware
 
 
@@ -41,6 +43,12 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE persons ADD COLUMN IF NOT EXISTS alert_on_detection boolean DEFAULT false"
         ))
+        await conn.execute(text(
+            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS sub_rtsp_url_enc text"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS motion_sensitivity integer"
+        ))
         # HNSW-индексы pgvector для быстрого поиска по эмбеддингам (≤5с на 100k лиц)
         for stmt in (
             "CREATE INDEX IF NOT EXISTS idx_face_events_embedding ON face_events "
@@ -63,11 +71,14 @@ async def lifespan(app: FastAPI):
             "retention_days": str(settings.RETENTION_DAYS_DEFAULT),
             "motion_threshold": "1500",
             "similarity_threshold": "0.45",
-            "detection_fps": "5",
             "event_cooldown_sec": "10",
             "telegram_bot_token": "",
             "telegram_chat_id": "",
             "alert_cooldown_sec": "300",
+            "record_codec": "h264",
+            "performance_profile": DEFAULT_PROFILE,
+            # detection_fps, frame_skip, face_model, upscale_mode и т.д.
+            **profile_settings(DEFAULT_PROFILE),
         }
         existing = {s.key for s in (await db.execute(select(Setting))).scalars().all()}
         for k, v in defaults.items():
@@ -99,6 +110,7 @@ app.include_router(r_reports.router)
 app.include_router(r_search.router)
 app.include_router(r_settings.router)
 app.include_router(r_audit.router)
+app.include_router(r_system.router)
 app.include_router(r_ws.router)
 
 

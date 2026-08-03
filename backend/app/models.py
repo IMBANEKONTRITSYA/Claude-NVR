@@ -18,11 +18,13 @@ class Camera(Base):
     __tablename__ = "cameras"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
-    rtsp_url_enc: Mapped[str] = mapped_column(Text)
+    rtsp_url_enc: Mapped[str] = mapped_column(Text)              # основной поток: запись + HLS
+    sub_rtsp_url_enc: Mapped[str | None] = mapped_column(Text, nullable=True)  # субпоток: аналитика
     location: Mapped[str] = mapped_column(String(120), default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     status: Mapped[str] = mapped_column(String(20), default="offline")  # online|offline|disabled
     roi: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # {"polygons": [[[x,y],...]]}
+    motion_sensitivity: Mapped[int | None] = mapped_column(Integer, nullable=True)  # переопределяет профиль
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

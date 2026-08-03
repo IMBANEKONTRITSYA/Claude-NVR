@@ -14,6 +14,7 @@ const Users = lazy(() => import("./pages/Users").then(m => ({ default: m.Users }
 const Reports = lazy(() => import("./pages/Reports").then(m => ({ default: m.Reports })));
 const Search = lazy(() => import("./pages/Search").then(m => ({ default: m.Search })));
 const SettingsPage = lazy(() => import("./pages/Settings").then(m => ({ default: m.Settings })));
+const Monitoring = lazy(() => import("./pages/Monitoring").then(m => ({ default: m.Monitoring })));
 const Audit = lazy(() => import("./pages/Audit").then(m => ({ default: m.Audit })));
 const Profile = lazy(() => import("./pages/Profile").then(m => ({ default: m.Profile })));
 
@@ -51,6 +52,7 @@ function Layout({ children }: { children: any }) {
           {can("admin", "operator") && <NavLink to="/reports">Отчёты</NavLink>}
           {can("admin") && <NavLink to="/cameras">Управление камерами</NavLink>}
           {can("admin") && <NavLink to="/users">Пользователи</NavLink>}
+          {can("admin", "operator") && <NavLink to="/monitoring">Мониторинг</NavLink>}
           {can("admin") && <NavLink to="/settings">Настройки</NavLink>}
           {can("admin") && <NavLink to="/audit">Журнал действий</NavLink>}
         </nav>
@@ -88,6 +90,7 @@ export function App() {
       <Route path="/search" element={<Private roles={["admin", "operator"]}><Search /></Private>} />
       <Route path="/cameras" element={<Private roles={["admin"]}><Cameras /></Private>} />
       <Route path="/users" element={<Private roles={["admin"]}><Users /></Private>} />
+      <Route path="/monitoring" element={<Private roles={["admin", "operator"]}><Monitoring /></Private>} />
       <Route path="/settings" element={<Private roles={["admin"]}><SettingsPage /></Private>} />
       <Route path="/audit" element={<Private roles={["admin"]}><Audit /></Private>} />
       <Route path="/profile" element={<Private><Profile /></Private>} />

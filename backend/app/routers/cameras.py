@@ -18,7 +18,13 @@ router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 @router.get("", response_model=list[CameraOut])
 async def list_cameras(_=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     r = await db.execute(select(Camera).order_by(Camera.id))
-    return r.scalars().all()
+    return [
+        CameraOut(
+            id=c.id, name=c.name, location=c.location, enabled=c.enabled, status=c.status,
+            has_substream=bool(c.sub_rtsp_url_enc), motion_sensitivity=c.motion_sensitivity,
+        )
+        for c in r.scalars().all()
+    ]
 
 
 @router.post("", response_model=CameraOut)
@@ -26,15 +32,20 @@ async def add_camera(payload: CameraIn, _=Depends(require_role("admin")), db: As
     cam = Camera(
         name=payload.name,
         rtsp_url_enc=encrypt(payload.rtsp_url),
+        sub_rtsp_url_enc=encrypt(payload.sub_rtsp_url) if payload.sub_rtsp_url else None,
         location=payload.location,
         enabled=payload.enabled,
+        motion_sensitivity=payload.motion_sensitivity,
         status="offline",
     )
     db.add(cam)
     await db.commit()
     await db.refresh(cam)
     await get_redis().publish("cameras:changed", str(cam.id))
-    return cam
+    return CameraOut(
+        id=cam.id, name=cam.name, location=cam.location, enabled=cam.enabled, status=cam.status,
+        has_substream=bool(cam.sub_rtsp_url_enc), motion_sensitivity=cam.motion_sensitivity,
+    )
 
 
 @router.put("/{cam_id}", response_model=CameraOut)
@@ -44,12 +55,19 @@ async def update_camera(cam_id: int, payload: CameraIn, _=Depends(require_role("
         raise HTTPException(404, "Камера не найдена")
     cam.name = payload.name
     cam.rtsp_url_enc = encrypt(payload.rtsp_url)
+    # Пустое поле субпотока очищает его, отсутствующее — оставляет прежнее значение
+    if payload.sub_rtsp_url is not None:
+        cam.sub_rtsp_url_enc = encrypt(payload.sub_rtsp_url) if payload.sub_rtsp_url else None
     cam.location = payload.location
     cam.enabled = payload.enabled
+    cam.motion_sensitivity = payload.motion_sensitivity
     await db.commit()
     await db.refresh(cam)
     await get_redis().publish("cameras:changed", str(cam.id))
-    return cam
+    return CameraOut(
+        id=cam.id, name=cam.name, location=cam.location, enabled=cam.enabled, status=cam.status,
+        has_substream=bool(cam.sub_rtsp_url_enc), motion_sensitivity=cam.motion_sensitivity,
+    )
 
 
 @router.delete("/{cam_id}")

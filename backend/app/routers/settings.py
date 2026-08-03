@@ -7,6 +7,7 @@ from sqlalchemy import select
 from ..db import get_db
 from ..models import Setting
 from ..auth import require_role
+from ..profiles import PROFILES, profile_settings
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -20,6 +21,23 @@ SCHEMA: dict[str, tuple] = {
     "alert_cooldown_sec": (int, 10, 86400),
     "telegram_bot_token": (str,),     # просто строка, может быть пустой
     "telegram_chat_id": (str,),
+    # Профиль производительности и его параметры (ТЗ 18)
+    "performance_profile": (str,),
+    "frame_skip": (int, 0, 20),
+    "motion_prefilter": (int, 0, 1),
+    "idle_fps": (int, 1, 30),
+    "face_model": (str,),
+    "upscale_mode": (str,),           # manual | avatar | all
+    "cluster_interval_min": (int, 1, 1440),
+    "detect_width": (int, 320, 1920),
+    "record_codec": (str,),           # h264 | h265
+}
+
+ENUMS = {
+    "performance_profile": set(PROFILES),
+    "face_model": {"buffalo_s", "buffalo_l"},
+    "upscale_mode": {"manual", "avatar", "all"},
+    "record_codec": {"h264", "h265"},
 }
 
 
@@ -32,6 +50,14 @@ class SettingsUpdate(BaseModel):
     alert_cooldown_sec: int | None = None
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
+    frame_skip: int | None = None
+    motion_prefilter: int | None = None
+    idle_fps: int | None = None
+    face_model: str | None = None
+    upscale_mode: str | None = None
+    cluster_interval_min: int | None = None
+    detect_width: int | None = None
+    record_codec: str | None = None
 
 
 @router.get("")
@@ -54,11 +80,56 @@ async def update_settings(payload: SettingsUpdate, _=Depends(require_role("admin
             lo, hi = spec[1], spec[2]
             if not (lo <= casted <= hi):
                 raise HTTPException(400, f"{key} должно быть в диапазоне [{lo}, {hi}]")
+        allowed = ENUMS.get(key)
+        if allowed and casted not in allowed:
+            raise HTTPException(400, f"{key}: допустимые значения — {', '.join(sorted(allowed))}")
         existing = await db.get(Setting, key)
         if existing:
             existing.value = str(casted)
         else:
             db.add(Setting(key=key, value=str(casted)))
+    # Ручная правка параметра профиля переводит его в режим «своя настройка»
+    if any(k in PROFILE_TUNABLES for k in data):
+        prof = await db.get(Setting, "performance_profile")
+        if prof and prof.value in PROFILES:
+            prof.value = "custom"
+    await db.commit()
+    rows = (await db.execute(select(Setting))).scalars().all()
+    return {s.key: s.value for s in rows}
+
+
+PROFILE_TUNABLES = {
+    "detection_fps", "frame_skip", "motion_prefilter", "idle_fps",
+    "face_model", "upscale_mode", "cluster_interval_min", "detect_width",
+}
+
+
+@router.get("/profiles")
+async def list_profiles(_=Depends(require_role("admin"))):
+    """Доступные профили производительности и их параметры (ТЗ 18.9)."""
+    return {
+        "profiles": PROFILES,
+        "titles": {
+            "economy": "Экономный — слабое железо (Intel N100), 4–8 камер",
+            "standard": "Стандартный — Core i3 / Ryzen 3, 8–12 камер",
+            "maximum": "Максимальный — Core i5+ / GPU, 12–16 камер",
+        },
+    }
+
+
+@router.post("/profile/{name}")
+async def apply_profile(name: str, _=Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
+    """Применяет профиль: перезаписывает управляемые им параметры."""
+    if name not in PROFILES:
+        raise HTTPException(400, f"Неизвестный профиль: {name}")
+    values = profile_settings(name)
+    values["performance_profile"] = name
+    for key, val in values.items():
+        existing = await db.get(Setting, key)
+        if existing:
+            existing.value = val
+        else:
+            db.add(Setting(key=key, value=val))
     await db.commit()
     rows = (await db.execute(select(Setting))).scalars().all()
     return {s.key: s.value for s in rows}

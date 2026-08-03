@@ -87,6 +87,9 @@ export const api = {
   getSettings: () => req("/api/settings"),
   putSettings: (b: any) => req("/api/settings", { method: "PUT", body: JSON.stringify(b) }),
   testTelegram: () => req("/api/settings/test-telegram", { method: "POST" }),
+  listProfiles: () => req("/api/settings/profiles"),
+  applyProfile: (name: string) => req(`/api/settings/profile/${name}`, { method: "POST" }),
+  sysMetrics: () => req("/api/system/metrics"),
   health: async () => {
     const r = await fetch("/api/health");
     try { return await r.json(); } catch { return { ok: false, db: "?", redis: "?" }; }

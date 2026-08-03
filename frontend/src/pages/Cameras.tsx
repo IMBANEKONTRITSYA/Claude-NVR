@@ -5,7 +5,7 @@ import { useUI } from "../ui";
 export function Cameras() {
   const { toast, confirm } = useUI();
   const [cams, setCams] = useState<any[]>([]);
-  const [form, setForm] = useState({ name: "", rtsp_url: "", location: "", enabled: true });
+  const [form, setForm] = useState({ name: "", rtsp_url: "", sub_rtsp_url: "", location: "", enabled: true });
   const [editing, setEditing] = useState<number | null>(null);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string>("");
@@ -17,7 +17,7 @@ export function Cameras() {
     try {
       if (editing) await api.camUpdate(editing, form);
       else await api.camAdd(form);
-      setForm({ name: "", rtsp_url: "", location: "", enabled: true });
+      setForm({ name: "", rtsp_url: "", sub_rtsp_url: "", location: "", enabled: true });
       setEditing(null);
       load();
       toast(editing ? "Камера обновлена" : "Камера добавлена", "ok");
@@ -41,6 +41,7 @@ export function Cameras() {
         <div className="grid" style={{ gridTemplateColumns: "1fr 2fr 1fr", marginBottom: 8 }}>
           <div><label>Название</label><input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></div>
           <div><label>RTSP URL</label><input value={form.rtsp_url} onChange={e => setForm({ ...form, rtsp_url: e.target.value })} placeholder="rtsp://user:pass@ip:554/stream" /></div>
+          <div><label>RTSP субпотока (для детекции)</label><input value={form.sub_rtsp_url} onChange={e => setForm({ ...form, sub_rtsp_url: e.target.value })} placeholder="640x360, необязательно" /></div>
           <div><label>Локация</label><input value={form.location} onChange={e => setForm({ ...form, location: e.target.value })} /></div>
         </div>
         <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginRight: 12 }}>
@@ -57,7 +58,7 @@ export function Cameras() {
             } catch (e: any) { setTestResult(`Ошибка: ${e.message}`); }
             finally { setTesting(false); }
           }}>{testing ? "Проверка..." : "Проверить RTSP"}</button>
-        {editing && <button className="btn secondary" onClick={() => { setEditing(null); setForm({ name: "", rtsp_url: "", location: "", enabled: true }); setTestResult(""); }} style={{ marginLeft: 8 }}>Отмена</button>}
+        {editing && <button className="btn secondary" onClick={() => { setEditing(null); setForm({ name: "", rtsp_url: "", sub_rtsp_url: "", location: "", enabled: true }); setTestResult(""); }} style={{ marginLeft: 8 }}>Отмена</button>}
         {testResult && <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>{testResult}</div>}
       </div>
 
@@ -68,7 +69,7 @@ export function Cameras() {
             {cams.map(c => (
               <tr key={c.id}>
                 <td>{c.id}</td>
-                <td>{c.name}</td>
+                <td>{c.name}{c.has_substream && <span className="muted" style={{ fontSize: 10, marginLeft: 6 }} title="Детекция идёт по субпотоку">SUB</span>}</td>
                 <td>{c.location}</td>
                 <td><span className={`badge ${c.status}`}>{c.status}</span></td>
                 <td>
@@ -81,7 +82,7 @@ export function Cameras() {
                   </label>
                 </td>
                 <td>
-                  <button className="btn secondary" onClick={() => { setEditing(c.id); setForm({ name: c.name, rtsp_url: "", location: c.location, enabled: c.enabled }); }}>Изм.</button>
+                  <button className="btn secondary" onClick={() => { setEditing(c.id); setForm({ name: c.name, rtsp_url: "", sub_rtsp_url: "", location: c.location, enabled: c.enabled }); }}>Изм.</button>
                   <button className="btn danger" onClick={() => remove(c.id)} style={{ marginLeft: 4 }}>Удалить</button>
                 </td>
               </tr>

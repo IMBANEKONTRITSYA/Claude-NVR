@@ -46,12 +46,34 @@ CONFIG = {
     "retention_days": RETENTION_DAYS,
     "motion_threshold": 1500,
     "similarity_threshold": 0.45,   # 1 - cosine_similarity; ниже — совпадение
-    "detection_fps": 5,
+    "detection_fps": 10,
     "event_cooldown_sec": 10,
     "alert_cooldown_sec": 300,
     "telegram_bot_token": "",
     "telegram_chat_id": "",
+    # Профиль производительности (ТЗ 18)
+    "frame_skip": 1,           # анализировать каждый (frame_skip+1)-й обработанный кадр
+    "motion_prefilter": 1,     # детектор лиц только по движению
+    "idle_fps": 2,             # частота при длительном отсутствии движения
+    "face_model": "buffalo_s",
+    "upscale_mode": "avatar",  # manual | avatar | all
+    "cluster_interval_min": 15,
+    "detect_width": 640,
+    "record_codec": "h264",
 }
+
+# Типы значений настроек: как приводить строку из БД
+_CONFIG_TYPES = {
+    "retention_days": int, "motion_threshold": int, "similarity_threshold": float,
+    "detection_fps": int, "event_cooldown_sec": int, "alert_cooldown_sec": int,
+    "telegram_bot_token": str, "telegram_chat_id": str,
+    "frame_skip": int, "motion_prefilter": int, "idle_fps": int,
+    "face_model": str, "upscale_mode": str, "cluster_interval_min": int,
+    "detect_width": int, "record_codec": str,
+}
+
+# Секунд без движения, после которых камера уходит в «спящий» режим детекции
+IDLE_AFTER_SEC = 20
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 Session = sessionmaker(bind=engine)
@@ -80,24 +102,14 @@ def refresh_config():
     """Подтягивает настройки из БД в CONFIG (вызывается периодически из manager)."""
     try:
         with Session() as s:
-            rows = s.execute(select(Setting)).scalars().all()
-            for row in rows:
-                if row.key == "retention_days":
-                    CONFIG["retention_days"] = int(row.value)
-                elif row.key == "motion_threshold":
-                    CONFIG["motion_threshold"] = int(row.value)
-                elif row.key == "similarity_threshold":
-                    CONFIG["similarity_threshold"] = float(row.value)
-                elif row.key == "detection_fps":
-                    CONFIG["detection_fps"] = int(row.value)
-                elif row.key == "event_cooldown_sec":
-                    CONFIG["event_cooldown_sec"] = int(row.value)
-                elif row.key == "alert_cooldown_sec":
-                    CONFIG["alert_cooldown_sec"] = int(row.value)
-                elif row.key == "telegram_bot_token":
-                    CONFIG["telegram_bot_token"] = row.value or ""
-                elif row.key == "telegram_chat_id":
-                    CONFIG["telegram_chat_id"] = row.value or ""
+            for row in s.execute(select(Setting)).scalars().all():
+                caster = _CONFIG_TYPES.get(row.key)
+                if caster is None:
+                    continue  # ключ не влияет на воркер (например, performance_profile)
+                try:
+                    CONFIG[row.key] = caster(row.value) if row.value != "" else ("" if caster is str else CONFIG[row.key])
+                except (TypeError, ValueError):
+                    pass
     except Exception as e:
         print(f"[worker] не удалось прочитать настройки: {e}", flush=True)
 
@@ -133,10 +145,12 @@ class Camera(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String)
     rtsp_url_enc = Column(Text)
+    sub_rtsp_url_enc = Column(Text)      # субпоток для аналитики (ТЗ 18.1)
     location = Column(String)
     enabled = Column(Boolean)
     status = Column(String)
     roi = Column(JSON)
+    motion_sensitivity = Column(Integer)
 
 
 class Person(Base):
@@ -175,10 +189,38 @@ class VideoSegment(Base):
     duration_sec = Column(Integer)
 
 
-def load_face_app():
+def detect_providers() -> list[str]:
+    """Автоопределение аппаратного ускорения (ТЗ 18.2).
+    Порядок предпочтения: CUDA → DirectML (Windows/AMD) → OpenVINO (Intel) → CPU."""
+    try:
+        import onnxruntime as ort
+        available = set(ort.get_available_providers())
+    except Exception:
+        return ["CPUExecutionProvider"]
+    preferred = [
+        "CUDAExecutionProvider",
+        "DmlExecutionProvider",
+        "OpenVINOExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    chosen = [p for p in preferred if p in available]
+    return chosen or ["CPUExecutionProvider"]
+
+
+ACCELERATOR = "CPU"
+
+
+def load_face_app(model_name: str | None = None):
+    """Загружает модель детекции/распознавания с учётом профиля (ТЗ 18.5)."""
+    global ACCELERATOR
     from insightface.app import FaceAnalysis
-    app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
-    app.prepare(ctx_id=0, det_size=(640, 640))
+    name = model_name or CONFIG["face_model"]
+    providers = detect_providers()
+    ACCELERATOR = providers[0].replace("ExecutionProvider", "")
+    size = int(CONFIG["detect_width"])
+    print(f"[worker] модель={name} ускоритель={ACCELERATOR} det_size={size}", flush=True)
+    app = FaceAnalysis(name=name, providers=providers)
+    app.prepare(ctx_id=0, det_size=(size, size))
     return app
 
 
@@ -281,13 +323,13 @@ def save_latest_frame(frame, cam_id: int):
     cv2.imwrite(fpath, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
 
 
-def load_cam_state(cam_id: int) -> tuple[dict | None, bool]:
-    """(roi, active). active=False — камера удалена или отключена: поток должен завершиться."""
+def load_cam_state(cam_id: int) -> tuple[dict | None, bool, int | None]:
+    """(roi, active, motion_sensitivity). active=False — камера отключена или удалена."""
     with Session() as s:
         cam = s.get(Camera, cam_id)
         if cam is None or not cam.enabled:
-            return None, False
-        return cam.roi, True
+            return None, False, None
+        return cam.roi, True, getattr(cam, "motion_sensitivity", None)
 
 
 def finalize_segment(cam_id: int, tmp_path: str, final_path: str,
@@ -295,10 +337,14 @@ def finalize_segment(cam_id: int, tmp_path: str, final_path: str,
     """Транскод mp4v → H.264 (браузеры не играют mp4v в <video>) + запись в БД.
     Выполняется в отдельной короткоживущей нити, чтобы не блокировать цикл камеры."""
     ok = False
+    # H.265 экономит до 50% места, но не играется в части браузеров —
+    # выбор за администратором (ТЗ 18.8).
+    codec = "libx265" if CONFIG["record_codec"] == "h265" else "libx264"
     try:
+        _lower_priority()
         subprocess.run(
             ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", tmp_path,
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-c:v", codec, "-preset", "veryfast", "-crf", "23",
              "-movflags", "+faststart", "-an", final_path],
             timeout=300, check=True,
         )
@@ -328,11 +374,14 @@ def finalize_segment(cam_id: int, tmp_path: str, final_path: str,
         print(f"[cam {cam_id}] не удалось сохранить сегмент: {e}", flush=True)
 
 
-def camera_worker(cam_id: int, rtsp_url: str, face_app):
-    print(f"[cam {cam_id}] старт", flush=True)
+def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None = None):
+    """Двухпоточная схема (ТЗ 18.1): основной поток идёт в архив и HLS,
+    аналитика выполняется на субпотоке низкого разрешения, если он задан."""
+    analyze_url = sub_rtsp_url or rtsp_url
+    print(f"[cam {cam_id}] старт (аналитика: {'субпоток' if sub_rtsp_url else 'основной поток'})", flush=True)
     republish = start_republish(cam_id, rtsp_url)
 
-    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    cap = cv2.VideoCapture(analyze_url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         print(f"[cam {cam_id}] не удалось открыть RTSP", flush=True)
         update_status(cam_id, "offline")
@@ -345,9 +394,12 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
     last_proc = 0.0
     last_latest_save = 0.0
     last_state_reload = 0.0
-    roi, active = load_cam_state(cam_id)
+    roi, active, motion_sens = load_cam_state(cam_id)
     roi_mask = None
     roi_mask_shape = None
+    frame_counter = 0            # для пропуска кадров (ТЗ 18.3)
+    fps_window_start = time.time()
+    fps_frames = 0
 
     writer = None
     seg_path = None
@@ -395,19 +447,41 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
             republish = start_republish(cam_id, rtsp_url)
 
         now = time.time()
-        interval = 1.0 / max(1, CONFIG["detection_fps"])
+        # Адаптивная частота (ТЗ 18.3): при длительном покое опускаемся до idle_fps,
+        # при первом же движении мгновенно возвращаемся к полной частоте.
+        idle = (now - last_motion) > IDLE_AFTER_SEC
+        target_fps = CONFIG["idle_fps"] if idle else CONFIG["detection_fps"]
+        interval = 1.0 / max(1, target_fps)
         if now - last_proc < interval:
             if writer:
                 writer.write(frame)
             continue
         last_proc = now
 
+        # Пропуск кадров: анализируем каждый (frame_skip+1)-й отобранный кадр
+        frame_counter += 1
+        skip = int(CONFIG["frame_skip"])
+        if skip and (frame_counter % (skip + 1)) != 0:
+            if writer:
+                writer.write(frame)
+            continue
+
+        # Фактический FPS детекции по камере → в Redis для мониторинга
+        fps_frames += 1
+        if now - fps_window_start >= 10.0:
+            try:
+                r.hset("worker:fps", str(cam_id), round(fps_frames / (now - fps_window_start), 2))
+            except Exception:
+                pass
+            fps_window_start = now
+            fps_frames = 0
+
         if now - last_latest_save > 2.0:
             save_latest_frame(frame, cam_id)
             last_latest_save = now
 
         if now - last_state_reload > 10.0:
-            roi, active = load_cam_state(cam_id)
+            roi, active, motion_sens = load_cam_state(cam_id)
             roi_mask = None
             last_state_reload = now
             if not active:
@@ -431,11 +505,16 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app):
             small_mask = cv2.resize(roi_mask, (640, 360), interpolation=cv2.INTER_NEAREST)
             fg = cv2.bitwise_and(fg, fg, mask=small_mask)
         motion_pixels = int(np.count_nonzero(fg))
-        motion = motion_pixels > CONFIG["motion_threshold"]
+        # Чувствительность камеры переопределяет общий порог профиля
+        threshold = motion_sens if motion_sens else CONFIG["motion_threshold"]
+        motion = motion_pixels > threshold
 
+        # Префильтр движения (ТЗ 18.4): в «максимальном» профиле отключается
+        # и детектор лиц работает по каждому кадру.
+        run_detector = motion or not CONFIG["motion_prefilter"]
         faces = []
         try:
-            if motion:
+            if run_detector:
                 detected = face_app.get(frame)
                 faces = [f for f in detected if bbox_in_roi(f.bbox.tolist(), roi_mask)]
         except Exception as e:
@@ -535,7 +614,8 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at):
                 is_known=is_known,
             )
             s.add(ev)
-            if person.avatar_path is None and snap_rel:
+            is_new_avatar = person.avatar_path is None and bool(snap_rel)
+            if is_new_avatar:
                 person.avatar_path = snap_rel
             s.commit()
 
@@ -553,9 +633,13 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at):
                     "frame_w": fw,
                     "frame_h": fh,
                 }))
-                # Ставим скриншот в очередь на нейросетевой апскейл (асинхронно).
-                # Ограничиваем очередь, чтобы медленный CPU-апскейл не копил бэклог часами.
-                if r.llen("upscale:queue") < 500:
+                # Ленивый апскейл (ТЗ 18.6): в режиме "manual" не делаем ничего,
+                # в "avatar" улучшаем только первый кадр персоны (её аватар),
+                # в "all" — всю галерею. Очередь ограничена, чтобы медленный
+                # CPU-апскейл не копил бэклог часами.
+                mode = CONFIG["upscale_mode"]
+                want = mode == "all" or (mode == "avatar" and is_new_avatar)
+                if want and r.llen("upscale:queue") < 500:
                     r.lpush("upscale:queue", json.dumps({"event_id": ev.id}))
             except Exception:
                 pass
@@ -567,6 +651,23 @@ def _to_vec(val) -> np.ndarray:
     if isinstance(val, str):
         return np.fromstring(val.strip("[]"), sep=",", dtype=np.float32)
     return np.asarray(val, dtype=np.float32)
+
+
+def _lower_priority():
+    """Фоновые задачи не должны конкурировать с детекцией за CPU (ТЗ 18.6).
+    В Linux-контейнере это nice, на Windows-хосте — idle priority процесса."""
+    try:
+        os.nice(10)
+    except (AttributeError, OSError):
+        pass
+
+
+def _recluster_bg():
+    _lower_priority()
+    try:
+        recluster_unknowns()
+    except Exception as e:
+        print(f"[worker] recluster ошибка: {e}", flush=True)
 
 
 def recluster_unknowns():
@@ -678,10 +779,14 @@ def manager():
                         continue
                     try:
                         rtsp = fernet.decrypt(cam.rtsp_url_enc.encode()).decode()
+                        sub_enc = getattr(cam, "sub_rtsp_url_enc", None)
+                        sub = fernet.decrypt(sub_enc.encode()).decode() if sub_enc else None
                     except Exception as e:
                         print(f"[cam {cam.id}] не удалось расшифровать RTSP: {e}", flush=True)
                         continue
-                    t = threading.Thread(target=camera_worker, args=(cam.id, rtsp, face_app), daemon=True)
+                    t = threading.Thread(
+                        target=camera_worker, args=(cam.id, rtsp, face_app, sub), daemon=True
+                    )
                     t.start()
                     threads[cam.id] = t
 
@@ -693,12 +798,11 @@ def manager():
                 except Exception as e:
                     print(f"[worker] cleanup ошибка: {e}", flush=True)
 
-            if now - last_recluster > 3600:
+            # Пакетная кластеризация (ТЗ 18.6): интервал задаётся профилем,
+            # выполняется в фоновой нити с пониженным приоритетом.
+            if now - last_recluster > CONFIG["cluster_interval_min"] * 60:
                 last_recluster = now
-                try:
-                    recluster_unknowns()
-                except Exception as e:
-                    print(f"[worker] recluster ошибка: {e}", flush=True)
+                threading.Thread(target=_recluster_bg, daemon=True).start()
 
         except Exception as e:
             print(f"[worker] ошибка цикла: {e}", flush=True)
