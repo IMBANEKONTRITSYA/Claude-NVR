@@ -12,8 +12,13 @@ if errorlevel 1 (
 )
 
 if not exist .env (
-  echo Creating .env from template...
-  copy .env.example .env >nul
+  echo Creating .env with random secrets...
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\generate_env.ps1"
+  if errorlevel 1 (
+    echo [ERROR] Could not generate .env automatically. Falling back to template
+    echo [ERROR] ^(remember to change SECRET_KEY, RTSP_ENCRYPTION_KEY, ADMIN_PASSWORD^).
+    copy .env.example .env >nul
+  )
 )
 
 echo Building and starting containers...
@@ -33,7 +38,7 @@ echo.
 echo === FaceWatch is running ===
 echo Web UI:  http://localhost:8080
 echo API:     http://localhost:8000/docs
-echo Login: admin   Password: see ADMIN_PASSWORD in .env (default: admin)
+echo Login: admin   Password: see ADMIN_PASSWORD in .env (printed above on first run)
 echo.
 echo To stop: docker compose down  (or run stop.bat)
 pause
