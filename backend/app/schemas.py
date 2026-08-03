@@ -1,5 +1,34 @@
 from datetime import datetime
-from pydantic import BaseModel, Field
+from urllib.parse import urlsplit
+from pydantic import BaseModel, Field, field_validator
+
+# ffmpeg/ffprobe/OpenCV принимают URL множества протоколов (file:, http:,
+# concat:, subprocess:, srt: и т.д.) — без ограничения схемы эти поля стали
+# бы SSRF/LFI-вектором (например, тест-подключение через /api/cameras/test
+# запускает ffprobe прямо с введённым URL). RTSP-URL камер должен быть
+# только rtsp(s).
+_ALLOWED_RTSP_SCHEMES = ("rtsp", "rtsps")
+
+
+def _check_rtsp_scheme(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme.lower() not in _ALLOWED_RTSP_SCHEMES or not parsed.hostname:
+        raise ValueError(
+            "RTSP-URL должен начинаться с rtsp:// или rtsps:// и содержать хост"
+        )
+    return value
+
+
+def _validate_rtsp_url_required(value: str) -> str:
+    return _check_rtsp_scheme(value)
+
+
+def _validate_rtsp_url_optional(value: str | None) -> str | None:
+    # Пустая строка у sub_rtsp_url — сигнал "очистить субпоток" (cameras.py),
+    # это допустимое значение, а не невалидный URL.
+    if value is None or value == "":
+        return value
+    return _check_rtsp_scheme(value)
 
 
 class Token(BaseModel):
@@ -32,6 +61,8 @@ class PasswordChange(BaseModel):
 class RtspTest(BaseModel):
     rtsp_url: str
 
+    _check_rtsp_url = field_validator("rtsp_url")(_validate_rtsp_url_required)
+
 
 class CameraIn(BaseModel):
     name: str
@@ -40,6 +71,9 @@ class CameraIn(BaseModel):
     location: str = ""
     enabled: bool = True
     motion_sensitivity: int | None = None
+
+    _check_rtsp_url = field_validator("rtsp_url")(_validate_rtsp_url_required)
+    _check_sub_rtsp_url = field_validator("sub_rtsp_url")(_validate_rtsp_url_optional)
 
 
 class CameraOut(BaseModel):
