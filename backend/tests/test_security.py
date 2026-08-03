@@ -63,6 +63,59 @@ def test_jwt_rejects_tampered_signature():
     assert raised, "Изменённый токен должен отвергаться"
 
 
+def test_camera_rejects_non_rtsp_scheme():
+    """ffprobe/ffmpeg понимают множество протоколов (file:, http:, concat:,
+    subprocess: и т.д.) — без ограничения на rtsp(s) поле стало бы SSRF/LFI-
+    вектором через /api/cameras и /api/cameras/test."""
+    from pydantic import ValidationError
+    from app.schemas import CameraIn, RtspTest
+
+    for bad_url in (
+        "file:///etc/passwd",
+        "http://169.254.169.254/latest/meta-data/",
+        "concat:/etc/passwd|/etc/shadow",
+        "subprocess:id",
+        "not-a-url",
+        "",
+    ):
+        try:
+            CameraIn(name="cam", rtsp_url=bad_url)
+            raised = False
+        except ValidationError:
+            raised = True
+        assert raised, f"CameraIn должен отклонять не-RTSP URL: {bad_url!r}"
+
+        try:
+            RtspTest(rtsp_url=bad_url)
+            raised = False
+        except ValidationError:
+            raised = True
+        assert raised, f"RtspTest должен отклонять не-RTSP URL: {bad_url!r}"
+
+
+def test_camera_accepts_rtsp_and_rtsps():
+    from app.schemas import CameraIn, RtspTest
+
+    for url in ("rtsp://192.168.1.10:554/stream1", "rtsps://cam.local/ch0"):
+        assert CameraIn(name="cam", rtsp_url=url).rtsp_url == url
+        assert RtspTest(rtsp_url=url).rtsp_url == url
+
+
+def test_camera_sub_rtsp_url_optional_but_validated():
+    from pydantic import ValidationError
+    from app.schemas import CameraIn
+
+    cam = CameraIn(name="cam", rtsp_url="rtsp://cam/main", sub_rtsp_url=None)
+    assert cam.sub_rtsp_url is None
+
+    try:
+        CameraIn(name="cam", rtsp_url="rtsp://cam/main", sub_rtsp_url="http://evil/sub")
+        raised = False
+    except ValidationError:
+        raised = True
+    assert raised, "sub_rtsp_url тоже должен ограничиваться rtsp(s)"
+
+
 def test_default_secret_key_flagged_as_insecure():
     """SECRET_KEY, оставшийся из .env.example/docker-compose.yml, известен
     каждому, кто читал публичный репозиторий — приложение обязано считать
