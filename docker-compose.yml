@@ -97,6 +97,11 @@ services:
       # Первый старт качает модель InsightFace (~30 МБ) — даём запас
       start_period: 300s
     restart: unless-stopped
+    # По умолчанию Docker ждёт SIGTERM только 10с и досылает SIGKILL —
+    # graceful shutdown (закрытие VideoCapture/VideoWriter, остановка
+    # ffmpeg-репабликации по каждой камере) может не уложиться. Воркер сам
+    # ограничивает суммарное ожидание нитей 8с, здесь оставляем запас.
+    stop_grace_period: 20s
     deploy:
       resources:
         limits:

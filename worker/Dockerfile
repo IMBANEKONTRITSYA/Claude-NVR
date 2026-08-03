@@ -11,6 +11,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY worker.py embed_api.py backoff.py ./
+COPY worker.py embed_api.py backoff.py shutdown.py ./
 
 CMD ["python", "worker.py"]

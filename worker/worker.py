@@ -12,6 +12,7 @@ import sys
 import time
 import json
 import shlex
+import signal
 import threading
 import subprocess
 import traceback
@@ -30,6 +31,7 @@ from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, J
 from pgvector.sqlalchemy import Vector
 
 from backoff import reconnect_delay
+from shutdown import shutdown_event, handle_shutdown_signal
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -438,13 +440,26 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
 
     reconnect_attempt = 0
     while True:
+        if shutdown_event.is_set():
+            print(f"[cam {cam_id}] остановка (shutdown), освобождаю ресурсы", flush=True)
+            if writer:
+                close_segment(datetime.utcnow())
+            cap.release()
+            if republish:
+                republish.terminate()
+            update_status(cam_id, "offline")
+            return
+
         ok, frame = cap.read()
         if not ok:
             update_status(cam_id, "offline")
             delay = reconnect_delay(reconnect_attempt)
             print(f"[cam {cam_id}] поток потерян, повтор через {delay:.0f}с "
                   f"(попытка {reconnect_attempt + 1})", flush=True)
-            time.sleep(delay)
+            # Прерываемое ожидание — при shutdown не держим камеру в сне
+            # до 60с, а сразу уходим на освобождение ресурсов сверху цикла.
+            if shutdown_event.wait(delay):
+                continue
             reconnect_attempt += 1
             cap.release()
             # Переоткрываем именно поток аналитики (субпоток, если задан) —
@@ -790,7 +805,7 @@ def manager():
 
     print(f"[worker] конфиг: {CONFIG}", flush=True)
 
-    while True:
+    while not shutdown_event.is_set():
         try:
             refresh_config()
             # Смена модели/разрешения в профиле применяется без перезапуска
@@ -835,10 +850,24 @@ def manager():
 
         except Exception as e:
             print(f"[worker] ошибка цикла: {e}", flush=True)
-        time.sleep(10)
+        # Прерываемое ожидание: shutdown не должен ждать до 10с впустую.
+        shutdown_event.wait(10)
+
+    print("[worker] завершение: жду остановки нитей камер...", flush=True)
+    # Бюджет ожидания общий на все камеры (не по 8с на каждую), иначе
+    # остановка 16 камер могла бы растянуться на пару минут и упереться
+    # в SIGKILL раньше, чем нити успеют освободить ресурсы.
+    deadline = time.time() + 8.0
+    for cam_id, t in threads.items():
+        t.join(timeout=max(0.0, deadline - time.time()))
+        if t.is_alive():
+            print(f"[cam {cam_id}] не успела остановиться в срок", flush=True)
+    print("[worker] остановлен", flush=True)
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
     time.sleep(5)
     # Не полагаемся на то, что backend уже создал структуру каталогов
     for sub in ("snapshots", "segments", "avatars", "uploads"):
