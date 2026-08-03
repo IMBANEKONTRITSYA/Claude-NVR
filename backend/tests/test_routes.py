@@ -26,6 +26,8 @@ def test_core_routes_present():
     paths = _paths()
     for p in [
         "/api/auth/login",
+        "/api/auth/refresh",
+        "/api/auth/logout",
         "/api/cameras",
         "/api/persons",
         "/api/search/face",

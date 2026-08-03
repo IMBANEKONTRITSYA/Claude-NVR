@@ -33,9 +33,18 @@ def _validate_rtsp_url_optional(value: str | None) -> str | None:
 
 class Token(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
     role: str
     username: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: str
 
 
 class UserOut(BaseModel):

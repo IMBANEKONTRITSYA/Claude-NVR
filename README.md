@@ -214,7 +214,7 @@ pgvector-поиск по `face_events` с сортировкой по косин
 ```bash
 # Бэкенд: тесты безопасности (шифрование RTSP, JWT, пароли)
 cd backend
-python -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
+python -m venv .venv && .venv/bin/pip install -r requirements.txt pytest aiosqlite
 .venv/bin/pytest -q
 
 # Фронтенд: сборка и проверка типов

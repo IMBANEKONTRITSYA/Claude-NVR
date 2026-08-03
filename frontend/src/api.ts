@@ -1,22 +1,50 @@
 const TOKEN_KEY = "fw_token";
+const REFRESH_KEY = "fw_refresh";
 const ROLE_KEY = "fw_role";
 const USER_KEY = "fw_user";
 
 export function getToken() { return localStorage.getItem(TOKEN_KEY); }
+export function getRefreshToken() { return localStorage.getItem(REFRESH_KEY); }
 export function getRole() { return localStorage.getItem(ROLE_KEY) || ""; }
 export function getUser() { return localStorage.getItem(USER_KEY) || ""; }
-export function setAuth(t: string, role: string, user: string) {
+export function setAuth(t: string, refresh: string, role: string, user: string) {
   localStorage.setItem(TOKEN_KEY, t);
+  localStorage.setItem(REFRESH_KEY, refresh);
   localStorage.setItem(ROLE_KEY, role);
   localStorage.setItem(USER_KEY, user);
 }
 export function clearAuth() {
   localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(REFRESH_KEY);
   localStorage.removeItem(ROLE_KEY);
   localStorage.removeItem(USER_KEY);
 }
 
-async function req(path: string, opts: RequestInit = {}) {
+// Access-токен живёт недолго (см. ACCESS_TOKEN_EXPIRE_MINUTES) — вместо
+// разлогинивания на каждый 401 пробуем один раз обновить его через
+// refresh-токен и повторить запрос. refreshPromise дедуплицирует
+// параллельные 401 (например, несколько виджетов дашборда одновременно).
+let refreshPromise: Promise<string | null> | null = null;
+
+async function doRefresh(): Promise<string | null> {
+  const rt = getRefreshToken();
+  if (!rt) return null;
+  try {
+    const res = await fetch("/api/auth/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: rt }),
+    });
+    if (!res.ok) return null;
+    const j = await res.json();
+    setAuth(j.access_token, j.refresh_token, j.role, j.username);
+    return j.access_token as string;
+  } catch {
+    return null;
+  }
+}
+
+async function req(path: string, opts: RequestInit = {}, retried = false): Promise<any> {
   const headers: Record<string, string> = { ...(opts.headers as any) };
   const t = getToken();
   if (t) headers["Authorization"] = `Bearer ${t}`;
@@ -24,7 +52,17 @@ async function req(path: string, opts: RequestInit = {}) {
     headers["Content-Type"] = "application/json";
   }
   const res = await fetch(path, { ...opts, headers });
-  if (res.status === 401) { clearAuth(); window.location.href = "/login"; throw new Error("401"); }
+  if (res.status === 401) {
+    if (!retried && getRefreshToken()) {
+      refreshPromise = refreshPromise || doRefresh();
+      const newToken = await refreshPromise;
+      refreshPromise = null;
+      if (newToken) return req(path, opts, true);
+    }
+    clearAuth();
+    window.location.href = "/login";
+    throw new Error("401");
+  }
   if (!res.ok) {
     let msg = `Ошибка ${res.status}`;
     try { const j = await res.json(); msg = j.detail || msg; } catch {}
@@ -44,6 +82,21 @@ export const api = {
     return res.json();
   },
   me: () => req("/api/auth/me"),
+  logout: async () => {
+    const rt = getRefreshToken();
+    if (rt) {
+      // Best-effort: даже если запрос не дойдёт (сеть/сервер недоступен),
+      // локальный выход всё равно должен сработать.
+      try {
+        await fetch("/api/auth/logout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh_token: rt }),
+        });
+      } catch { /* локальный logout ниже отработает в любом случае */ }
+    }
+    clearAuth();
+  },
   changePassword: (old_password: string, new_password: string) =>
     req("/api/auth/change-password", { method: "POST", body: JSON.stringify({ old_password, new_password }) }),
   testRtsp: (rtsp_url: string) =>
