@@ -29,6 +29,8 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, JSON, Text
 from pgvector.sqlalchemy import Vector
 
+from backoff import reconnect_delay
+
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 MEDIA_PATH = os.environ.get("MEDIA_PATH", "/media")
@@ -434,16 +436,27 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         seg_started = None
         seg_had_face = False
 
+    reconnect_attempt = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             update_status(cam_id, "offline")
-            time.sleep(2)
+            delay = reconnect_delay(reconnect_attempt)
+            print(f"[cam {cam_id}] поток потерян, повтор через {delay:.0f}с "
+                  f"(попытка {reconnect_attempt + 1})", flush=True)
+            time.sleep(delay)
+            reconnect_attempt += 1
             cap.release()
-            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            # Переоткрываем именно поток аналитики (субпоток, если задан) —
+            # раньше здесь по ошибке использовался основной поток, из-за чего
+            # детекция после первого разрыва связи молча переезжала на
+            # основной поток в обход двухпоточной схемы (ТЗ 18.1).
+            cap = cv2.VideoCapture(analyze_url, cv2.CAP_FFMPEG)
             if cap.isOpened():
                 update_status(cam_id, "online")
             continue
+        if reconnect_attempt:
+            reconnect_attempt = 0
 
         # Авто-перезапуск ffmpeg-репабликации, если он умер
         if republish and republish.poll() is not None:
