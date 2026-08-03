@@ -5,7 +5,7 @@ import os
 # Дефолтный ключ из config — валидный Fernet (32 байта в base64).
 from app.services.encryption import encrypt, decrypt
 from app.auth import hash_password, verify_password, create_token
-from app.config import settings
+from app.config import settings, Settings, insecure_secret_problems
 from jose import jwt
 
 
@@ -61,3 +61,23 @@ def test_jwt_rejects_tampered_signature():
     except JWTError:
         raised = True
     assert raised, "Изменённый токен должен отвергаться"
+
+
+def test_default_secret_key_flagged_as_insecure():
+    """SECRET_KEY, оставшийся из .env.example/docker-compose.yml, известен
+    каждому, кто читал публичный репозиторий — приложение обязано считать
+    его небезопасным, а не запускаться молча."""
+    s = Settings(SECRET_KEY="change-me-in-production", RTSP_ENCRYPTION_KEY="my-own-random-key")
+    problems = insecure_secret_problems(s)
+    assert any("SECRET_KEY" in p for p in problems)
+
+
+def test_default_rtsp_key_flagged_as_insecure():
+    s = Settings(SECRET_KEY="my-own-random-key", RTSP_ENCRYPTION_KEY="ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ=")
+    problems = insecure_secret_problems(s)
+    assert any("RTSP_ENCRYPTION_KEY" in p for p in problems)
+
+
+def test_custom_secrets_pass_validation():
+    s = Settings(SECRET_KEY="a-real-random-secret-32bytes+", RTSP_ENCRYPTION_KEY="another-real-random-key")
+    assert insecure_secret_problems(s) == []
