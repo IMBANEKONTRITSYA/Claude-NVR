@@ -30,6 +30,7 @@ from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, J
 from pgvector.sqlalchemy import Vector
 
 from backoff import reconnect_delay
+from record_encode import build_encode_args
 from shutdown import shutdown_event, handle_shutdown_signal
 from logging_utils import configure_logging
 import onvif_client
@@ -67,6 +68,8 @@ CONFIG = {
     "cluster_interval_min": 15,
     "detect_width": 640,
     "record_codec": "h264",
+    "record_bitrate": 0,       # kbps; 0 — CRF-режим (авто-качество), >0 — фиксированный битрейт (ТЗ 18.8)
+    "record_iframe_only": 0,   # 1 — только ключевые кадры (максимальная экономия места, ТЗ 18.8)
 }
 
 # Типы значений настроек: как приводить строку из БД
@@ -77,12 +80,17 @@ _CONFIG_TYPES = {
     "frame_skip": int, "motion_prefilter": int, "idle_fps": int,
     "face_model": str, "upscale_mode": str, "cluster_interval_min": int,
     "detect_width": int, "record_codec": str,
+    "record_bitrate": int, "record_iframe_only": int,
 }
 
 # Секунд без движения, после которых камера уходит в «спящий» режим детекции
 IDLE_AFTER_SEC = 20
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# pool_size подобран под целевую нагрузку ТЗ: каждая из до 16 камер держит
+# свой поток с короткоживущими сессиями (load_cam_state, запись событий),
+# плюс сегментный транскод/рекластеризация в отдельных потоках — дефолтный
+# pool_size=5 у SQLAlchemy становится узким местом раньше, чем CPU/сеть.
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=20, max_overflow=10)
 Session = sessionmaker(bind=engine)
 Base = declarative_base()
 def _normalize_fernet_key(raw: str) -> bytes:
@@ -356,12 +364,16 @@ def finalize_segment(cam_id: int, tmp_path: str, final_path: str,
     # H.265 экономит до 50% места, но не играется в части браузеров —
     # выбор за администратором (ТЗ 18.8).
     codec = "libx265" if CONFIG["record_codec"] == "h265" else "libx264"
+    encode_args = build_encode_args(
+        codec,
+        bitrate_kbps=int(CONFIG.get("record_bitrate") or 0),
+        iframe_only=bool(int(CONFIG.get("record_iframe_only") or 0)),
+    )
     try:
         _lower_priority()
         subprocess.run(
             ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", tmp_path,
-             "-c:v", codec, "-preset", "veryfast", "-crf", "23",
-             "-movflags", "+faststart", "-an", final_path],
+             *encode_args, "-movflags", "+faststart", "-an", final_path],
             timeout=300, check=True,
         )
         os.remove(tmp_path)

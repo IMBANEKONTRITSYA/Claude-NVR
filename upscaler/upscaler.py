@@ -153,7 +153,18 @@ def process_event(event_id: int, force: bool = False):
         print(f"[upscaler] событие {event_id} улучшено ({backend})", flush=True)
 
 
+def _lower_priority():
+    """Апскейл — фоновая задача, не должна конкурировать с детекцией за CPU
+    (ТЗ 18.6: "все фоновые задачи... выполняются с низким приоритетом
+    процесса"). В Linux-контейнере это nice, на Windows os.nice отсутствует."""
+    try:
+        os.nice(10)
+    except (AttributeError, OSError):
+        pass
+
+
 def main():
+    _lower_priority()
     print(f"[upscaler] старт, backend={UPSCALE_BACKEND}", flush=True)
     if UPSCALE_BACKEND == "gfpgan":
         try:
