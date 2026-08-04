@@ -33,6 +33,7 @@ from backoff import reconnect_delay
 from record_encode import build_encode_args
 from shutdown import shutdown_event, handle_shutdown_signal
 from logging_utils import configure_logging
+from hwaccel import hw_decode_requested, detect_hw_accelerator_name
 import onvif_client
 
 logger = configure_logging("facewatch.worker")
@@ -285,6 +286,33 @@ def start_republish(cam_id: int, rtsp_url: str) -> subprocess.Popen | None:
         return None
 
 
+_DECODE_ACCEL_LOGGED = False
+
+
+def open_capture(url: str) -> cv2.VideoCapture:
+    """Открывает RTSP-поток аналитики с попыткой аппаратного декодирования
+    (ТЗ 18.2, вторая половина — инференс уже автоопределялся, декодирование
+    кадров нет). `VIDEO_ACCELERATION_ANY` заставляет ffmpeg-бэкенд OpenCV
+    попробовать доступный HW-ускоритель (VAAPI/QuickSync/NVDEC) и прозрачно
+    откатиться на программное декодирование, если ничего не найдено — то же
+    поведение и в песочнице без GPU, и на целевом N100 без настроенного
+    VAAPI, поэтому безопасно включать по умолчанию.
+    Свойство должно быть выставлено ДО open() — после открытия потока
+    OpenCV его уже не применяет."""
+    global _DECODE_ACCEL_LOGGED
+    cap = cv2.VideoCapture()
+    if hw_decode_requested():
+        try:
+            cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+        except Exception:
+            pass  # сборка OpenCV без поддержки свойства — не критично, откат на софт-декод
+    if not _DECODE_ACCEL_LOGGED:
+        _DECODE_ACCEL_LOGGED = True
+        logger.info("декодирование видео", extra={"hw_accelerator": detect_hw_accelerator_name()})
+    cap.open(url, cv2.CAP_FFMPEG)
+    return cap
+
+
 def build_roi_mask(roi: dict | None, shape) -> np.ndarray | None:
     """Полигоны хранятся в нормализованных координатах [0..1]."""
     if not roi or not roi.get("polygons"):
@@ -484,7 +512,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
             daemon=True,
         ).start()
 
-    cap = cv2.VideoCapture(analyze_url, cv2.CAP_FFMPEG)
+    cap = open_capture(analyze_url)
     if not cap.isOpened():
         logger.error("не удалось открыть RTSP", extra={"camera_id": cam_id})
         update_status(cam_id, "offline")
@@ -563,7 +591,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
             # раньше здесь по ошибке использовался основной поток, из-за чего
             # детекция после первого разрыва связи молча переезжала на
             # основной поток в обход двухпоточной схемы (ТЗ 18.1).
-            cap = cv2.VideoCapture(analyze_url, cv2.CAP_FFMPEG)
+            cap = open_capture(analyze_url)
             if cap.isOpened():
                 update_status(cam_id, "online")
             continue
