@@ -45,7 +45,7 @@ jobs:
       # смонтирован и доступен на запись; на голом раннере это корень ФС,
       # не пишется от непривилегированного пользователя — TestClient падал
       # с PermissionError на самом первом os.makedirs() при старте lifespan.
-      MEDIA_PATH: ${{ runner.temp }}/facewatch-media
+      MEDIA_PATH: /tmp/facewatch-media
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
