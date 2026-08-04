@@ -6,8 +6,40 @@
 import json
 import logging
 import os
+import re
 import sys
+from copy import copy
 from datetime import datetime, timezone
+
+from uvicorn.logging import AccessFormatter
+
+# archive/reports/snapshot/prometheus/ws-эндпоинты принимают access-токен как
+# ?token=... (нужно там, куда нельзя послать заголовок Authorization —
+# прямые ссылки, WS handshake, сторонний monitoring). Дефолтный access-лог
+# uvicorn пишет query string как есть, то есть токен уходит в открытом виде
+# в docker-логи (docs/reviews/REVIEW-2026-08-04T103308Z.md, рекомендация №1
+# цикла 7). Тот же класс редактирования, что и в frontend/nginx.conf — там
+# редактируется на уровне reverse proxy, здесь на уровне самого backend,
+# чтобы токен не осел в логах ни на одном хопе.
+_TOKEN_QS_RE = re.compile(r"([?&]token=)[^&\s]*")
+
+
+class RedactedAccessFormatter(AccessFormatter):
+    """uvicorn.logging.AccessFormatter, вырезающий значение ?token=... из
+    request line перед форматированием — used via --log-config (см.
+    logging_config.json и Dockerfile)."""
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        recordcopy = copy(record)
+        client_addr, method, full_path, http_version, status_code = recordcopy.args
+        recordcopy.args = (
+            client_addr,
+            method,
+            _TOKEN_QS_RE.sub(r"\1REDACTED", full_path),
+            http_version,
+            status_code,
+        )
+        return super().formatMessage(recordcopy)
 
 # Стандартные атрибуты LogRecord — всё, что сверх них в record.__dict__,
 # считается пользовательским полем (передано через logging.info(..., extra={...})).
