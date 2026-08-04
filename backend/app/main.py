@@ -123,6 +123,8 @@ async def lifespan(app: FastAPI):
             "telegram_chat_id": "",
             "alert_cooldown_sec": "300",
             "record_codec": "h264",
+            "record_bitrate": "0",
+            "record_iframe_only": "0",
             "performance_profile": DEFAULT_PROFILE,
             # detection_fps, frame_skip, face_model, upscale_mode и т.д.
             **profile_settings(DEFAULT_PROFILE),

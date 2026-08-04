@@ -31,6 +31,8 @@ SCHEMA: dict[str, tuple] = {
     "cluster_interval_min": (int, 1, 1440),
     "detect_width": (int, 320, 1920),
     "record_codec": (str,),           # h264 | h265
+    "record_bitrate": (int, 0, 50_000),   # kbps; 0 — CRF (авто-качество)
+    "record_iframe_only": (int, 0, 1),    # 1 — только ключевые кадры
 }
 
 ENUMS = {
@@ -58,6 +60,8 @@ class SettingsUpdate(BaseModel):
     cluster_interval_min: int | None = None
     detect_width: int | None = None
     record_codec: str | None = None
+    record_bitrate: int | None = None
+    record_iframe_only: int | None = None
 
 
 @router.get("")

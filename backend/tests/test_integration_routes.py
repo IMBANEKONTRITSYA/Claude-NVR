@@ -276,6 +276,26 @@ def test_settings_update_persists_and_validates_range(client, admin_headers):
     assert r.status_code == 400
 
 
+def test_record_bitrate_and_iframe_only_persist_and_validate(client, admin_headers):
+    r = client.put("/api/settings", json={"record_bitrate": 4000, "record_iframe_only": 1}, headers=admin_headers)
+    assert r.status_code == 200
+    assert r.json()["record_bitrate"] == "4000"
+    assert r.json()["record_iframe_only"] == "1"
+
+    r = client.get("/api/settings", headers=admin_headers)
+    assert r.json()["record_bitrate"] == "4000"
+
+    r = client.put("/api/settings", json={"record_bitrate": -1}, headers=admin_headers)
+    assert r.status_code == 400
+
+    r = client.put("/api/settings", json={"record_iframe_only": 2}, headers=admin_headers)
+    assert r.status_code == 400
+
+    r = client.put("/api/settings", json={"record_bitrate": 0}, headers=admin_headers)
+    assert r.status_code == 200
+    assert r.json()["record_bitrate"] == "0"
+
+
 def test_apply_performance_profile_rewrites_tunables(client, admin_headers):
     r = client.post("/api/settings/profile/economy", headers=admin_headers)
     assert r.status_code == 200
