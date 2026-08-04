@@ -1,7 +1,20 @@
+# ТЗ 12: "структурированные логи... с ротацией". Docker-драйвер json-file по
+# умолчанию не ограничен по размеру — на системе, работающей 24/7 (ТЗ:
+# "стабильно работать 24/7 без деградации"), это медленная, но верная утечка
+# места на диске. Единый якорь на все сервисы: 10 файлов по 10 МБ (100 МБ на
+# контейнер) с лихвой хватает на разбор инцидента и не требует держать
+# отдельный лог-агрегатор (Loki) для однокомпьютерного развёртывания.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "10"
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
     container_name: facewatch-postgres
+    logging: *default-logging
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-facewatch}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-facewatch}
@@ -26,6 +39,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: facewatch-redis
+    logging: *default-logging
     ports:
       # Redis не требует пароля по умолчанию — публикация на все интерфейсы
       # дала бы любому в локальной сети полный доступ к очередям/кэшу.
@@ -40,6 +54,7 @@ services:
   mediamtx:
     image: bluenviron/mediamtx:latest
     container_name: facewatch-mediamtx
+    logging: *default-logging
     ports:
       # MediaMTX не требует аутентификации по умолчанию (ТЗ 13). Worker
       # публикует камеры и nginx проксирует HLS через внутреннюю docker-сеть
@@ -56,6 +71,7 @@ services:
   backend:
     build: ./backend
     container_name: facewatch-backend
+    logging: *default-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -90,6 +106,7 @@ services:
   worker:
     build: ./worker
     container_name: facewatch-worker
+    logging: *default-logging
     depends_on:
       backend:
         condition: service_started
@@ -123,6 +140,7 @@ services:
   upscaler:
     build: ./upscaler
     container_name: facewatch-upscaler
+    logging: *default-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -148,6 +166,7 @@ services:
     # Dockerfile/образ не нужен (ТЗ 12: ежедневный автобэкап + ручной запуск).
     image: postgres:16-alpine
     container_name: facewatch-backup
+    logging: *default-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -183,6 +202,7 @@ services:
   frontend:
     build: ./frontend
     container_name: facewatch-frontend
+    logging: *default-logging
     depends_on:
       - backend
     ports:
