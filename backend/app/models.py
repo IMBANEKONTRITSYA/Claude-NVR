@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import String, Integer, DateTime, ForeignKey, Boolean, JSON, Text, func
+from sqlalchemy import String, Integer, DateTime, ForeignKey, Boolean, JSON, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 from .db import Base
@@ -32,7 +32,7 @@ class RefreshToken(Base):
     # пароля/массовым revoke": повторное предъявление ПЕРВОГО — сигнал кражи
     # (кто-то ещё владеет уже провёрнутым токеном), второго — ожидаемо и не
     # должно обрушивать остальные сессии пользователя.
-    rotated: Mapped[bool] = mapped_column(Boolean, default=False)
+    rotated: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 
 
 class Camera(Base):
@@ -42,7 +42,7 @@ class Camera(Base):
     rtsp_url_enc: Mapped[str] = mapped_column(Text)              # основной поток: запись + HLS
     sub_rtsp_url_enc: Mapped[str | None] = mapped_column(Text, nullable=True)  # субпоток: аналитика
     location: Mapped[str] = mapped_column(String(120), default="")
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     status: Mapped[str] = mapped_column(String(20), default="offline")  # online|offline|disabled
     roi: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # {"polygons": [[[x,y],...]]}
     motion_sensitivity: Mapped[int | None] = mapped_column(Integer, nullable=True)  # переопределяет профиль
@@ -57,7 +57,7 @@ class Person(Base):
     avatar_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     centroid: Mapped[list[float] | None] = mapped_column(Vector(512), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-    alert_on_detection: Mapped[bool] = mapped_column(Boolean, default=False)
+    alert_on_detection: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
@@ -69,10 +69,10 @@ class FaceEvent(Base):
     ts: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
     snapshot_path: Mapped[str | None] = mapped_column(String(500), nullable=True)       # текущий лучший (улучшенный, если готов)
     orig_snapshot_path: Mapped[str | None] = mapped_column(String(500), nullable=True)  # исходный скриншот
-    enhanced: Mapped[bool] = mapped_column(Boolean, default=False)                       # апскейл выполнен
+    enhanced: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))  # апскейл выполнен
     embedding: Mapped[list[float] | None] = mapped_column(Vector(512), nullable=True)
     bbox: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    is_known: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_known: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 
 
 class VideoSegment(Base):
