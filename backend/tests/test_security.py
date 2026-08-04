@@ -132,5 +132,22 @@ def test_default_rtsp_key_flagged_as_insecure():
 
 
 def test_custom_secrets_pass_validation():
-    s = Settings(SECRET_KEY="a-real-random-secret-32bytes+", RTSP_ENCRYPTION_KEY="another-real-random-key")
+    s = Settings(
+        SECRET_KEY="a-real-random-secret-32bytes+",
+        RTSP_ENCRYPTION_KEY="another-real-random-key",
+        ADMIN_PASSWORD="Xk9#mQ2vLp7$rT4w",
+    )
     assert insecure_secret_problems(s) == []
+
+
+def test_default_admin_password_flagged_as_insecure():
+    """ADMIN_PASSWORD, оставшийся значением 'admin' из .env.example/
+    docker-compose.yml, известен каждому — учётка администратора не должна
+    молча оставаться доступной с публичным дефолтным паролем (ТЗ 13)."""
+    s = Settings(
+        SECRET_KEY="a-real-random-secret-32bytes+",
+        RTSP_ENCRYPTION_KEY="another-real-random-key",
+        ADMIN_PASSWORD="admin",
+    )
+    problems = insecure_secret_problems(s)
+    assert any("ADMIN_PASSWORD" in p for p in problems)

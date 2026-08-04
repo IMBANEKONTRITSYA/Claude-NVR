@@ -13,6 +13,11 @@ INSECURE_SECRET_KEYS = {
 INSECURE_RTSP_ENCRYPTION_KEYS = {
     "ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ=",
 }
+INSECURE_ADMIN_PASSWORDS = {
+    "admin",
+    "password",
+    "change-me",
+}
 
 
 class Settings(BaseSettings):
@@ -28,6 +33,9 @@ class Settings(BaseSettings):
     # пароля, обнаружение повторного использования).
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 14
+    # ТЗ 13: "парольная политика (сложность, срок действия)".
+    PASSWORD_MIN_LENGTH: int = 10
+    PASSWORD_MAX_AGE_DAYS: int = 90
     WORKER_URL: str = "http://worker:9000"
     RETENTION_DAYS_DEFAULT: int = 30
     # В production фронтенд и backend живут за одним nginx (same-origin, см.
@@ -60,5 +68,11 @@ def insecure_secret_problems(s: "Settings" = settings) -> list[str]:
             "RTSP_ENCRYPTION_KEY оставлен значением по умолчанию из публичного репозитория — "
             "учётные данные камер расшифровываются кем угодно. Сгенерируйте свой ключ "
             "(python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\")."
+        )
+    if s.ADMIN_PASSWORD.lower() in INSECURE_ADMIN_PASSWORDS:
+        problems.append(
+            "ADMIN_PASSWORD оставлен публично известным словарным значением — учётная "
+            "запись администратора взламывается с первой попытки. Задайте свой пароль в .env "
+            f"(минимум {s.PASSWORD_MIN_LENGTH} символов, минимум 3 из 4 классов символов)."
         )
     return problems

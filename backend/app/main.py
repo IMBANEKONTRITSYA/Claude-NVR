@@ -60,6 +60,9 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS motion_sensitivity integer"
         ))
+        await conn.execute(text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at timestamp DEFAULT now()"
+        ))
         # HNSW-индексы pgvector для быстрого поиска по эмбеддингам (≤5с на 100k лиц)
         for stmt in (
             "CREATE INDEX IF NOT EXISTS idx_face_events_embedding ON face_events "
