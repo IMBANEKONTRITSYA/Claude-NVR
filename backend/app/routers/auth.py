@@ -24,6 +24,9 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 MAX_ATTEMPTS = 10        # попыток за окно
 WINDOW_SEC = 300         # окно блокировки, сек
 
+CHANGE_PW_MAX_ATTEMPTS = 5   # попыток неверного old_password за окно
+CHANGE_PW_WINDOW_SEC = 300
+
 
 def real_ip(request: Request) -> str:
     """За nginx request.client.host — это адрес прокси; читаем X-Real-IP."""
@@ -115,10 +118,40 @@ async def change_password(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Без этого лимита обладатель уже похищенного/недолговечного access-
+    # токена мог подбирать old_password неограниченное число раз — токен
+    # короткоживущий (30 мин), но подобранный пароль остаётся рабочим
+    # секретом навсегда. У /login есть такой же лимит по IP+логину; здесь —
+    # по user.id, потому что владение валидным access-токеном уже сильнее
+    # идентифицирует атакующего, чем IP (токен можно использовать с любого).
+    redis = get_redis()
+    key = f"changepw_fail:{user.id}"
+    try:
+        attempts = int(await redis.get(key) or 0)
+    except Exception:
+        attempts = 0
+    if attempts >= CHANGE_PW_MAX_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="Слишком много попыток. Повторите через несколько минут.")
+
     if not verify_password(payload.old_password, user.password_hash):
+        try:
+            pipe = redis.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, CHANGE_PW_WINDOW_SEC)
+            await pipe.execute()
+        except Exception:
+            pass
         raise HTTPException(400, "Старый пароль неверен")
+
+    try:
+        await redis.delete(key)
+    except Exception:
+        pass
     user.password_hash = hash_password(payload.new_password)
-    user.password_changed_at = datetime.now(timezone.utc)
+    # naive UTC: users.password_changed_at — TIMESTAMP WITHOUT TIME ZONE,
+    # asyncpg отказывается биндить timezone-aware datetime в такую колонку
+    # (тот же паттерн, что ../auth.py:_utcnow_naive для refresh_tokens).
+    user.password_changed_at = datetime.now(timezone.utc).replace(tzinfo=None)
     # Смена пароля — сигнал "эта учётка могла быть скомпрометирована":
     # отзываем все refresh-токены, вынуждая перелогиниться везде, включая
     # устройство злоумышленника, если пароль сменили именно поэтому.
