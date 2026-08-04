@@ -80,7 +80,18 @@ def _username_token_header(username: str, password: str) -> str:
         '<Security xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" '
         'xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">'
         "<UsernameToken>"
-        f"<Username>{username}</Username>"
+        # Экранируем через xml.sax.saxutils.escape, как и profile_token в
+        # get_stream_uri() ниже — username здесь вводится администратором в
+        # форме камеры (OnvifProfilesRequest/CameraIn), тот же уровень
+        # доверия, что и остальные поля CameraIn, но подстановка в XML без
+        # экранирования всё равно даёт возможность выйти за пределы
+        # <Username> и внедрить произвольные SOAP-элементы в запрос к самой
+        # ONVIF-камере (например, значение вида
+        # `foo</Username><Bogus>x` разваливает структуру заголовка) — цена
+        # экранирования нулевая, а его отсутствие — единственное
+        # непоследовательное место в модуле (password подставляется только
+        # в SHA1-дайджест, а не в XML напрямую, поэтому не нуждается).
+        f"<Username>{_xml_escape(username)}</Username>"
         '<Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">'
         f"{digest}</Password>"
         '<Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">'
