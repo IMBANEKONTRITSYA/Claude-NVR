@@ -1,4 +1,5 @@
 import os
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from jose import jwt, JWTError
@@ -155,6 +156,24 @@ async def hls_auth(_=Depends(get_current_user)):
     разрешает просмотр видео онлайн всем трём ролям — здесь важна только
     валидность токена, тот же контракт, что у snapshot()/archive/prometheus."""
     return {"ok": True}
+
+
+@router.get("/onvif/discover")
+async def onvif_discover(_=Depends(require_role("admin"))):
+    """Автообнаружение ONVIF-камер в сети (ТЗ 18.7: "автообнаружение камер
+    в сети"). Сама WS-Discovery multicast-рассылка выполняется воркером
+    (worker/onvif_api.py) — он в той же docker-сети, что и камеры, backend
+    туда не имеет прямого сетевого пути для UDP multicast. admin-only, как
+    и остальное управление камерами (add/update/delete/rtsp)."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.get(f"{settings.WORKER_URL}/onvif/discover")
+        except httpx.HTTPError as e:
+            raise HTTPException(503, f"Сервис распознавания недоступен: {e}")
+    data = resp.json()
+    if not data.get("ok"):
+        raise HTTPException(502, data.get("error") or "Не удалось выполнить автообнаружение")
+    return {"devices": data.get("devices", [])}
 
 
 @router.post("/test")

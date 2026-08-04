@@ -10,6 +10,8 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File
 import uvicorn
 
+from onvif_api import router as onvif_router
+
 
 def _enhance_small(img: np.ndarray) -> np.ndarray:
     """Бонус ТЗ: небольшое фото апскейлится перед поиском → выше точность."""
@@ -21,6 +23,7 @@ def _enhance_small(img: np.ndarray) -> np.ndarray:
 
 def build_app(face_app) -> FastAPI:
     app = FastAPI(title="FaceWatch worker embed API")
+    app.include_router(onvif_router)
 
     @app.get("/health")
     async def health():
