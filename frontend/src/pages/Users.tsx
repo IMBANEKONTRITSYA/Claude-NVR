@@ -34,7 +34,16 @@ export function Users() {
         <h3>Добавить</h3>
         <div className="grid" style={{ gridTemplateColumns: "1fr 1fr 1fr auto", gap: 8, alignItems: "end" }}>
           <div><label>Логин</label><input value={form.username} onChange={e => setForm({ ...form, username: e.target.value })} /></div>
-          <div><label>Пароль</label><input type="password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} /></div>
+          <div>
+            <label>Пароль</label>
+            <input
+              type="password"
+              value={form.password}
+              onChange={e => setForm({ ...form, password: e.target.value })}
+              minLength={10}
+              title="Минимум 10 символов, минимум 3 из 4: строчные, ЗАГЛАВНЫЕ, цифры, спецсимволы"
+            />
+          </div>
           <div>
             <label>Роль</label>
             <select value={form.role} onChange={e => setForm({ ...form, role: e.target.value })}>
