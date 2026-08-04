@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func
 from ..db import get_db
 from ..models import User
-from ..auth import require_role, hash_password
+from ..auth import require_role, hash_password_async
 from ..schemas import UserCreate, UserOut
 
 router = APIRouter(prefix="/api/users", tags=["users"])
@@ -20,7 +20,7 @@ async def create_user(payload: UserCreate, _=Depends(require_role("admin")), db:
     exists = (await db.execute(select(User).where(User.username == payload.username))).scalar_one_or_none()
     if exists:
         raise HTTPException(400, "Пользователь уже существует")
-    u = User(username=payload.username, password_hash=hash_password(payload.password), role=payload.role)
+    u = User(username=payload.username, password_hash=await hash_password_async(payload.password), role=payload.role)
     db.add(u)
     await db.commit()
     await db.refresh(u)
