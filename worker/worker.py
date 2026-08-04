@@ -32,6 +32,7 @@ from pgvector.sqlalchemy import Vector
 from backoff import reconnect_delay
 from shutdown import shutdown_event, handle_shutdown_signal
 from logging_utils import configure_logging
+import onvif_client
 
 logger = configure_logging("facewatch.worker")
 
@@ -157,6 +158,11 @@ class Camera(Base):
     status = Column(String)
     roi = Column(JSON)
     motion_sensitivity = Column(Integer)
+    onvif_enabled = Column(Boolean, default=False)     # ТЗ 18.7
+    onvif_host = Column(String)
+    onvif_port = Column(Integer)
+    onvif_username = Column(String)
+    onvif_password_enc = Column(Text)
 
 
 class Person(Base):
@@ -384,12 +390,87 @@ def finalize_segment(cam_id: int, tmp_path: str, final_path: str,
         logger.error("не удалось сохранить сегмент", exc_info=True, extra={"camera_id": cam_id})
 
 
-def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None = None):
+# ТЗ 18.7: события движения/присутствия от ONVIF-камеры вместо постоянного
+# MOG2-префильтра на CPU. cam_id -> время последнего события/последнего
+# успешного pull'а — camera_worker считает ONVIF "здоровым" (и пропускает
+# MOG2 целиком ради экономии CPU) только пока последний успешный pull был
+# недавно; при сетевых проблемах/отвале подписки автоматически откатывается
+# на обычный MOG2-префильтр, не теряя детекцию совсем.
+ONVIF_LAST_MOTION: dict[int, float] = {}
+ONVIF_LAST_HEALTHY: dict[int, float] = {}
+ONVIF_HEALTHY_WINDOW_SEC = 30.0
+ONVIF_MOTION_FRESH_SEC = 5.0
+
+
+def onvif_healthy(cam_id: int) -> bool:
+    last = ONVIF_LAST_HEALTHY.get(cam_id, 0.0)
+    return (time.time() - last) < ONVIF_HEALTHY_WINDOW_SEC
+
+
+def onvif_motion_recent(cam_id: int) -> bool:
+    last = ONVIF_LAST_MOTION.get(cam_id, 0.0)
+    return (time.time() - last) < ONVIF_MOTION_FRESH_SEC
+
+
+def onvif_poll_worker(cam_id: int, host: str, port: int, username: str | None, password: str | None):
+    """Фоновая нить на камеру с onvif_enabled: держит PullPoint-подписку и
+    складывает события движения в ONVIF_LAST_MOTION/ONVIF_LAST_HEALTHY.
+    Никогда не поднимает исключение наружу — рассчитана на постоянный
+    daemon-запуск на весь срок жизни камеры, ошибки только логируются и
+    ведут к переподписке с экспоненциальной задержкой (тот же backoff, что
+    и у RTSP-реконнекта)."""
+    attempt = 0
+    while not shutdown_event.is_set():
+        try:
+            subscription_url = onvif_client.create_pull_point_subscription(host, port, username, password)
+            logger.info("ONVIF-подписка создана", extra={"camera_id": cam_id, "onvif_host": host})
+            attempt = 0
+            while not shutdown_event.is_set():
+                try:
+                    events = onvif_client.pull_messages(subscription_url, username, password)
+                except onvif_client.OnvifError:
+                    logger.warning("ONVIF pull не удался, переподписка", exc_info=True, extra={"camera_id": cam_id})
+                    break
+                ONVIF_LAST_HEALTHY[cam_id] = time.time()
+                for ev in events:
+                    if onvif_client.is_motion_event(ev.get("topic"), ev.get("state")):
+                        ONVIF_LAST_MOTION[cam_id] = time.time()
+                if shutdown_event.wait(0.5):
+                    return
+        except onvif_client.OnvifError:
+            delay = reconnect_delay(attempt)
+            logger.warning(
+                "не удалось создать ONVIF-подписку, повтор",
+                exc_info=True, extra={"camera_id": cam_id, "retry_in_sec": round(delay, 1)},
+            )
+            attempt += 1
+            if shutdown_event.wait(delay):
+                return
+        except Exception:
+            # Не даём непредвиденной ошибке ONVIF уронить всю нить — это
+            # вспомогательный источник детекции, MOG2-фолбэк в camera_worker
+            # продолжает работать независимо от состояния этой нити.
+            logger.error("непредвиденная ошибка ONVIF-нити", exc_info=True, extra={"camera_id": cam_id})
+            if shutdown_event.wait(reconnect_delay(attempt)):
+                return
+            attempt += 1
+
+
+def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None = None,
+                   onvif_config: dict | None = None):
     """Двухпоточная схема (ТЗ 18.1): основной поток идёт в архив и HLS,
     аналитика выполняется на субпотоке низкого разрешения, если он задан."""
     analyze_url = sub_rtsp_url or rtsp_url
     logger.info("старт камеры", extra={"camera_id": cam_id, "analytics_stream": "sub" if sub_rtsp_url else "main"})
     republish = start_republish(cam_id, rtsp_url)
+
+    if onvif_config and onvif_config.get("host"):
+        threading.Thread(
+            target=onvif_poll_worker,
+            args=(cam_id, onvif_config["host"], onvif_config.get("port") or 80,
+                  onvif_config.get("username"), onvif_config.get("password")),
+            daemon=True,
+        ).start()
 
     cap = cv2.VideoCapture(analyze_url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
@@ -535,15 +616,25 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
             roi_mask = build_roi_mask(roi, frame.shape)
             roi_mask_shape = frame.shape[:2]
 
-        small = cv2.resize(frame, (640, 360))
-        fg = bg.apply(small)
-        if roi_mask is not None:
-            small_mask = cv2.resize(roi_mask, (640, 360), interpolation=cv2.INTER_NEAREST)
-            fg = cv2.bitwise_and(fg, fg, mask=small_mask)
-        motion_pixels = int(np.count_nonzero(fg))
-        # Чувствительность камеры переопределяет общий порог профиля
-        threshold = motion_sens if motion_sens else CONFIG["motion_threshold"]
-        motion = motion_pixels > threshold
+        # ТЗ 18.7: пока ONVIF-подписка камеры здорова (недавний успешный
+        # pull), движение берётся из событий камеры — MOG2 целиком
+        # пропускается ради экономии CPU ("камера делает предобработку на
+        # своём чипе"). При проблемах с ONVIF (сеть, отвал подписки)
+        # onvif_healthy() перестаёт быть True без дополнительной логики
+        # здесь, и следующий же кадр прозрачно возвращается на обычный
+        # MOG2-префильтр — детекция не останавливается.
+        if onvif_config and onvif_healthy(cam_id):
+            motion = onvif_motion_recent(cam_id)
+        else:
+            small = cv2.resize(frame, (640, 360))
+            fg = bg.apply(small)
+            if roi_mask is not None:
+                small_mask = cv2.resize(roi_mask, (640, 360), interpolation=cv2.INTER_NEAREST)
+                fg = cv2.bitwise_and(fg, fg, mask=small_mask)
+            motion_pixels = int(np.count_nonzero(fg))
+            # Чувствительность камеры переопределяет общий порог профиля
+            threshold = motion_sens if motion_sens else CONFIG["motion_threshold"]
+            motion = motion_pixels > threshold
 
         # Префильтр движения (ТЗ 18.4): в «максимальном» профиле отключается
         # и детектор лиц работает по каждому кадру.
@@ -832,8 +923,23 @@ def manager():
                     except Exception:
                         logger.error("не удалось расшифровать RTSP", exc_info=True, extra={"camera_id": cam.id})
                         continue
+                    onvif_config = None
+                    if getattr(cam, "onvif_enabled", False) and getattr(cam, "onvif_host", None):
+                        onvif_password = None
+                        pw_enc = getattr(cam, "onvif_password_enc", None)
+                        if pw_enc:
+                            try:
+                                onvif_password = fernet.decrypt(pw_enc.encode()).decode()
+                            except Exception:
+                                logger.error("не удалось расшифровать ONVIF-пароль", exc_info=True, extra={"camera_id": cam.id})
+                        onvif_config = {
+                            "host": cam.onvif_host,
+                            "port": cam.onvif_port or 80,
+                            "username": cam.onvif_username,
+                            "password": onvif_password,
+                        }
                     t = threading.Thread(
-                        target=camera_worker, args=(cam.id, rtsp, face_app, sub), daemon=True
+                        target=camera_worker, args=(cam.id, rtsp, face_app, sub, onvif_config), daemon=True
                     )
                     t.start()
                     threads[cam.id] = t

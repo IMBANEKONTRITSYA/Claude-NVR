@@ -2,10 +2,15 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import { useUI } from "../ui";
 
+const EMPTY_FORM = {
+  name: "", rtsp_url: "", sub_rtsp_url: "", location: "", enabled: true,
+  onvif_enabled: false, onvif_host: "", onvif_port: 80, onvif_username: "", onvif_password: "",
+};
+
 export function Cameras() {
   const { toast, confirm } = useUI();
   const [cams, setCams] = useState<any[]>([]);
-  const [form, setForm] = useState({ name: "", rtsp_url: "", sub_rtsp_url: "", location: "", enabled: true });
+  const [form, setForm] = useState(EMPTY_FORM);
   const [editing, setEditing] = useState<number | null>(null);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string>("");
@@ -17,7 +22,7 @@ export function Cameras() {
     try {
       if (editing) await api.camUpdate(editing, form);
       else await api.camAdd(form);
-      setForm({ name: "", rtsp_url: "", sub_rtsp_url: "", location: "", enabled: true });
+      setForm(EMPTY_FORM);
       setEditing(null);
       load();
       toast(editing ? "Камера обновлена" : "Камера добавлена", "ok");
@@ -58,8 +63,29 @@ export function Cameras() {
             } catch (e: any) { setTestResult(`Ошибка: ${e.message}`); }
             finally { setTesting(false); }
           }}>{testing ? "Проверка..." : "Проверить RTSP"}</button>
-        {editing && <button className="btn secondary" onClick={() => { setEditing(null); setForm({ name: "", rtsp_url: "", sub_rtsp_url: "", location: "", enabled: true }); setTestResult(""); }} style={{ marginLeft: 8 }}>Отмена</button>}
+        {editing && <button className="btn secondary" onClick={() => { setEditing(null); setForm(EMPTY_FORM); setTestResult(""); }} style={{ marginLeft: 8 }}>Отмена</button>}
         {testResult && <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>{testResult}</div>}
+
+        <div style={{ marginTop: 16, paddingTop: 12, borderTop: "1px solid var(--border)" }}>
+          <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+            <input type="checkbox" style={{ width: "auto" }} checked={form.onvif_enabled}
+              onChange={e => setForm({ ...form, onvif_enabled: e.target.checked })} />
+            ONVIF-события движения (вместо постоянного анализа кадров)
+          </label>
+          {form.onvif_enabled && (
+            <div className="grid" style={{ gridTemplateColumns: "2fr 1fr 1fr 1fr" }}>
+              <div><label>ONVIF-адрес камеры</label><input value={form.onvif_host}
+                onChange={e => setForm({ ...form, onvif_host: e.target.value })} placeholder="192.168.1.64" /></div>
+              <div><label>Порт</label><input type="number" value={form.onvif_port}
+                onChange={e => setForm({ ...form, onvif_port: +e.target.value })} /></div>
+              <div><label>Логин</label><input value={form.onvif_username}
+                onChange={e => setForm({ ...form, onvif_username: e.target.value })} /></div>
+              <div><label>Пароль{editing ? " (оставить пустым — не менять)" : ""}</label>
+                <input type="password" value={form.onvif_password}
+                  onChange={e => setForm({ ...form, onvif_password: e.target.value })} /></div>
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="card">
@@ -69,7 +95,11 @@ export function Cameras() {
             {cams.map(c => (
               <tr key={c.id}>
                 <td>{c.id}</td>
-                <td>{c.name}{c.has_substream && <span className="muted" style={{ fontSize: 10, marginLeft: 6 }} title="Детекция идёт по субпотоку">SUB</span>}</td>
+                <td>
+                  {c.name}
+                  {c.has_substream && <span className="muted" style={{ fontSize: 10, marginLeft: 6 }} title="Детекция идёт по субпотоку">SUB</span>}
+                  {c.onvif_enabled && <span className="muted" style={{ fontSize: 10, marginLeft: 6 }} title="Движение — по событиям ONVIF">ONVIF</span>}
+                </td>
                 <td>{c.location}</td>
                 <td><span className={`badge ${c.status}`}>{c.status}</span></td>
                 <td>
@@ -82,7 +112,13 @@ export function Cameras() {
                   </label>
                 </td>
                 <td>
-                  <button className="btn secondary" onClick={() => { setEditing(c.id); setForm({ name: c.name, rtsp_url: "", sub_rtsp_url: "", location: c.location, enabled: c.enabled }); }}>Изм.</button>
+                  <button className="btn secondary" onClick={() => {
+                    setEditing(c.id);
+                    setForm({
+                      name: c.name, rtsp_url: "", sub_rtsp_url: "", location: c.location, enabled: c.enabled,
+                      onvif_enabled: !!c.onvif_enabled, onvif_host: "", onvif_port: 80, onvif_username: "", onvif_password: "",
+                    });
+                  }}>Изм.</button>
                   <button className="btn danger" onClick={() => remove(c.id)} style={{ marginLeft: 4 }}>Удалить</button>
                 </td>
               </tr>

@@ -15,16 +15,18 @@ from ..services.pubsub import get_redis
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 
 
+def _camera_out(c: Camera) -> CameraOut:
+    return CameraOut(
+        id=c.id, name=c.name, location=c.location, enabled=c.enabled, status=c.status,
+        has_substream=bool(c.sub_rtsp_url_enc), motion_sensitivity=c.motion_sensitivity,
+        onvif_enabled=bool(c.onvif_enabled), has_onvif=bool(c.onvif_host),
+    )
+
+
 @router.get("", response_model=list[CameraOut])
 async def list_cameras(_=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     r = await db.execute(select(Camera).order_by(Camera.id))
-    return [
-        CameraOut(
-            id=c.id, name=c.name, location=c.location, enabled=c.enabled, status=c.status,
-            has_substream=bool(c.sub_rtsp_url_enc), motion_sensitivity=c.motion_sensitivity,
-        )
-        for c in r.scalars().all()
-    ]
+    return [_camera_out(c) for c in r.scalars().all()]
 
 
 @router.post("", response_model=CameraOut)
@@ -37,15 +39,17 @@ async def add_camera(payload: CameraIn, _=Depends(require_role("admin")), db: As
         enabled=payload.enabled,
         motion_sensitivity=payload.motion_sensitivity,
         status="offline",
+        onvif_enabled=payload.onvif_enabled,
+        onvif_host=payload.onvif_host or None,
+        onvif_port=payload.onvif_port,
+        onvif_username=payload.onvif_username or None,
+        onvif_password_enc=encrypt(payload.onvif_password) if payload.onvif_password else None,
     )
     db.add(cam)
     await db.commit()
     await db.refresh(cam)
     await get_redis().publish("cameras:changed", str(cam.id))
-    return CameraOut(
-        id=cam.id, name=cam.name, location=cam.location, enabled=cam.enabled, status=cam.status,
-        has_substream=bool(cam.sub_rtsp_url_enc), motion_sensitivity=cam.motion_sensitivity,
-    )
+    return _camera_out(cam)
 
 
 @router.put("/{cam_id}", response_model=CameraOut)
@@ -61,13 +65,18 @@ async def update_camera(cam_id: int, payload: CameraIn, _=Depends(require_role("
     cam.location = payload.location
     cam.enabled = payload.enabled
     cam.motion_sensitivity = payload.motion_sensitivity
+    cam.onvif_enabled = payload.onvif_enabled
+    cam.onvif_host = payload.onvif_host or None
+    cam.onvif_port = payload.onvif_port
+    cam.onvif_username = payload.onvif_username or None
+    # Пароль, как и sub_rtsp_url: пустое значение из формы не должно
+    # затирать уже сохранённый пароль при обычном редактировании других полей.
+    if payload.onvif_password:
+        cam.onvif_password_enc = encrypt(payload.onvif_password)
     await db.commit()
     await db.refresh(cam)
     await get_redis().publish("cameras:changed", str(cam.id))
-    return CameraOut(
-        id=cam.id, name=cam.name, location=cam.location, enabled=cam.enabled, status=cam.status,
-        has_substream=bool(cam.sub_rtsp_url_enc), motion_sensitivity=cam.motion_sensitivity,
-    )
+    return _camera_out(cam)
 
 
 @router.delete("/{cam_id}")

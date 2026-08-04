@@ -1,0 +1,219 @@
+"""Юнит-тесты ONVIF-клиента (ТЗ 18.7) — чистая логика, без сети и без
+реальной камеры: HTTP замокан через monkeypatch на urllib.request.urlopen,
+SOAP-ответы — статичные XML-фикстуры по образцу спецификации ONVIF Core/
+Events. Пять предыдущих циклов аудита откладывали ONVIF целиком, ссылаясь
+на отсутствие камеры в песочнице — этот файл показывает, что протокольный
+клиент можно проверить и без неё."""
+import base64
+import hashlib
+from datetime import datetime, timezone
+
+import pytest
+
+import onvif_client as oc
+
+
+class _FakeResponse:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _mock_urlopen(monkeypatch, response_bytes: bytes | None = None, exc: Exception | None = None, capture: dict | None = None):
+    def fake(req, timeout=None):
+        if capture is not None:
+            capture["url"] = req.full_url
+            capture["body"] = req.data.decode("utf-8")
+            capture["headers"] = dict(req.header_items())
+            capture["timeout"] = timeout
+        if exc is not None:
+            raise exc
+        return _FakeResponse(response_bytes)
+
+    monkeypatch.setattr(oc.urllib.request, "urlopen", fake)
+
+
+# ---------------------------------------------------------------------------
+# WS-Security UsernameToken (PasswordDigest)
+# ---------------------------------------------------------------------------
+
+def test_username_token_digest_matches_wssecurity_spec():
+    header = oc._username_token_header("admin", "s3cret")
+    assert "<Username>admin</Username>" in header
+    assert 'Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest"' in header
+
+    # Извлекаем Nonce/Created/Digest из сгенерированного заголовка и
+    # пересчитываем digest независимо — должен совпасть 1-в-1 с формулой
+    # спецификации: Base64(SHA1(RawNonce + Created + Password)).
+    import re
+    nonce_b64 = re.search(r"<Nonce[^>]*>([^<]+)</Nonce>", header).group(1)
+    created = re.search(r"<wsu:Created>([^<]+)</wsu:Created>", header).group(1)
+    digest = re.search(r"<Password[^>]*>([^<]+)</Password>", header).group(1)
+
+    raw_nonce = base64.b64decode(nonce_b64)
+    expected = base64.b64encode(
+        hashlib.sha1(raw_nonce + created.encode() + b"s3cret").digest()
+    ).decode()
+    assert digest == expected
+
+    # Created — валидный UTC ISO8601 в пределах разумного окна от "сейчас"
+    parsed = datetime.strptime(created, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    assert abs((datetime.now(timezone.utc) - parsed).total_seconds()) < 30
+
+
+def test_envelope_without_credentials_has_empty_header():
+    envelope = oc._soap_envelope("<Body/>", None, None)
+    assert "<soap:Header></soap:Header>" in envelope
+    assert "UsernameToken" not in envelope
+
+
+# ---------------------------------------------------------------------------
+# create_pull_point_subscription
+# ---------------------------------------------------------------------------
+
+CREATE_SUBSCRIPTION_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope"
+    xmlns:wsa="http://www.w3.org/2005/08/addressing"
+    xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
+  <SOAP-ENV:Body>
+    <tev:CreatePullPointSubscriptionResponse>
+      <tev:SubscriptionReference>
+        <wsa:Address>http://192.168.1.64/onvif/Events/PullPoint/abc123</wsa:Address>
+      </tev:SubscriptionReference>
+      <wsnt:CurrentTime xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">2026-08-04T05:00:00Z</wsnt:CurrentTime>
+    </tev:CreatePullPointSubscriptionResponse>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"""
+
+
+def test_create_pull_point_subscription_parses_address(monkeypatch):
+    capture = {}
+    _mock_urlopen(monkeypatch, response_bytes=CREATE_SUBSCRIPTION_RESPONSE.encode(), capture=capture)
+    url = oc.create_pull_point_subscription("192.168.1.64", 80, "admin", "s3cret")
+    assert url == "http://192.168.1.64/onvif/Events/PullPoint/abc123"
+    assert capture["url"] == "http://192.168.1.64:80/onvif/Events"
+    assert "UsernameToken" in capture["body"]
+    assert capture["headers"]["Content-type"] == "application/soap+xml; charset=utf-8"
+
+
+def test_create_pull_point_subscription_without_credentials_omits_security(monkeypatch):
+    capture = {}
+    _mock_urlopen(monkeypatch, response_bytes=CREATE_SUBSCRIPTION_RESPONSE.encode(), capture=capture)
+    oc.create_pull_point_subscription("192.168.1.64", 80, None, None)
+    assert "UsernameToken" not in capture["body"]
+
+
+def test_create_pull_point_subscription_raises_on_network_error(monkeypatch):
+    import urllib.error
+    _mock_urlopen(monkeypatch, exc=urllib.error.URLError("connection refused"))
+    with pytest.raises(oc.OnvifError):
+        oc.create_pull_point_subscription("192.168.1.64", 80, "admin", "s3cret")
+
+
+def test_create_pull_point_subscription_raises_on_malformed_xml(monkeypatch):
+    _mock_urlopen(monkeypatch, response_bytes=b"not xml at all")
+    with pytest.raises(oc.OnvifError):
+        oc.create_pull_point_subscription("192.168.1.64", 80, "admin", "s3cret")
+
+
+def test_create_pull_point_subscription_raises_when_address_missing(monkeypatch):
+    empty = """<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope">
+    <SOAP-ENV:Body><tev:CreatePullPointSubscriptionResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl"/></SOAP-ENV:Body>
+    </SOAP-ENV:Envelope>"""
+    _mock_urlopen(monkeypatch, response_bytes=empty.encode())
+    with pytest.raises(oc.OnvifError):
+        oc.create_pull_point_subscription("192.168.1.64", 80, "admin", "s3cret")
+
+
+# ---------------------------------------------------------------------------
+# pull_messages
+# ---------------------------------------------------------------------------
+
+PULL_MESSAGES_RESPONSE_WITH_MOTION = """<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope"
+    xmlns:tev="http://www.onvif.org/ver10/events/wsdl"
+    xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"
+    xmlns:tt="http://www.onvif.org/ver10/schema">
+  <SOAP-ENV:Body>
+    <tev:PullMessagesResponse>
+      <tev:CurrentTime>2026-08-04T05:00:10Z</tev:CurrentTime>
+      <tev:TerminationTime>2026-08-04T05:10:00Z</tev:TerminationTime>
+      <wsnt:NotificationMessage>
+        <wsnt:Topic Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic>
+        <wsnt:Message>
+          <tt:Message UtcTime="2026-08-04T05:00:09Z">
+            <tt:Data>
+              <tt:SimpleItem Name="State" Value="true"/>
+            </tt:Data>
+          </tt:Message>
+        </wsnt:Message>
+      </wsnt:NotificationMessage>
+      <wsnt:NotificationMessage>
+        <wsnt:Topic>tns1:VideoSource/GlobalSceneChange/ImagingService</wsnt:Topic>
+        <wsnt:Message>
+          <tt:Message UtcTime="2026-08-04T05:00:10Z">
+            <tt:Data/>
+          </tt:Message>
+        </wsnt:Message>
+      </wsnt:NotificationMessage>
+    </tev:PullMessagesResponse>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"""
+
+
+def test_pull_messages_parses_topic_and_state(monkeypatch):
+    _mock_urlopen(monkeypatch, response_bytes=PULL_MESSAGES_RESPONSE_WITH_MOTION.encode())
+    events = oc.pull_messages("http://192.168.1.64/onvif/Events/PullPoint/abc123", "admin", "s3cret")
+    assert len(events) == 2
+    assert events[0]["topic"] == "tns1:RuleEngine/CellMotionDetector/Motion"
+    assert events[0]["state"] == "true"
+    assert events[0]["utc_time"] == "2026-08-04T05:00:09Z"
+    assert events[1]["state"] is None
+
+
+def test_pull_messages_empty_response_returns_empty_list(monkeypatch):
+    empty = """<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope">
+    <SOAP-ENV:Body><tev:PullMessagesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl"/></SOAP-ENV:Body>
+    </SOAP-ENV:Envelope>"""
+    _mock_urlopen(monkeypatch, response_bytes=empty.encode())
+    assert oc.pull_messages("http://cam/PullPoint/x", None, None) == []
+
+
+def test_pull_messages_raises_on_timeout(monkeypatch):
+    _mock_urlopen(monkeypatch, exc=TimeoutError("timed out"))
+    with pytest.raises(oc.OnvifError):
+        oc.pull_messages("http://cam/PullPoint/x", "admin", "s3cret")
+
+
+def test_pull_messages_sends_timeout_and_limit_in_body(monkeypatch):
+    capture = {}
+    _mock_urlopen(monkeypatch, response_bytes=PULL_MESSAGES_RESPONSE_WITH_MOTION.encode(), capture=capture)
+    oc.pull_messages("http://cam/PullPoint/x", "admin", "s3cret", timeout_sec=3, message_limit=10)
+    assert "<Timeout>PT3S</Timeout>" in capture["body"]
+    assert "<MessageLimit>10</MessageLimit>" in capture["body"]
+
+
+# ---------------------------------------------------------------------------
+# is_motion_event classification
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("topic,state,expected", [
+    ("tns1:RuleEngine/CellMotionDetector/Motion", "true", True),
+    ("tns1:RuleEngine/CellMotionDetector/Motion", "false", False),
+    ("tns1:RuleEngine/CellMotionDetector/Motion", None, True),
+    ("tns1:RuleEngine/PeopleDetector/People", "true", True),
+    ("tns1:RuleEngine/PeopleDetector/People", "FALSE", False),  # регистронезависимо
+    ("tns1:VideoSource/GlobalSceneChange/ImagingService", "true", False),
+    ("", "true", False),
+    (None, None, False),
+])
+def test_is_motion_event_classification(topic, state, expected):
+    assert oc.is_motion_event(topic, state) is expected
