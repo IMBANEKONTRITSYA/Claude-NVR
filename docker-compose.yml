@@ -187,6 +187,13 @@ services:
       - backend
     ports:
       - "8080:80"
+      # ТЗ 13: TLS/HTTPS доступен по умолчанию — самоподписанный сертификат
+      # генерируется автоматически при первом запуске (docker-entrypoint.sh).
+      - "8443:443"
+    volumes:
+      # Сертификат переживает пересоздание контейнера — иначе браузеру
+      # пришлось бы заново принимать предупреждение при каждом обновлении.
+      - frontend_certs:/etc/nginx/certs
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
       interval: 30s
@@ -198,3 +205,4 @@ volumes:
   pgdata:
   media:
   backups:
+  frontend_certs:
