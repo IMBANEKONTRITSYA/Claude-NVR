@@ -20,6 +20,24 @@ def test_security_headers_present_on_both_listeners():
         assert "always" in line
 
 
+def test_csp_header_present_and_permits_hls_worker():
+    # ТЗ 13: OWASP Top 10 — защита от XSS. worker-src blob: — без него
+    # hls.js (enableWorker по умолчанию) не может создать свой demuxer-
+    # воркер через URL.createObjectURL(new Blob(...)), браузер блокирует
+    # его с "Refused to create a worker from 'blob:...' because it violates
+    # ... script-src" — подтверждено вручную headless Chromium: без
+    # worker-src видео на LiveGrid не воспроизводится вообще (см. PR).
+    locations = (FRONTEND / "nginx-locations.conf").read_text(encoding="utf-8")
+    line = next(l for l in locations.splitlines() if "add_header Content-Security-Policy" in l)
+    assert "always" in line
+    assert "default-src 'self'" in line
+    assert "worker-src 'self' blob:" in line
+    # Никаких внешних хостов (CDN и т.п.) — фронтенд не использует их вовсе,
+    # 'self' везде не должен получить исключений вида *.example.com.
+    assert "object-src 'none'" in line
+    assert "frame-ancestors 'none'" in line
+
+
 def test_hsts_only_on_https_listener():
     conf = (FRONTEND / "nginx.conf").read_text(encoding="utf-8")
     assert "Strict-Transport-Security" in conf
