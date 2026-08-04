@@ -19,6 +19,9 @@ from .routers import settings as r_settings
 from .routers import audit as r_audit
 from .routers import system as r_system
 from .audit import AuditMiddleware
+from .logging_utils import configure_logging
+
+logger = configure_logging("facewatch.backend")
 
 
 @asynccontextmanager
@@ -27,7 +30,7 @@ async def lifespan(app: FastAPI):
         problems = insecure_secret_problems()
         if problems:
             for p in problems:
-                print(f"[startup] КРИТИЧНО: {p}", flush=True)
+                logger.critical(p)
             raise RuntimeError(
                 "Запуск остановлен: обнаружены секреты по умолчанию из публичного репозитория "
                 "(см. сообщения выше). Заполните .env реальными значениями "
@@ -72,8 +75,8 @@ async def lifespan(app: FastAPI):
         ):
             try:
                 await conn.execute(text(stmt))
-            except Exception as e:
-                print(f"[startup] не удалось создать HNSW-индекс: {e}", flush=True)
+            except Exception:
+                logger.warning("не удалось создать HNSW-индекс", exc_info=True, extra={"statement": stmt})
     async with SessionLocal() as db:
         r = await db.execute(select(User).where(User.username == "admin"))
         if not r.scalar_one_or_none():
