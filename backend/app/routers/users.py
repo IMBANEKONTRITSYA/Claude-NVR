@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 from ..db import get_db
 from ..models import User
 from ..auth import require_role, hash_password
@@ -28,7 +28,31 @@ async def create_user(payload: UserCreate, _=Depends(require_role("admin")), db:
 
 
 @router.delete("/{user_id}")
-async def delete_user(user_id: int, _=Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
+async def delete_user(user_id: int, current: User = Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
+    # Без первой проверки админ мог удалить сам себя (self-lockout —
+    # текущая сессия и refresh-токены остаются валидны до истечения, но
+    # войти заново или управлять системой после logout уже нельзя, и
+    # main.py:lifespan досеивает "admin" только если такого username вообще
+    # не существует — переименованный/другой-по-имени последний админ не
+    # восстановится автоматически при перезапуске). Это единственный
+    # реалистичный путь к нулю администраторов через этот эндпоинт: он сам
+    # требует роль admin, поэтому если удаляющий и удаляемый — разные
+    # пользователи, админов на момент проверки как минимум два (оба
+    # существуют одновременно), и подсчёт ниже не сработает. Второй чек
+    # (подсчёт) — оставлен как defense-in-depth и явная фиксация инварианта
+    # «в системе всегда есть хотя бы один администратор» на случай будущего
+    # изменения self-check выше или появления другого пути удаления.
+    target = await db.get(User, user_id)
+    if not target:
+        raise HTTPException(404, "Пользователь не найден")
+    if target.id == current.id:
+        raise HTTPException(400, "Нельзя удалить собственную учётную запись")
+    if target.role == "admin":
+        admin_count = (await db.execute(
+            select(func.count()).select_from(User).where(User.role == "admin")
+        )).scalar() or 0
+        if admin_count <= 1:
+            raise HTTPException(400, "Нельзя удалить последнего администратора")
     await db.execute(delete(User).where(User.id == user_id))
     await db.commit()
     return {"ok": True}
