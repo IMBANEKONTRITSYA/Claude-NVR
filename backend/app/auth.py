@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,32 @@ def hash_password(p: str) -> str:
 
 def verify_password(p: str, h: str) -> bool:
     return pwd_ctx.verify(p, h)
+
+
+async def verify_password_async(p: str, h: str) -> bool:
+    """bcrypt — намеренно медленная CPU-bound функция (сотни мс на
+    текущем work factor). Вызов синхронного verify_password() напрямую
+    внутри async-обработчика блокирует единственный event loop uvicorn на
+    всё это время: не только сам /login, но и вообще все остальные
+    корутины (снепшоты живой сетки, дашборд, архив у уже залогиненных
+    пользователей) встают в очередь за ним, пока bcrypt считается в том
+    же потоке. Обнаружено нагрузочным тестом (loadtest/locustfile.py,
+    SPEC.md §14 "Нагрузочное тестирование... проверка стабильности FPS и
+    задержек"): при 16 одновременных клиентах p99 задержки на никак не
+    связанных с логином эндпоинтах подскакивал до 300-900мс именно в
+    моменты конкурентных входов — под SPEC.md "задержка трансляции
+    ≤3 сек" и "24/7 без деградации" это реальный риск на пересменке, когда
+    несколько операторов логинятся почти одновременно. asyncio.to_thread
+    не ускоряет сам bcrypt (это by-design медленная функция — защита от
+    brute-force), но переносит блокировку в пул потоков, освобождая
+    event loop для остальных запросов."""
+    return await asyncio.to_thread(verify_password, p, h)
+
+
+async def hash_password_async(p: str) -> str:
+    """См. verify_password_async — тот же bcrypt-cost, тот же риск
+    блокировки event loop, применяется при регистрации/смене пароля."""
+    return await asyncio.to_thread(hash_password, p)
 
 
 def create_token(sub: str, role: str) -> str:

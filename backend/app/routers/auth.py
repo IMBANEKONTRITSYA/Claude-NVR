@@ -7,10 +7,10 @@ from ..config import settings
 from ..db import get_db
 from ..models import User
 from ..auth import (
-    verify_password,
+    verify_password_async,
     create_token,
     get_current_user,
-    hash_password,
+    hash_password_async,
     create_refresh_token,
     rotate_refresh_token,
     revoke_refresh_token,
@@ -57,7 +57,7 @@ async def login(request: Request, form: OAuth2PasswordRequestForm = Depends(), d
 
     r = await db.execute(select(User).where(User.username == form.username))
     user = r.scalar_one_or_none()
-    if not user or not verify_password(form.password, user.password_hash):
+    if not user or not await verify_password_async(form.password, user.password_hash):
         try:
             pipe = redis.pipeline()
             pipe.incr(key)
@@ -133,7 +133,7 @@ async def change_password(
     if attempts >= CHANGE_PW_MAX_ATTEMPTS:
         raise HTTPException(status_code=429, detail="Слишком много попыток. Повторите через несколько минут.")
 
-    if not verify_password(payload.old_password, user.password_hash):
+    if not await verify_password_async(payload.old_password, user.password_hash):
         try:
             pipe = redis.pipeline()
             pipe.incr(key)
@@ -147,7 +147,7 @@ async def change_password(
         await redis.delete(key)
     except Exception:
         pass
-    user.password_hash = hash_password(payload.new_password)
+    user.password_hash = await hash_password_async(payload.new_password)
     # naive UTC: users.password_changed_at — TIMESTAMP WITHOUT TIME ZONE,
     # asyncpg отказывается биндить timezone-aware datetime в такую колонку
     # (тот же паттерн, что ../auth.py:_utcnow_naive для refresh_tokens).
