@@ -136,6 +136,18 @@ async def hls_url(cam_id: int, _=Depends(get_current_user)):
     return {"url": f"/hls/cam{cam_id}/index.m3u8"}
 
 
+@router.get("/hls-auth", include_in_schema=False)
+async def hls_auth(_=Depends(get_current_user)):
+    """Внутренний эндпоинт для nginx `auth_request` (location /hls/ в
+    nginx-locations.conf). До этого фикса /hls/ проксировался в MediaMTX без
+    какой-либо проверки — любой, у кого есть сетевой доступ к nginx, мог
+    смотреть видео с любой камеры вообще без логина, просто перебирая
+    cam{id} (P0, цикл 6). Роль не проверяется намеренно: матрица прав ТЗ
+    разрешает просмотр видео онлайн всем трём ролям — здесь важна только
+    валидность токена, тот же контракт, что у snapshot()/archive/prometheus."""
+    return {"ok": True}
+
+
 @router.post("/test")
 async def test_rtsp(payload: RtspTest, _=Depends(require_role("admin"))):
     """Проверка RTSP-подключения: открытие потока через ffprobe с таймаутом 10с."""

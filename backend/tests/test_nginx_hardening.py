@@ -31,6 +31,24 @@ def test_hsts_only_on_https_listener():
     assert "Strict-Transport-Security" not in http_block
 
 
+def test_hls_location_requires_auth_request():
+    # P0 (цикл 6): /hls/ проксировал в MediaMTX без какой-либо проверки —
+    # любой с сетевым доступом к nginx мог смотреть любую камеру без логина.
+    locations = (FRONTEND / "nginx-locations.conf").read_text(encoding="utf-8")
+    assert "location = /internal/hls-auth" in locations
+    # Комментарии в этом конфиге содержат `}` (например, "cam{id}") — split
+    # по первой "}" отрезал бы блок раньше времени, поэтому режем по началу
+    # следующего location-блока, а не по скобке.
+    internal_start = locations.index("location = /internal/hls-auth")
+    hls_start = locations.index("location /hls/", internal_start)
+    internal_block = locations[internal_start:hls_start]
+    assert "internal;" in internal_block
+
+    next_location_start = locations.index("location / {", hls_start)
+    hls_block = locations[hls_start:next_location_start]
+    assert "auth_request /internal/hls-auth" in hls_block
+
+
 def test_login_endpoint_is_rate_limited():
     conf = (FRONTEND / "nginx.conf").read_text(encoding="utf-8")
     assert "limit_req_zone" in conf

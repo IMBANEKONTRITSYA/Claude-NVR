@@ -39,6 +39,23 @@ def test_cameras_require_auth(client):
     assert r.status_code == 401
 
 
+def test_hls_auth_rejects_missing_or_invalid_token(client):
+    # Внутренний эндпоинт для nginx auth_request (location /hls/, P0 цикл 6):
+    # раньше видеопоток проксировался вообще без проверки. Контракт —
+    # тот же, что и у get_current_user везде: 401 без валидного Bearer.
+    assert client.get("/api/cameras/hls-auth").status_code == 401
+    assert client.get(
+        "/api/cameras/hls-auth", headers={"Authorization": "Bearer garbage"}
+    ).status_code == 401
+
+
+def test_hls_auth_accepts_any_authenticated_role(client, admin_headers):
+    # Матрица прав ТЗ: просмотр видео онлайн разрешён всем трём ролям — этот
+    # эндпоинт не должен ограничивать роль, только проверять валидность токена.
+    r = client.get("/api/cameras/hls-auth", headers=admin_headers)
+    assert r.status_code == 200
+
+
 def test_camera_crud_roundtrip_encrypts_rtsp_credentials(client, admin_headers, request):
     name = _unique("cam", request)
     rtsp_url = "rtsp://operator:s3cr3t@192.168.1.50:554/Streaming/Channels/101"
