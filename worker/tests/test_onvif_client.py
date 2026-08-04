@@ -203,6 +203,117 @@ def test_pull_messages_sends_timeout_and_limit_in_body(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# get_profiles / get_stream_uri (SPEC 18.7 — "получение профилей потоков")
+# ---------------------------------------------------------------------------
+
+GET_PROFILES_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope"
+    xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+    xmlns:tt="http://www.onvif.org/ver10/schema">
+  <SOAP-ENV:Body>
+    <trt:GetProfilesResponse>
+      <trt:Profiles token="profile_1" fixed="true">
+        <tt:Name>MainStream</tt:Name>
+      </trt:Profiles>
+      <trt:Profiles token="profile_2" fixed="true">
+        <tt:Name>SubStream</tt:Name>
+      </trt:Profiles>
+    </trt:GetProfilesResponse>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"""
+
+GET_STREAM_URI_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope"
+    xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+    xmlns:tt="http://www.onvif.org/ver10/schema">
+  <SOAP-ENV:Body>
+    <trt:GetStreamUriResponse>
+      <trt:MediaUri>
+        <tt:Uri>rtsp://192.168.1.64:554/profile1</tt:Uri>
+      </trt:MediaUri>
+    </trt:GetStreamUriResponse>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"""
+
+
+def test_get_profiles_parses_token_and_name(monkeypatch):
+    capture = {}
+    _mock_urlopen(monkeypatch, response_bytes=GET_PROFILES_RESPONSE.encode(), capture=capture)
+    profiles = oc.get_profiles("192.168.1.64", 80, "admin", "s3cret")
+    assert profiles == [
+        {"token": "profile_1", "name": "MainStream"},
+        {"token": "profile_2", "name": "SubStream"},
+    ]
+    assert capture["url"] == "http://192.168.1.64:80/onvif/Media"
+    assert "UsernameToken" in capture["body"]
+
+
+def test_get_profiles_falls_back_to_token_when_name_missing(monkeypatch):
+    no_name = """<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope">
+    <SOAP-ENV:Body><trt:GetProfilesResponse xmlns:trt="http://www.onvif.org/ver10/media/wsdl">
+    <trt:Profiles token="profile_x"/></trt:GetProfilesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>"""
+    _mock_urlopen(monkeypatch, response_bytes=no_name.encode())
+    assert oc.get_profiles("192.168.1.64", 80, None, None) == [{"token": "profile_x", "name": "profile_x"}]
+
+
+def test_get_profiles_empty_response_returns_empty_list(monkeypatch):
+    empty = """<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope">
+    <SOAP-ENV:Body><trt:GetProfilesResponse xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/></SOAP-ENV:Body>
+    </SOAP-ENV:Envelope>"""
+    _mock_urlopen(monkeypatch, response_bytes=empty.encode())
+    assert oc.get_profiles("192.168.1.64", 80, None, None) == []
+
+
+def test_get_profiles_raises_on_malformed_xml(monkeypatch):
+    _mock_urlopen(monkeypatch, response_bytes=b"not xml")
+    with pytest.raises(oc.OnvifError):
+        oc.get_profiles("192.168.1.64", 80, "admin", "s3cret")
+
+
+def test_get_profiles_raises_on_network_error(monkeypatch):
+    import urllib.error
+    _mock_urlopen(monkeypatch, exc=urllib.error.URLError("connection refused"))
+    with pytest.raises(oc.OnvifError):
+        oc.get_profiles("192.168.1.64", 80, "admin", "s3cret")
+
+
+def test_get_stream_uri_parses_uri(monkeypatch):
+    capture = {}
+    _mock_urlopen(monkeypatch, response_bytes=GET_STREAM_URI_RESPONSE.encode(), capture=capture)
+    uri = oc.get_stream_uri("192.168.1.64", 80, "profile_1", "admin", "s3cret")
+    assert uri == "rtsp://192.168.1.64:554/profile1"
+    assert "<ProfileToken>profile_1</ProfileToken>" in capture["body"]
+    assert "RTP-Unicast" in capture["body"]
+
+
+def test_get_stream_uri_escapes_profile_token_from_camera(monkeypatch):
+    # profile_token приходит из ответа камеры (GetProfiles) — потенциально
+    # враждебный ввод (скомпрометированная/поддельная камера в локальной
+    # сети), должен быть экранирован при подстановке обратно в XML-тело,
+    # а не ломать структуру запроса или внедрять посторонние SOAP-элементы.
+    capture = {}
+    _mock_urlopen(monkeypatch, response_bytes=GET_STREAM_URI_RESPONSE.encode(), capture=capture)
+    oc.get_stream_uri("192.168.1.64", 80, '"><Injected/>', "admin", "s3cret")
+    assert "<Injected/>" not in capture["body"]
+    assert '"&gt;&lt;Injected/&gt;' in capture["body"]
+
+
+def test_get_stream_uri_raises_when_uri_missing(monkeypatch):
+    empty = """<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope">
+    <SOAP-ENV:Body><trt:GetStreamUriResponse xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/></SOAP-ENV:Body>
+    </SOAP-ENV:Envelope>"""
+    _mock_urlopen(monkeypatch, response_bytes=empty.encode())
+    with pytest.raises(oc.OnvifError):
+        oc.get_stream_uri("192.168.1.64", 80, "profile_1", "admin", "s3cret")
+
+
+def test_get_stream_uri_raises_on_timeout(monkeypatch):
+    _mock_urlopen(monkeypatch, exc=TimeoutError("timed out"))
+    with pytest.raises(oc.OnvifError):
+        oc.get_stream_uri("192.168.1.64", 80, "profile_1", "admin", "s3cret")
+
+
+# ---------------------------------------------------------------------------
 # is_motion_event classification
 # ---------------------------------------------------------------------------
 

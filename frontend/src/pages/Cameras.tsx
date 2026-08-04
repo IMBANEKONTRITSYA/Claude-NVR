@@ -16,6 +16,8 @@ export function Cameras() {
   const [testResult, setTestResult] = useState<string>("");
   const [discovering, setDiscovering] = useState(false);
   const [discovered, setDiscovered] = useState<any[] | null>(null);
+  const [loadingProfiles, setLoadingProfiles] = useState(false);
+  const [profiles, setProfiles] = useState<any[] | null>(null);
 
   const load = () => api.cameras().then(setCams).catch(() => {});
   useEffect(() => { load(); }, []);
@@ -39,6 +41,26 @@ export function Cameras() {
       if (!r.devices?.length) toast("Камеры в сети не найдены", "err");
     } catch (e: any) { toast(e.message, "err"); }
     finally { setDiscovering(false); }
+  };
+
+  // ТЗ 18.7, вторая часть: "получение профилей потоков" — GetProfiles,
+  // затем GetStreamUri по выбранному профилю автозаполняет RTSP URL формы
+  // (аналогично тому, как автообнаружение уже автозаполняет host/port).
+  const loadProfiles = async () => {
+    setLoadingProfiles(true); setProfiles(null);
+    try {
+      const r = await api.onvifProfiles(form.onvif_host, form.onvif_port, form.onvif_username, form.onvif_password);
+      setProfiles(r.profiles || []);
+      if (!r.profiles?.length) toast("Профили потоков не найдены", "err");
+    } catch (e: any) { toast(e.message, "err"); }
+    finally { setLoadingProfiles(false); }
+  };
+
+  const pickProfile = async (token: string) => {
+    try {
+      const r = await api.onvifStreamUri(form.onvif_host, form.onvif_port, form.onvif_username, form.onvif_password, token);
+      if (r.uri) { setForm({ ...form, rtsp_url: r.uri }); toast("RTSP URL заполнен из профиля", "ok"); }
+    } catch (e: any) { toast(e.message, "err"); }
   };
 
   const remove = async (id: number) => {
@@ -110,6 +132,23 @@ export function Cameras() {
                         {d.host}:{d.port || 80}
                         {d.scopes?.find((s: string) => s.includes("/name/")) &&
                           ` — ${d.scopes.find((s: string) => s.includes("/name/")).split("/name/")[1]}`}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              <button type="button" className="btn secondary" style={{ marginTop: 8, marginLeft: 8 }}
+                disabled={!form.onvif_host || loadingProfiles}
+                onClick={loadProfiles}>
+                {loadingProfiles ? "Запрос..." : "Получить профили потоков"}
+              </button>
+              {profiles && profiles.length > 0 && (
+                <ul style={{ marginTop: 8, paddingLeft: 0, listStyle: "none" }}>
+                  {profiles.map((p, i) => (
+                    <li key={i} style={{ marginBottom: 4 }}>
+                      <button type="button" className="btn secondary" onClick={() => pickProfile(p.token)}>
+                        {p.name || p.token}
                       </button>
                     </li>
                   ))}

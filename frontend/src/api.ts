@@ -134,6 +134,13 @@ export const api = {
   testRtsp: (rtsp_url: string) =>
     req("/api/cameras/test", { method: "POST", body: JSON.stringify({ rtsp_url }) }),
   onvifDiscover: () => req("/api/cameras/onvif/discover"),
+  onvifProfiles: (host: string, port: number, username: string, password: string) =>
+    req("/api/cameras/onvif/profiles", { method: "POST", body: JSON.stringify({ host, port, username, password }) }),
+  onvifStreamUri: (host: string, port: number, username: string, password: string, profile_token: string) =>
+    req("/api/cameras/onvif/stream-uri", {
+      method: "POST",
+      body: JSON.stringify({ host, port, username, password, profile_token }),
+    }),
   cameras: () => req("/api/cameras"),
   camAdd: (b: any) => req("/api/cameras", { method: "POST", body: JSON.stringify(b) }),
   camUpdate: (id: number, b: any) => req(`/api/cameras/${id}`, { method: "PUT", body: JSON.stringify(b) }),

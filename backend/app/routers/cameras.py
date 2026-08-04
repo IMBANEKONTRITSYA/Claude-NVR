@@ -9,7 +9,7 @@ from ..config import settings
 from ..db import get_db
 from ..models import Camera
 from ..auth import require_role, get_current_user
-from ..schemas import CameraIn, CameraOut, ROIIn, RtspTest
+from ..schemas import CameraIn, CameraOut, OnvifProfilesRequest, OnvifStreamUriRequest, ROIIn, RtspTest
 from ..services.encryption import encrypt, decrypt
 from ..services.pubsub import get_redis
 
@@ -174,6 +174,41 @@ async def onvif_discover(_=Depends(require_role("admin"))):
     if not data.get("ok"):
         raise HTTPException(502, data.get("error") or "Не удалось выполнить автообнаружение")
     return {"devices": data.get("devices", [])}
+
+
+@router.post("/onvif/profiles")
+async def onvif_profiles(payload: OnvifProfilesRequest, _=Depends(require_role("admin"))):
+    """Получение профилей потоков ONVIF-камеры (ТЗ 18.7, вторая часть:
+    "получение профилей потоков") — GetProfiles Media-сервиса. Учётные
+    данные приходят в теле POST от формы камеры (ещё не обязательно
+    сохранённой), не персистятся здесь; проксируется воркеру по той же
+    причине, что и /onvif/discover — backend не имеет прямого сетевого
+    пути к камерам, воркер в той же docker-сети."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.post(f"{settings.WORKER_URL}/onvif/profiles", json=payload.model_dump())
+        except httpx.HTTPError as e:
+            raise HTTPException(503, f"Сервис распознавания недоступен: {e}")
+    data = resp.json()
+    if not data.get("ok"):
+        raise HTTPException(502, data.get("error") or "Не удалось получить профили потоков")
+    return {"profiles": data.get("profiles", [])}
+
+
+@router.post("/onvif/stream-uri")
+async def onvif_stream_uri(payload: OnvifStreamUriRequest, _=Depends(require_role("admin"))):
+    """RTSP-адрес потока для выбранного ONVIF-профиля (GetStreamUri) —
+    завершает ТЗ 18.7: результат подставляется фронтендом в поле rtsp_url
+    формы камеры вместо ручного ввода."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.post(f"{settings.WORKER_URL}/onvif/stream-uri", json=payload.model_dump())
+        except httpx.HTTPError as e:
+            raise HTTPException(503, f"Сервис распознавания недоступен: {e}")
+    data = resp.json()
+    if not data.get("ok"):
+        raise HTTPException(502, data.get("error") or "Не удалось получить адрес потока")
+    return {"uri": data.get("uri")}
 
 
 @router.post("/test")
