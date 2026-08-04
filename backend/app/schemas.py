@@ -1,6 +1,8 @@
+import re
 from datetime import datetime
 from urllib.parse import urlsplit
 from pydantic import BaseModel, Field, field_validator
+from .config import settings
 
 # ffmpeg/ffprobe/OpenCV принимают URL множества протоколов (file:, http:,
 # concat:, subprocess:, srt: и т.д.) — без ограничения схемы эти поля стали
@@ -23,6 +25,29 @@ def _validate_rtsp_url_required(value: str) -> str:
     return _check_rtsp_scheme(value)
 
 
+# ТЗ 13: "парольная политика (сложность)". Требуем минимальную длину и не
+# менее 3 из 4 классов символов — блокирует и совсем короткие пароли, и
+# длинные, но словарные (только строчные буквы).
+_PASSWORD_CLASSES = (
+    re.compile(r"[a-zа-яё]"),
+    re.compile(r"[A-ZА-ЯЁ]"),
+    re.compile(r"\d"),
+    re.compile(r"[^\w\s]"),
+)
+
+
+def _validate_password_complexity(value: str) -> str:
+    if len(value) < settings.PASSWORD_MIN_LENGTH:
+        raise ValueError(f"Пароль должен быть не короче {settings.PASSWORD_MIN_LENGTH} символов")
+    classes_present = sum(1 for pattern in _PASSWORD_CLASSES if pattern.search(value))
+    if classes_present < 3:
+        raise ValueError(
+            "Пароль должен содержать минимум 3 из 4: строчные буквы, "
+            "заглавные буквы, цифры, спецсимволы"
+        )
+    return value
+
+
 def _validate_rtsp_url_optional(value: str | None) -> str | None:
     # Пустая строка у sub_rtsp_url — сигнал "очистить субпоток" (cameras.py),
     # это допустимое значение, а не невалидный URL.
@@ -37,6 +62,10 @@ class Token(BaseModel):
     token_type: str = "bearer"
     role: str
     username: str
+    # ТЗ 13: "срок действия пароля" — фронтенд принудительно ведёт на смену
+    # пароля, не блокируя сам вход (иначе просроченный пароль = lockout без
+    # способа его сменить).
+    password_expired: bool = False
 
 
 class RefreshRequest(BaseModel):
@@ -61,10 +90,14 @@ class UserCreate(BaseModel):
     password: str
     role: str = Field(pattern="^(admin|operator|viewer)$")
 
+    _check_password = field_validator("password")(_validate_password_complexity)
+
 
 class PasswordChange(BaseModel):
     old_password: str
-    new_password: str = Field(min_length=6)
+    new_password: str
+
+    _check_new_password = field_validator("new_password")(_validate_password_complexity)
 
 
 class RtspTest(BaseModel):

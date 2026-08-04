@@ -12,6 +12,10 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(20))  # admin | operator | viewer
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # ТЗ 13: "парольная политика (срок действия)". Обновляется при создании
+    # пользователя и при каждой смене пароля — используется для расчёта
+    # истечения (settings.PASSWORD_MAX_AGE_DAYS).
+    password_changed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class RefreshToken(Base):

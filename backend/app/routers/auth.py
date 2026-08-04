@@ -1,7 +1,9 @@
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from ..config import settings
 from ..db import get_db
 from ..models import User
 from ..auth import (
@@ -26,6 +28,16 @@ WINDOW_SEC = 300         # окно блокировки, сек
 def real_ip(request: Request) -> str:
     """За nginx request.client.host — это адрес прокси; читаем X-Real-IP."""
     return request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
+
+
+def _is_password_expired(user: User) -> bool:
+    changed_at = user.password_changed_at
+    if changed_at is None:
+        return False
+    if changed_at.tzinfo is None:
+        changed_at = changed_at.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - changed_at
+    return age > timedelta(days=settings.PASSWORD_MAX_AGE_DAYS)
 
 
 @router.post("/login", response_model=Token)
@@ -58,7 +70,13 @@ async def login(request: Request, form: OAuth2PasswordRequestForm = Depends(), d
         pass
     token = create_token(user.username, user.role)
     refresh_token = await create_refresh_token(db, user.id)
-    return Token(access_token=token, refresh_token=refresh_token, role=user.role, username=user.username)
+    return Token(
+        access_token=token,
+        refresh_token=refresh_token,
+        role=user.role,
+        username=user.username,
+        password_expired=_is_password_expired(user),
+    )
 
 
 @router.post("/refresh", response_model=Token)
@@ -68,7 +86,13 @@ async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Refresh-токен недействителен или истёк")
     user, new_refresh_token = result
     access_token = create_token(user.username, user.role)
-    return Token(access_token=access_token, refresh_token=new_refresh_token, role=user.role, username=user.username)
+    return Token(
+        access_token=access_token,
+        refresh_token=new_refresh_token,
+        role=user.role,
+        username=user.username,
+        password_expired=_is_password_expired(user),
+    )
 
 
 @router.post("/logout")
@@ -94,6 +118,7 @@ async def change_password(
     if not verify_password(payload.old_password, user.password_hash):
         raise HTTPException(400, "Старый пароль неверен")
     user.password_hash = hash_password(payload.new_password)
+    user.password_changed_at = datetime.now(timezone.utc)
     # Смена пароля — сигнал "эта учётка могла быть скомпрометирована":
     # отзываем все refresh-токены, вынуждая перелогиниться везде, включая
     # устройство злоумышленника, если пароль сменили именно поэтому.
