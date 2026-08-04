@@ -2,7 +2,17 @@ import io
 import json
 import logging
 
-from app.logging_utils import JsonFormatter, configure_logging
+from app.logging_utils import JsonFormatter, RedactedAccessFormatter, configure_logging
+
+
+def _format_access_line(full_path: str) -> str:
+    formatter = RedactedAccessFormatter(fmt='%(client_addr)s - "%(request_line)s" %(status_code)s')
+    record = logging.LogRecord(
+        name="uvicorn.access", level=logging.INFO, pathname="", lineno=0,
+        msg="", args=None, exc_info=None,
+    )
+    record.args = ("127.0.0.1:12345", "GET", full_path, "1.1", 200)
+    return formatter.formatMessage(record)
 
 
 def test_json_formatter_basic_fields():
@@ -45,3 +55,28 @@ def test_configure_logging_sets_level_from_env(monkeypatch):
     assert logger.level == logging.WARNING
     assert len(logger.handlers) == 1
     assert isinstance(logger.handlers[0].formatter, JsonFormatter)
+
+
+def test_redacted_access_formatter_masks_token_value():
+    line = _format_access_line("/api/reports/persons_csv?days=7&token=eyJhbGciOiJIUzI1NiJ9.secret&x=1")
+    assert "token=REDACTED" in line
+    assert "secret" not in line
+    assert "days=7" in line and "x=1" in line
+
+
+def test_redacted_access_formatter_masks_token_as_only_param():
+    line = _format_access_line("/api/cameras/1/snapshot?token=SUPERSECRETVALUE")
+    assert "token=REDACTED" in line
+    assert "SUPERSECRETVALUE" not in line
+
+
+def test_redacted_access_formatter_leaves_other_params_untouched():
+    line = _format_access_line("/api/foo?mytoken=shouldstay&notoken=alsostay")
+    assert "mytoken=shouldstay" in line
+    assert "notoken=alsostay" in line
+
+
+def test_redacted_access_formatter_leaves_paths_without_token_untouched():
+    line = _format_access_line("/api/persons?page=2")
+    assert "page=2" in line
+    assert "REDACTED" not in line
