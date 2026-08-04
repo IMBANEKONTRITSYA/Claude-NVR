@@ -41,6 +41,11 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://facewatch:facewatch@localhost:5432/facewatch_test
       REDIS_URL: redis://localhost:6379/0
       ALLOW_INSECURE_DEFAULT_SECRETS: "true"
+      # Дефолт settings.MEDIA_PATH ("/media") предполагает контейнер, где он
+      # смонтирован и доступен на запись; на голом раннере это корень ФС,
+      # не пишется от непривилегированного пользователя — TestClient падал
+      # с PermissionError на самом первом os.makedirs() при старте lifespan.
+      MEDIA_PATH: ${{ runner.temp }}/facewatch-media
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
