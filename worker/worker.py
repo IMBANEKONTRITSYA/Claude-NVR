@@ -15,7 +15,6 @@ import shlex
 import signal
 import threading
 import subprocess
-import traceback
 from datetime import datetime, timedelta
 
 import cv2
@@ -32,6 +31,9 @@ from pgvector.sqlalchemy import Vector
 
 from backoff import reconnect_delay
 from shutdown import shutdown_event, handle_shutdown_signal
+from logging_utils import configure_logging
+
+logger = configure_logging("facewatch.worker")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -114,8 +116,8 @@ def refresh_config():
                     CONFIG[row.key] = caster(row.value) if row.value != "" else ("" if caster is str else CONFIG[row.key])
                 except (TypeError, ValueError):
                     pass
-    except Exception as e:
-        print(f"[worker] не удалось прочитать настройки: {e}", flush=True)
+    except Exception:
+        logger.error("не удалось прочитать настройки", exc_info=True)
 
 
 def send_telegram_alert(person_id: int, name: str, camera_id: int, snapshot_path: str):
@@ -140,8 +142,8 @@ def send_telegram_alert(person_id: int, name: str, camera_id: int, snapshot_path
             data=data, method="POST",
         )
         urllib.request.urlopen(req, timeout=5).read()
-    except Exception as e:
-        print(f"[alert] telegram error: {e}", flush=True)
+    except Exception:
+        logger.warning("ошибка отправки Telegram-уведомления", exc_info=True, extra={"person_id": person_id, "camera_id": camera_id})
 
 
 class Camera(Base):
@@ -225,7 +227,7 @@ def load_face_app(model_name: str | None = None):
     providers = detect_providers()
     ACCELERATOR = providers[0].replace("ExecutionProvider", "")
     size = int(CONFIG["detect_width"])
-    print(f"[worker] модель={name} ускоритель={ACCELERATOR} det_size={size}", flush=True)
+    logger.info("модель загружена", extra={"model": name, "accelerator": ACCELERATOR, "det_size": size})
     app = FaceAnalysis(name=name, providers=providers)
     app.prepare(ctx_id=0, det_size=(size, size))
     FACE_APP = app
@@ -265,7 +267,7 @@ def start_republish(cam_id: int, rtsp_url: str) -> subprocess.Popen | None:
     try:
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError:
-        print(f"[cam {cam_id}] ffmpeg не найден, репабликация пропущена", flush=True)
+        logger.warning("ffmpeg не найден, репабликация пропущена", extra={"camera_id": cam_id})
         return None
 
 
@@ -321,7 +323,7 @@ def save_face_snapshot(frame, cam_id: int, bbox) -> str | None:
     fname = f"cam{cam_id}_{int(time.time() * 1000)}.jpg"
     fpath = os.path.join(MEDIA_PATH, "snapshots", fname)
     if not cv2.imwrite(fpath, crop, [cv2.IMWRITE_JPEG_QUALITY, 85]):
-        print(f"[cam {cam_id}] не удалось записать снимок {fpath}", flush=True)
+        logger.warning("не удалось записать снимок", extra={"camera_id": cam_id, "path": fpath})
         return None
     return f"snapshots/{fname}"
 
@@ -358,8 +360,8 @@ def finalize_segment(cam_id: int, tmp_path: str, final_path: str,
         )
         os.remove(tmp_path)
         ok = True
-    except Exception as e:
-        print(f"[cam {cam_id}] транскод не удался ({e}), оставляю исходник", flush=True)
+    except Exception:
+        logger.warning("транскод не удался, оставляю исходник", exc_info=True, extra={"camera_id": cam_id})
         try:
             os.replace(tmp_path, final_path)
             ok = True
@@ -378,20 +380,20 @@ def finalize_segment(cam_id: int, tmp_path: str, final_path: str,
                 duration_sec=int((ended - started).total_seconds()),
             ))
             s.commit()
-    except Exception as e:
-        print(f"[cam {cam_id}] не удалось сохранить сегмент: {e}", flush=True)
+    except Exception:
+        logger.error("не удалось сохранить сегмент", exc_info=True, extra={"camera_id": cam_id})
 
 
 def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None = None):
     """Двухпоточная схема (ТЗ 18.1): основной поток идёт в архив и HLS,
     аналитика выполняется на субпотоке низкого разрешения, если он задан."""
     analyze_url = sub_rtsp_url or rtsp_url
-    print(f"[cam {cam_id}] старт (аналитика: {'субпоток' if sub_rtsp_url else 'основной поток'})", flush=True)
+    logger.info("старт камеры", extra={"camera_id": cam_id, "analytics_stream": "sub" if sub_rtsp_url else "main"})
     republish = start_republish(cam_id, rtsp_url)
 
     cap = cv2.VideoCapture(analyze_url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
-        print(f"[cam {cam_id}] не удалось открыть RTSP", flush=True)
+        logger.error("не удалось открыть RTSP", extra={"camera_id": cam_id})
         update_status(cam_id, "offline")
         if republish:
             republish.terminate()
@@ -441,7 +443,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
     reconnect_attempt = 0
     while True:
         if shutdown_event.is_set():
-            print(f"[cam {cam_id}] остановка (shutdown), освобождаю ресурсы", flush=True)
+            logger.info("остановка (shutdown), освобождаю ресурсы", extra={"camera_id": cam_id})
             if writer:
                 close_segment(datetime.utcnow())
             cap.release()
@@ -454,8 +456,10 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         if not ok:
             update_status(cam_id, "offline")
             delay = reconnect_delay(reconnect_attempt)
-            print(f"[cam {cam_id}] поток потерян, повтор через {delay:.0f}с "
-                  f"(попытка {reconnect_attempt + 1})", flush=True)
+            logger.warning(
+                "поток потерян, повтор подключения",
+                extra={"camera_id": cam_id, "retry_in_sec": round(delay, 1), "attempt": reconnect_attempt + 1},
+            )
             # Прерываемое ожидание — при shutdown не держим камеру в сне
             # до 60с, а сразу уходим на освобождение ресурсов сверху цикла.
             if shutdown_event.wait(delay):
@@ -475,7 +479,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
 
         # Авто-перезапуск ffmpeg-репабликации, если он умер
         if republish and republish.poll() is not None:
-            print(f"[cam {cam_id}] ffmpeg-репабликация упала, перезапускаю", flush=True)
+            logger.warning("ffmpeg-репабликация упала, перезапускаю", extra={"camera_id": cam_id})
             republish = start_republish(cam_id, rtsp_url)
 
         now = time.time()
@@ -518,7 +522,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
             last_state_reload = now
             if not active:
                 # Камера отключена или удалена — корректно останавливаем поток
-                print(f"[cam {cam_id}] отключена, останавливаю обработку", flush=True)
+                logger.info("камера отключена, останавливаю обработку", extra={"camera_id": cam_id})
                 if writer:
                     close_segment(datetime.utcnow())
                 cap.release()
@@ -550,8 +554,8 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
                 # Читаем глобальную модель, чтобы подхватить её горячую замену
                 detected = (FACE_APP or face_app).get(frame)
                 faces = [f for f in detected if bbox_in_roi(f.bbox.tolist(), roi_mask)]
-        except Exception as e:
-            print(f"[cam {cam_id}] ошибка распознавания: {e}", flush=True)
+        except Exception:
+            logger.error("ошибка распознавания", exc_info=True, extra={"camera_id": cam_id})
             faces = []
 
         if motion or faces:
@@ -582,7 +586,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
             process_faces(cam_id, frame, faces, fw, fh, now, last_event_at)
         except Exception:
             # Любой сбой на одном кадре не должен убивать нить камеры
-            print(f"[cam {cam_id}] ошибка обработки лиц:\n{traceback.format_exc()}", flush=True)
+            logger.error("ошибка обработки лиц", exc_info=True, extra={"camera_id": cam_id})
 
 
 def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at):
@@ -699,8 +703,8 @@ def _recluster_bg():
     _lower_priority()
     try:
         recluster_unknowns()
-    except Exception as e:
-        print(f"[worker] recluster ошибка: {e}", flush=True)
+    except Exception:
+        logger.error("ошибка фоновой рекластеризации", exc_info=True)
 
 
 def recluster_unknowns():
@@ -718,7 +722,7 @@ def recluster_unknowns():
         pids = np.array([r[0] for r in rows])
         embs = np.array([_to_vec(r[1]) for r in rows], dtype=np.float32)
         if embs.ndim != 2 or embs.shape[1] != 512:
-            print(f"[recluster] неожиданная форма эмбеддингов: {embs.shape}", flush=True)
+            logger.warning("неожиданная форма эмбеддингов", extra={"shape": str(embs.shape)})
             return
         labels = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES, metric="cosine").fit_predict(embs)
         merged = 0
@@ -740,7 +744,7 @@ def recluster_unknowns():
             merged += len(others)
         if merged:
             s.commit()
-            print(f"[recluster] объединено персон: {merged}", flush=True)
+            logger.info("рекластеризация: объединено персон", extra={"merged_count": merged})
 
 
 def cleanup_old():
@@ -786,36 +790,36 @@ def manager():
     # Настройки читаем ДО загрузки модели: профиль задаёт face_model и
     # detect_width, иначе выбор в админке не применялся бы до перезапуска.
     refresh_config()
-    print("[worker] загрузка модели InsightFace...", flush=True)
+    logger.info("загрузка модели InsightFace...")
     face_app = load_face_app()
-    print("[worker] модель готова", flush=True)
+    logger.info("модель готова")
     loaded_model = (CONFIG["face_model"], CONFIG["detect_width"])
 
     # Внутренний HTTP-API для извлечения эмбеддинга (поиск по фото)
     try:
         from embed_api import start_embed_api
         start_embed_api(face_app, port=9000)
-        print("[worker] embed-API запущен на :9000", flush=True)
-    except Exception as e:
-        print(f"[worker] не удалось запустить embed-API: {e}", flush=True)
+        logger.info("embed-API запущен", extra={"port": 9000})
+    except Exception:
+        logger.error("не удалось запустить embed-API", exc_info=True)
 
     threads: dict[int, threading.Thread] = {}
     last_cleanup = 0.0
     last_recluster = 0.0
 
-    print(f"[worker] конфиг: {CONFIG}", flush=True)
+    logger.info("конфиг воркера", extra={"config": CONFIG})
 
     while not shutdown_event.is_set():
         try:
             refresh_config()
             # Смена модели/разрешения в профиле применяется без перезапуска
             if (CONFIG["face_model"], CONFIG["detect_width"]) != loaded_model:
-                print("[worker] параметры модели изменились, перезагружаю", flush=True)
+                logger.info("параметры модели изменились, перезагружаю")
                 try:
                     load_face_app()  # обновляет глобальный FACE_APP
                     loaded_model = (CONFIG["face_model"], CONFIG["detect_width"])
-                except Exception as e:
-                    print(f"[worker] не удалось сменить модель: {e}", flush=True)
+                except Exception:
+                    logger.error("не удалось сменить модель", exc_info=True)
             with Session() as s:
                 cams = s.execute(select(Camera).where(Camera.enabled == True)).scalars().all()
                 for cam in cams:
@@ -825,8 +829,8 @@ def manager():
                         rtsp = fernet.decrypt(cam.rtsp_url_enc.encode()).decode()
                         sub_enc = getattr(cam, "sub_rtsp_url_enc", None)
                         sub = fernet.decrypt(sub_enc.encode()).decode() if sub_enc else None
-                    except Exception as e:
-                        print(f"[cam {cam.id}] не удалось расшифровать RTSP: {e}", flush=True)
+                    except Exception:
+                        logger.error("не удалось расшифровать RTSP", exc_info=True, extra={"camera_id": cam.id})
                         continue
                     t = threading.Thread(
                         target=camera_worker, args=(cam.id, rtsp, face_app, sub), daemon=True
@@ -839,8 +843,8 @@ def manager():
                 last_cleanup = now
                 try:
                     cleanup_old()
-                except Exception as e:
-                    print(f"[worker] cleanup ошибка: {e}", flush=True)
+                except Exception:
+                    logger.error("ошибка очистки (cleanup)", exc_info=True)
 
             # Пакетная кластеризация (ТЗ 18.6): интервал задаётся профилем,
             # выполняется в фоновой нити с пониженным приоритетом.
@@ -848,12 +852,12 @@ def manager():
                 last_recluster = now
                 threading.Thread(target=_recluster_bg, daemon=True).start()
 
-        except Exception as e:
-            print(f"[worker] ошибка цикла: {e}", flush=True)
+        except Exception:
+            logger.error("ошибка цикла воркера", exc_info=True)
         # Прерываемое ожидание: shutdown не должен ждать до 10с впустую.
         shutdown_event.wait(10)
 
-    print("[worker] завершение: жду остановки нитей камер...", flush=True)
+    logger.info("завершение: жду остановки нитей камер...")
     # Бюджет ожидания общий на все камеры (не по 8с на каждую), иначе
     # остановка 16 камер могла бы растянуться на пару минут и упереться
     # в SIGKILL раньше, чем нити успеют освободить ресурсы.
@@ -861,8 +865,8 @@ def manager():
     for cam_id, t in threads.items():
         t.join(timeout=max(0.0, deadline - time.time()))
         if t.is_alive():
-            print(f"[cam {cam_id}] не успела остановиться в срок", flush=True)
-    print("[worker] остановлен", flush=True)
+            logger.warning("нить камеры не успела остановиться в срок", extra={"camera_id": cam_id})
+    logger.info("воркер остановлен")
 
 
 if __name__ == "__main__":
