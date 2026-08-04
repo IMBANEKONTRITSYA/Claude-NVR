@@ -139,6 +139,75 @@ def test_camera_onvif_config_roundtrip(client, admin_headers, request):
     client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
 
 
+def test_onvif_discover_requires_admin(client, admin_headers, request):
+    username = _unique("op-onvif-discover", request)
+    client.post(
+        "/api/users",
+        json={"username": username, "password": "Op3rator!Pass1", "role": "operator"},
+        headers=admin_headers,
+    )
+    r = client.post("/api/auth/login", data={"username": username, "password": "Op3rator!Pass1"})
+    operator_headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+    r = client.get("/api/cameras/onvif/discover", headers=operator_headers)
+    assert r.status_code == 403
+
+    r = client.get("/api/cameras/onvif/discover")
+    assert r.status_code == 401
+
+
+def test_onvif_discover_proxies_worker_devices(client, admin_headers, monkeypatch):
+    import httpx as httpx_module
+
+    fake_devices = [{
+        "address": "urn:uuid:1111", "host": "192.168.1.64", "port": 80,
+        "xaddrs": ["http://192.168.1.64/onvif/device_service"], "scopes": [],
+    }]
+
+    class _FakeResponse:
+        def json(self):
+            return {"ok": True, "devices": fake_devices}
+
+    async def _fake_get(self, url, **kwargs):
+        assert url.endswith("/onvif/discover")
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx_module.AsyncClient, "get", _fake_get)
+
+    r = client.get("/api/cameras/onvif/discover", headers=admin_headers)
+    assert r.status_code == 200
+    assert r.json() == {"devices": fake_devices}
+
+
+def test_onvif_discover_returns_502_on_worker_error(client, admin_headers, monkeypatch):
+    import httpx as httpx_module
+
+    class _FakeResponse:
+        def json(self):
+            return {"ok": False, "error": "не удалось отправить WS-Discovery Probe: network unreachable", "devices": []}
+
+    async def _fake_get(self, url, **kwargs):
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx_module.AsyncClient, "get", _fake_get)
+
+    r = client.get("/api/cameras/onvif/discover", headers=admin_headers)
+    assert r.status_code == 502
+    assert "network unreachable" in r.text
+
+
+def test_onvif_discover_returns_503_when_worker_unreachable(client, admin_headers, monkeypatch):
+    import httpx as httpx_module
+
+    async def _fake_get(self, url, **kwargs):
+        raise httpx_module.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx_module.AsyncClient, "get", _fake_get)
+
+    r = client.get("/api/cameras/onvif/discover", headers=admin_headers)
+    assert r.status_code == 503
+
+
 def test_operator_cannot_manage_cameras_but_can_view(client, admin_headers, request):
     username = _unique("operator", request)
     r = client.post(

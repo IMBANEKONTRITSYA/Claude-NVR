@@ -14,6 +14,8 @@ export function Cameras() {
   const [editing, setEditing] = useState<number | null>(null);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string>("");
+  const [discovering, setDiscovering] = useState(false);
+  const [discovered, setDiscovered] = useState<any[] | null>(null);
 
   const load = () => api.cameras().then(setCams).catch(() => {});
   useEffect(() => { load(); }, []);
@@ -27,6 +29,16 @@ export function Cameras() {
       load();
       toast(editing ? "Камера обновлена" : "Камера добавлена", "ok");
     } catch (e: any) { toast(e.message, "err"); }
+  };
+
+  const discoverOnvif = async () => {
+    setDiscovering(true); setDiscovered(null);
+    try {
+      const r = await api.onvifDiscover();
+      setDiscovered(r.devices || []);
+      if (!r.devices?.length) toast("Камеры в сети не найдены", "err");
+    } catch (e: any) { toast(e.message, "err"); }
+    finally { setDiscovering(false); }
   };
 
   const remove = async (id: number) => {
@@ -73,17 +85,37 @@ export function Cameras() {
             ONVIF-события движения (вместо постоянного анализа кадров)
           </label>
           {form.onvif_enabled && (
-            <div className="grid" style={{ gridTemplateColumns: "2fr 1fr 1fr 1fr" }}>
-              <div><label>ONVIF-адрес камеры</label><input value={form.onvif_host}
-                onChange={e => setForm({ ...form, onvif_host: e.target.value })} placeholder="192.168.1.64" /></div>
-              <div><label>Порт</label><input type="number" value={form.onvif_port}
-                onChange={e => setForm({ ...form, onvif_port: +e.target.value })} /></div>
-              <div><label>Логин</label><input value={form.onvif_username}
-                onChange={e => setForm({ ...form, onvif_username: e.target.value })} /></div>
-              <div><label>Пароль{editing ? " (оставить пустым — не менять)" : ""}</label>
-                <input type="password" value={form.onvif_password}
-                  onChange={e => setForm({ ...form, onvif_password: e.target.value })} /></div>
-            </div>
+            <>
+              <div className="grid" style={{ gridTemplateColumns: "2fr 1fr 1fr 1fr" }}>
+                <div><label>ONVIF-адрес камеры</label><input value={form.onvif_host}
+                  onChange={e => setForm({ ...form, onvif_host: e.target.value })} placeholder="192.168.1.64" /></div>
+                <div><label>Порт</label><input type="number" value={form.onvif_port}
+                  onChange={e => setForm({ ...form, onvif_port: +e.target.value })} /></div>
+                <div><label>Логин</label><input value={form.onvif_username}
+                  onChange={e => setForm({ ...form, onvif_username: e.target.value })} /></div>
+                <div><label>Пароль{editing ? " (оставить пустым — не менять)" : ""}</label>
+                  <input type="password" value={form.onvif_password}
+                    onChange={e => setForm({ ...form, onvif_password: e.target.value })} /></div>
+              </div>
+              <button type="button" className="btn secondary" style={{ marginTop: 8 }} disabled={discovering}
+                onClick={discoverOnvif}>
+                {discovering ? "Поиск..." : "Найти камеры в сети"}
+              </button>
+              {discovered && discovered.length > 0 && (
+                <ul style={{ marginTop: 8, paddingLeft: 0, listStyle: "none" }}>
+                  {discovered.map((d, i) => (
+                    <li key={i} style={{ marginBottom: 4 }}>
+                      <button type="button" className="btn secondary"
+                        onClick={() => setForm({ ...form, onvif_host: d.host, onvif_port: d.port || 80 })}>
+                        {d.host}:{d.port || 80}
+                        {d.scopes?.find((s: string) => s.includes("/name/")) &&
+                          ` — ${d.scopes.find((s: string) => s.includes("/name/")).split("/name/")[1]}`}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
           )}
         </div>
       </div>

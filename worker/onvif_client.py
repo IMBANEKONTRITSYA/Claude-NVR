@@ -1,26 +1,34 @@
 """Минимальный ONVIF-клиент событий (ТЗ 18.7): подписка на PullPoint и
 получение событий движения/детекции людей напрямую от камеры, вместо
 постоянного MOG2-префильтра на CPU ("камера делает предобработку на своём
-чипе" — максимальная экономия ресурсов).
+чипе" — максимальная экономия ресурсов). Плюс WS-Discovery автообнаружение
+камер в сети (вторая часть ТЗ 18.7: "автообнаружение камер в сети").
 
-Реализован через stdlib (urllib, hashlib, xml.etree) без внешних
+Реализован через stdlib (urllib, hashlib, socket, xml.etree) без внешних
 ONVIF-библиотек (onvif-zeep и аналоги тянут zeep/suds — тяжёлые
 транзитивные зависимости, которых нет и не должно быть в требованиях
 воркера). WS-Security UsernameToken (PasswordDigest) собирается вручную по
 спецификации WS-Security 1.0.
 
-Пять предыдущих циклов аудита откладывали ONVIF целиком с обоснованием
-«нет реальной ONVIF-камеры в песочнице для проверки». Это верно для
-end-to-end проверки полного пользовательского сценария, но не мешает
-написать и протестировать сам протокольный клиент — вся логика ниже
-проверяется юнит-тестами на замоканных SOAP-ответах (test_onvif_client.py),
-без сети и без реального устройства."""
+Семь предыдущих циклов аудита откладывали автообнаружение с обоснованием
+«нет реальной ONVIF-камеры/эмулятора в песочнице для проверки». Это верно
+для end-to-end проверки на реальном оборудовании, но, как и с PullPoint
+(создан циклом 6 по тому же принципу), не мешает написать и протестировать
+сам протокольный клиент: сборка Probe-сообщения и разбор ProbeMatches —
+чистые функции без сети, а сама UDP-рассылка тестируется через
+внедряемую socket_factory (без реального multicast — GitHub Actions
+раннеры и песочницы часто блокируют multicast, полагаться на него в тестах
+не надёжно)."""
 import base64
 import hashlib
 import os
+import socket
+import time
 import urllib.error
 import urllib.request
+import uuid as _uuid
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
 _SOAP_ENV_NS = "http://www.w3.org/2003/05/soap-envelope"
@@ -167,6 +175,114 @@ def pull_messages(
                     state = item.attrib.get("Value")
         events.append({"topic": topic, "utc_time": utc_time, "state": state})
     return events
+
+
+_WSDD_NS = "http://schemas.xmlsoap.org/ws/2005/04/discovery"
+_WSA_NS = "http://schemas.xmlsoap.org/ws/2004/08/addressing"
+_WSDD_MULTICAST_ADDR = "239.255.255.250"
+_WSDD_MULTICAST_PORT = 3702
+
+
+def _probe_message() -> str:
+    """SOAP-тело WS-Discovery Probe, разосланного multicast-датаграммой на
+    239.255.255.250:3702 (спецификация WS-Discovery 1.1). Types ограничен
+    dn:NetworkVideoTransmitter — ONVIF-профиль камеры/энкодера, а не любое
+    WS-Discovery устройство в сети (принтеры и т.п. тоже на него отвечают)."""
+    message_id = f"uuid:{_uuid.uuid4()}"
+    return (
+        '<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" '
+        f'xmlns:w="{_WSA_NS}" xmlns:d="{_WSDD_NS}" '
+        'xmlns:dn="http://www.onvif.org/ver10/network/wsdl">'
+        "<e:Header>"
+        f"<w:MessageID>{message_id}</w:MessageID>"
+        '<w:To e:mustUnderstand="1">urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>'
+        f'<w:Action e:mustUnderstand="1">{_WSDD_NS}/Probe</w:Action>'
+        "</e:Header>"
+        "<e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body>"
+        "</e:Envelope>"
+    )
+
+
+def _xaddr_host_port(xaddr: str) -> tuple[str, int] | None:
+    """host_service_URL ('http://192.168.1.64/onvif/device_service') -> (host, port)."""
+    parsed = urlsplit(xaddr)
+    if not parsed.hostname:
+        return None
+    return parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+
+
+def _parse_probe_matches(raw: bytes) -> list[dict]:
+    """Разбирает один UDP-ответ ProbeMatches в список найденных устройств:
+    {address, xaddrs, scopes, host, port}. Невалидный XML или пакет без
+    XAddrs — пустой список, а не исключение: в общей сети могут отвечать
+    другие WS-Discovery устройства (принтеры, NAS), не только ONVIF-камеры,
+    и один битый/чужой пакет не должен ронять весь discover_devices()."""
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return []
+    devices = []
+    for match in _find_all(root, "ProbeMatch"):
+        addr_elem = _find_one(match, "Address")
+        address = (addr_elem.text or "").strip() if addr_elem is not None else ""
+        xaddrs_elem = _find_one(match, "XAddrs")
+        xaddrs = (xaddrs_elem.text or "").split() if xaddrs_elem is not None else []
+        if not xaddrs:
+            continue
+        scopes_elem = _find_one(match, "Scopes")
+        scopes = (scopes_elem.text or "").split() if scopes_elem is not None else []
+        host_port = None
+        for xaddr in xaddrs:
+            host_port = _xaddr_host_port(xaddr)
+            if host_port:
+                break
+        devices.append({
+            "address": address,
+            "xaddrs": xaddrs,
+            "scopes": scopes,
+            "host": host_port[0] if host_port else None,
+            "port": host_port[1] if host_port else None,
+        })
+    return devices
+
+
+def discover_devices(timeout: float = 3.0, socket_factory=socket.socket) -> list[dict]:
+    """WS-Discovery: рассылает multicast Probe на 239.255.255.250:3702 и
+    собирает ProbeMatch-ответы в течение timeout секунд. Возвращает список
+    найденных устройств, без дублей по Address (камера может ответить с
+    нескольких сетевых интерфейсов). socket_factory подменяется в тестах —
+    сама UDP/multicast-рассылка не тестируется юнитом (см. docstring
+    модуля), тестируется сборка запроса, разбор ответа и оркестрация вокруг
+    сокета (дедупликация, уважение timeout, устойчивость к мусорным
+    пакетам)."""
+    sock = socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(_probe_message().encode("utf-8"), (_WSDD_MULTICAST_ADDR, _WSDD_MULTICAST_PORT))
+        except OSError as e:
+            raise OnvifError(f"не удалось отправить WS-Discovery Probe: {e}") from e
+
+        devices_by_key: dict[str, dict] = {}
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                data, addr = sock.recvfrom(65535)
+            except (socket.timeout, OSError):
+                break
+            for device in _parse_probe_matches(data):
+                if device["host"] is None:
+                    device["host"] = addr[0]
+                key = device["address"] or f"{device['host']}:{device['port']}"
+                devices_by_key.setdefault(key, device)
+        return list(devices_by_key.values())
+    finally:
+        sock.close()
 
 
 def is_motion_event(topic: str | None, state: str | None = None) -> bool:

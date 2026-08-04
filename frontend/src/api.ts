@@ -133,6 +133,7 @@ export const api = {
     req("/api/auth/change-password", { method: "POST", body: JSON.stringify({ old_password, new_password }) }),
   testRtsp: (rtsp_url: string) =>
     req("/api/cameras/test", { method: "POST", body: JSON.stringify({ rtsp_url }) }),
+  onvifDiscover: () => req("/api/cameras/onvif/discover"),
   cameras: () => req("/api/cameras"),
   camAdd: (b: any) => req("/api/cameras", { method: "POST", body: JSON.stringify(b) }),
   camUpdate: (id: number, b: any) => req(`/api/cameras/${id}`, { method: "PUT", body: JSON.stringify(b) }),
