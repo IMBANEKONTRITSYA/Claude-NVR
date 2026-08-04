@@ -74,6 +74,25 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS motion_sensitivity integer"
         ))
+        # ТЗ 18.7: ONVIF-события движения/присутствия людей вместо MOG2-префильтра.
+        await conn.execute(text(
+            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_enabled boolean DEFAULT false"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE cameras ALTER COLUMN onvif_enabled SET DEFAULT false"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_host varchar(255)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_port integer"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_username varchar(120)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_password_enc text"
+        ))
         await conn.execute(text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at timestamp DEFAULT now()"
         ))

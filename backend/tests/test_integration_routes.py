@@ -83,6 +83,45 @@ def test_camera_crud_roundtrip_encrypts_rtsp_credentials(client, admin_headers, 
     assert r.status_code == 404
 
 
+def test_camera_onvif_config_roundtrip(client, admin_headers, request):
+    # ТЗ 18.7: события движения от ONVIF-камеры — конфиг сохраняется и
+    # шифруется так же, как RTSP-учётки, пароль не светится в списке камер.
+    name = _unique("cam-onvif", request)
+    r = client.post(
+        "/api/cameras",
+        json={
+            "name": name, "rtsp_url": "rtsp://cam/stream", "location": "Вход",
+            "onvif_enabled": True, "onvif_host": "192.168.1.64", "onvif_port": 80,
+            "onvif_username": "admin", "onvif_password": "s3cr3t-onvif",
+        },
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    cam = r.json()
+    assert cam["onvif_enabled"] is True
+    assert cam["has_onvif"] is True
+    cam_id = cam["id"]
+
+    r = client.get("/api/cameras", headers=admin_headers)
+    assert "s3cr3t-onvif" not in r.text
+
+    # Обновление без onvif_password не должно требовать пароль заново и не
+    # должно сбрасывать onvif_enabled/host (тот же принцип, что и sub_rtsp_url).
+    r = client.put(
+        f"/api/cameras/{cam_id}",
+        json={
+            "name": name, "rtsp_url": "rtsp://cam/stream", "location": "Вход",
+            "onvif_enabled": True, "onvif_host": "192.168.1.64", "onvif_port": 80,
+            "onvif_username": "admin",
+        },
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["has_onvif"] is True
+
+    client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
+
+
 def test_operator_cannot_manage_cameras_but_can_view(client, admin_headers, request):
     username = _unique("operator", request)
     r = client.post(

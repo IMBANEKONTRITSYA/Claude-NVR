@@ -113,6 +113,12 @@ class CameraIn(BaseModel):
     location: str = ""
     enabled: bool = True
     motion_sensitivity: int | None = None
+    # ТЗ 18.7: события движения/присутствия людей напрямую от ONVIF-камеры
+    onvif_enabled: bool = False
+    onvif_host: str | None = None
+    onvif_port: int | None = None
+    onvif_username: str | None = None
+    onvif_password: str | None = None  # пусто при PUT — оставить прежний пароль без изменений
 
     _check_rtsp_url = field_validator("rtsp_url")(_validate_rtsp_url_required)
     _check_sub_rtsp_url = field_validator("sub_rtsp_url")(_validate_rtsp_url_optional)
@@ -126,6 +132,8 @@ class CameraOut(BaseModel):
     status: str
     has_substream: bool = False
     motion_sensitivity: int | None = None
+    onvif_enabled: bool = False
+    has_onvif: bool = False
 
     class Config:
         from_attributes = True

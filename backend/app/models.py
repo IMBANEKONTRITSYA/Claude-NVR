@@ -47,6 +47,13 @@ class Camera(Base):
     roi: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # {"polygons": [[[x,y],...]]}
     motion_sensitivity: Mapped[int | None] = mapped_column(Integer, nullable=True)  # переопределяет профиль
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # ТЗ 18.7: события движения/присутствия людей напрямую от ONVIF-камеры
+    # вместо постоянного MOG2-префильтра на CPU.
+    onvif_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    onvif_host: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    onvif_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    onvif_username: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    onvif_password_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Person(Base):
