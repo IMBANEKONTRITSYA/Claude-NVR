@@ -1,5 +1,8 @@
 import { useState } from "react";
-import { api, getUser, getRole } from "../api";
+import { useNavigate } from "react-router-dom";
+import { api, getUser, getRole, isPasswordExpired, clearAuth } from "../api";
+
+const PASSWORD_HINT = "Минимум 10 символов, минимум 3 из 4: строчные, ЗАГЛАВНЫЕ, цифры, спецсимволы";
 
 export function Profile() {
   const [oldP, setOldP] = useState("");
@@ -7,16 +10,23 @@ export function Profile() {
   const [confirmP, setConfirmP] = useState("");
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const expired = isPasswordExpired();
+  const nav = useNavigate();
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (newP.length < 6) { setMsg({ type: "err", text: "Минимум 6 символов" }); return; }
+    if (newP.length < 10) { setMsg({ type: "err", text: PASSWORD_HINT }); return; }
     if (newP !== confirmP) { setMsg({ type: "err", text: "Пароли не совпадают" }); return; }
     setBusy(true); setMsg(null);
     try {
       await api.changePassword(oldP, newP);
-      setMsg({ type: "ok", text: "Пароль обновлён" });
-      setOldP(""); setNewP(""); setConfirmP("");
+      // Смена пароля отзывает на бэкенде все refresh-токены этого пользователя
+      // (сигнал возможной компрометации, см. /api/auth/change-password) — в
+      // том числе текущий, поэтому храня его дальше в localStorage, приведёт
+      // к тихому разлогиниванию при следующем истечении access-токена. Ведём
+      // на повторный вход сразу же, с понятным сообщением.
+      clearAuth();
+      nav("/login?reason=password-changed");
     } catch (e: any) { setMsg({ type: "err", text: e.message }); }
     finally { setBusy(false); }
   };
@@ -24,6 +34,11 @@ export function Profile() {
   return (
     <div>
       <h2>Профиль</h2>
+      {expired && (
+        <div className="card" style={{ maxWidth: 460, borderColor: "var(--red)", marginBottom: 12 }}>
+          Срок действия пароля истёк — смените его, чтобы продолжить работу с системой.
+        </div>
+      )}
       <div className="card" style={{ maxWidth: 460 }}>
         <div style={{ marginBottom: 12 }}>
           <div className="muted" style={{ fontSize: 12 }}>Пользователь</div>
@@ -37,7 +52,8 @@ export function Profile() {
           </div>
           <div style={{ marginBottom: 10 }}>
             <label>Новый пароль</label>
-            <input type="password" value={newP} onChange={e => setNewP(e.target.value)} required minLength={6} />
+            <input type="password" value={newP} onChange={e => setNewP(e.target.value)} required minLength={10} />
+            <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>{PASSWORD_HINT}</div>
           </div>
           <div style={{ marginBottom: 12 }}>
             <label>Повторите новый пароль</label>

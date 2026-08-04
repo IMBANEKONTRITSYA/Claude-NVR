@@ -2,22 +2,30 @@ const TOKEN_KEY = "fw_token";
 const REFRESH_KEY = "fw_refresh";
 const ROLE_KEY = "fw_role";
 const USER_KEY = "fw_user";
+const PWD_EXPIRED_KEY = "fw_pwd_expired";
 
 export function getToken() { return localStorage.getItem(TOKEN_KEY); }
 export function getRefreshToken() { return localStorage.getItem(REFRESH_KEY); }
 export function getRole() { return localStorage.getItem(ROLE_KEY) || ""; }
 export function getUser() { return localStorage.getItem(USER_KEY) || ""; }
-export function setAuth(t: string, refresh: string, role: string, user: string) {
+// ТЗ 13: "срок действия пароля" — бэкенд помечает флагом ответ login/refresh,
+// когда пароль просрочен (settings.PASSWORD_MAX_AGE_DAYS); фронтенд
+// принудительно ведёт на смену пароля, не блокируя сам вход.
+export function isPasswordExpired() { return localStorage.getItem(PWD_EXPIRED_KEY) === "1"; }
+export function setAuth(t: string, refresh: string, role: string, user: string, passwordExpired = false) {
   localStorage.setItem(TOKEN_KEY, t);
   localStorage.setItem(REFRESH_KEY, refresh);
   localStorage.setItem(ROLE_KEY, role);
   localStorage.setItem(USER_KEY, user);
+  if (passwordExpired) localStorage.setItem(PWD_EXPIRED_KEY, "1");
+  else localStorage.removeItem(PWD_EXPIRED_KEY);
 }
 export function clearAuth() {
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(REFRESH_KEY);
   localStorage.removeItem(ROLE_KEY);
   localStorage.removeItem(USER_KEY);
+  localStorage.removeItem(PWD_EXPIRED_KEY);
 }
 
 // Access-токен живёт недолго (см. ACCESS_TOKEN_EXPIRE_MINUTES) — вместо
@@ -37,11 +45,21 @@ async function doRefresh(): Promise<string | null> {
     });
     if (!res.ok) return null;
     const j = await res.json();
-    setAuth(j.access_token, j.refresh_token, j.role, j.username);
+    setAuth(j.access_token, j.refresh_token, j.role, j.username, j.password_expired);
     return j.access_token as string;
   } catch {
     return null;
   }
+}
+
+// FastAPI отдаёт detail строкой для наших HTTPException, но массивом
+// объектов {msg, loc, ...} для ошибок валидации Pydantic (422) — например,
+// пароль не прошедший политику сложности. Без этой распаковки пользователь
+// увидел бы "[object Object]" вместо текста ошибки.
+function errorMessage(j: any, fallback: string): string {
+  if (typeof j?.detail === "string") return j.detail;
+  if (Array.isArray(j?.detail)) return j.detail.map((d: any) => d?.msg || String(d)).join("; ");
+  return fallback;
 }
 
 async function req(path: string, opts: RequestInit = {}, retried = false): Promise<any> {
@@ -65,7 +83,7 @@ async function req(path: string, opts: RequestInit = {}, retried = false): Promi
   }
   if (!res.ok) {
     let msg = `Ошибка ${res.status}`;
-    try { const j = await res.json(); msg = j.detail || msg; } catch {}
+    try { const j = await res.json(); msg = errorMessage(j, msg); } catch {}
     throw new Error(msg);
   }
   const ct = res.headers.get("Content-Type") || "";
@@ -78,7 +96,7 @@ export const api = {
     fd.append("username", username);
     fd.append("password", password);
     const res = await fetch("/api/auth/login", { method: "POST", body: fd });
-    if (!res.ok) { const j = await res.json().catch(() => ({})); throw new Error(j.detail || "Ошибка входа"); }
+    if (!res.ok) { const j = await res.json().catch(() => ({})); throw new Error(errorMessage(j, "Ошибка входа")); }
     return res.json();
   },
   me: () => req("/api/auth/me"),

@@ -1,7 +1,8 @@
-import { NavLink, Route, Routes, Navigate, useNavigate } from "react-router-dom";
-import { Suspense, lazy, useEffect, useState } from "react";
-import { api, getRole, getToken, getUser } from "./api";
+import { NavLink, Route, Routes, Navigate, useLocation, useNavigate } from "react-router-dom";
+import { Suspense, lazy, useCallback, useEffect, useState } from "react";
+import { api, getRole, getToken, getUser, isPasswordExpired } from "./api";
 import { Login } from "./pages/Login";
+import { useInactivityLogout } from "./useInactivityLogout";
 
 const Dashboard = lazy(() => import("./pages/Dashboard").then(m => ({ default: m.Dashboard })));
 const LiveGrid = lazy(() => import("./pages/LiveGrid").then(m => ({ default: m.LiveGrid })));
@@ -37,6 +38,10 @@ function Layout({ children }: { children: any }) {
   const user = getUser();
   const can = (...roles: string[]) => roles.includes(role);
   const logout = () => { api.logout().then(() => nav("/login")); };
+  const inactivityLogout = useCallback(() => {
+    api.logout().finally(() => nav("/login?reason=inactive"));
+  }, [nav]);
+  useInactivityLogout(true, inactivityLogout);
   return (
     <div className="layout">
       <aside className="sidebar">
@@ -70,7 +75,13 @@ function Layout({ children }: { children: any }) {
 }
 
 function Private({ children, roles }: { children: any; roles?: string[] }) {
+  const location = useLocation();
   if (!getToken()) return <Navigate to="/login" replace />;
+  // ТЗ 13: срок действия пароля истёк — пускаем только на страницу его смены,
+  // не блокируя вход полностью.
+  if (isPasswordExpired() && location.pathname !== "/profile") {
+    return <Navigate to="/profile" replace />;
+  }
   if (roles && !roles.includes(getRole())) return <Navigate to="/dashboard" replace />;
   return <Layout>{children}</Layout>;
 }
