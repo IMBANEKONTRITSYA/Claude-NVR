@@ -52,10 +52,21 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE face_events ADD COLUMN IF NOT EXISTS enhanced boolean DEFAULT false"
         ))
         await conn.execute(text(
+            "ALTER TABLE face_events ALTER COLUMN enhanced SET DEFAULT false"
+        ))
+        await conn.execute(text(
             "ALTER TABLE persons ADD COLUMN IF NOT EXISTS notes text"
         ))
         await conn.execute(text(
             "ALTER TABLE persons ADD COLUMN IF NOT EXISTS alert_on_detection boolean DEFAULT false"
+        ))
+        # ADD COLUMN IF NOT EXISTS выше — no-op на БД, где колонка уже была добавлена
+        # раньше без DEFAULT (до этого фикса): raw SQL INSERT в routers/persons.py,
+        # который не указывает эту колонку явно, падал NotNullViolationError на
+        # каждый вызов. SET DEFAULT применяется безусловно, чтобы починить и такие
+        # уже развёрнутые БД, не только свежие (см. docs/reviews/REVIEW_LOG.md, цикл 5).
+        await conn.execute(text(
+            "ALTER TABLE persons ALTER COLUMN alert_on_detection SET DEFAULT false"
         ))
         await conn.execute(text(
             "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS sub_rtsp_url_enc text"

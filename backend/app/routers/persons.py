@@ -86,10 +86,13 @@ async def create_person(
         fh.write(content)
     avatar_rel = f"avatars/{avatar_name}"
 
-    # Создаём персону с центроидом через сырой SQL (Vector через ORM требует pgvector-адаптер на каждой сессии)
+    # Создаём персону с центроидом через сырой SQL (Vector через ORM требует pgvector-адаптер на каждой сессии).
+    # alert_on_detection указан явно: у колонки есть только Python-side default в модели
+    # (Boolean, default=False), а не server_default — сырой INSERT его не подхватывает
+    # и раньше падал с NotNullViolationError на каждом вызове (см. REVIEW_LOG.md, цикл 5).
     res = await db.execute(text(
-        "INSERT INTO persons (name, status, avatar_path, centroid, created_at) "
-        "VALUES (:n, 'known', :a, CAST(:c AS vector), NOW()) RETURNING id"
+        "INSERT INTO persons (name, status, avatar_path, centroid, alert_on_detection, created_at) "
+        "VALUES (:n, 'known', :a, CAST(:c AS vector), false, NOW()) RETURNING id"
     ), {"n": name.strip(), "a": avatar_rel, "c": "[" + ",".join(str(x) for x in embedding) + "]"})
     pid = res.scalar()
     await db.commit()
