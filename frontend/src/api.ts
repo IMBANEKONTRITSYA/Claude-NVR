@@ -12,6 +12,18 @@ export function getUser() { return localStorage.getItem(USER_KEY) || ""; }
 // когда пароль просрочен (settings.PASSWORD_MAX_AGE_DAYS); фронтенд
 // принудительно ведёт на смену пароля, не блокируя сам вход.
 export function isPasswordExpired() { return localStorage.getItem(PWD_EXPIRED_KEY) === "1"; }
+// /hls/ (nginx auth_request, см. nginx-locations.conf) не может нести
+// Authorization-заголовок или ?token= — HLS-плеер сам дергает .ts-сегменты
+// по относительным URI из плейлиста, куда query string исходного запроса
+// не переносится. Кука с тем же access-токеном, ограниченная path=/hls/, —
+// браузер прикрепляет её к каждому такому запросу автоматически (P0, цикл 6).
+function setHlsAuthCookie(t: string) {
+  const secure = location.protocol === "https:" ? "; Secure" : "";
+  document.cookie = `hls_auth=${t}; path=/hls/; SameSite=Strict${secure}`;
+}
+function clearHlsAuthCookie() {
+  document.cookie = "hls_auth=; path=/hls/; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+}
 export function setAuth(t: string, refresh: string, role: string, user: string, passwordExpired = false) {
   localStorage.setItem(TOKEN_KEY, t);
   localStorage.setItem(REFRESH_KEY, refresh);
@@ -19,6 +31,7 @@ export function setAuth(t: string, refresh: string, role: string, user: string, 
   localStorage.setItem(USER_KEY, user);
   if (passwordExpired) localStorage.setItem(PWD_EXPIRED_KEY, "1");
   else localStorage.removeItem(PWD_EXPIRED_KEY);
+  setHlsAuthCookie(t);
 }
 export function clearAuth() {
   localStorage.removeItem(TOKEN_KEY);
@@ -26,6 +39,7 @@ export function clearAuth() {
   localStorage.removeItem(ROLE_KEY);
   localStorage.removeItem(USER_KEY);
   localStorage.removeItem(PWD_EXPIRED_KEY);
+  clearHlsAuthCookie();
 }
 
 // Access-токен живёт недолго (см. ACCESS_TOKEN_EXPIRE_MINUTES) — вместо
