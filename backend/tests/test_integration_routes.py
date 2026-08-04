@@ -216,3 +216,58 @@ def test_apply_performance_profile_rewrites_tunables(client, admin_headers):
 
     r = client.post("/api/settings/profile/does-not-exist", headers=admin_headers)
     assert r.status_code == 400
+
+
+def _register_and_login(client, admin_headers, username: str, password: str = "Str0ngPass!23"):
+    r = client.post(
+        "/api/users",
+        json={"username": username, "password": password, "role": "viewer"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    r = client.post("/api/auth/login", data={"username": username, "password": password})
+    assert r.status_code == 200, r.text
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}, password
+
+
+def test_change_password_locks_out_after_repeated_wrong_old_password(client, admin_headers, request):
+    from app.routers.auth import CHANGE_PW_MAX_ATTEMPTS
+
+    username = _unique("changepw-lockout", request)
+    headers, _ = _register_and_login(client, admin_headers, username)
+
+    for _ in range(CHANGE_PW_MAX_ATTEMPTS):
+        r = client.post(
+            "/api/auth/change-password",
+            json={"old_password": "definitely-wrong", "new_password": "NewStr0ngPass!23"},
+            headers=headers,
+        )
+        assert r.status_code == 400, r.text
+
+    # Лимит исчерпан — даже правильный old_password теперь отклоняется 429,
+    # а не проверяется: иначе лимит не защищал бы от подбора.
+    r = client.post(
+        "/api/auth/change-password",
+        json={"old_password": "Str0ngPass!23", "new_password": "NewStr0ngPass!23"},
+        headers=headers,
+    )
+    assert r.status_code == 429, r.text
+
+
+def test_change_password_succeeds_and_resets_counter_below_limit(client, admin_headers, request):
+    username = _unique("changepw-ok", request)
+    headers, password = _register_and_login(client, admin_headers, username)
+
+    r = client.post(
+        "/api/auth/change-password",
+        json={"old_password": "wrong-once", "new_password": "NewStr0ngPass!23"},
+        headers=headers,
+    )
+    assert r.status_code == 400, r.text
+
+    r = client.post(
+        "/api/auth/change-password",
+        json={"old_password": password, "new_password": "NewStr0ngPass!23"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
