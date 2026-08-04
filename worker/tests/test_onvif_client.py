@@ -70,6 +70,18 @@ def test_username_token_digest_matches_wssecurity_spec():
     assert abs((datetime.now(timezone.utc) - parsed).total_seconds()) < 30
 
 
+def test_username_token_escapes_username_from_camera_form():
+    # username вводится администратором в форме камеры (CameraIn/
+    # OnvifProfilesRequest) — тот же уровень доверия, что и остальные поля
+    # CameraIn, но без экранирования всё равно можно выйти за пределы
+    # <Username> и внедрить посторонние SOAP-элементы в запрос к камере
+    # (тот же класс проблемы, что profile_token в get_stream_uri() ниже —
+    # там уже экранируется, здесь раньше не было).
+    header = oc._username_token_header('"><Injected/>', "s3cret")
+    assert "<Injected/>" not in header
+    assert '"&gt;&lt;Injected/&gt;' in header
+
+
 def test_envelope_without_credentials_has_empty_header():
     envelope = oc._soap_envelope("<Body/>", None, None)
     assert "<soap:Header></soap:Header>" in envelope
