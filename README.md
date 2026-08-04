@@ -233,3 +233,15 @@ CI (GitHub Actions, `.github/workflows/ci.yml`) на каждый push прог�
 - RTSP-строки шифруются Fernet перед записью в БД.
 - Доступ к медиа и архивам — только по валидному токену.
 - В production: смените `SECRET_KEY`, `RTSP_ENCRYPTION_KEY`, `ADMIN_PASSWORD`, поставьте Nginx за HTTPS.
+
+## Документация
+
+| Документ | Содержание |
+|---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | Подробная установка на Windows: требования, устранение неполадок |
+| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Руководство пользователя по ролям: камеры, архив, поиск, отчёты |
+| [docs/ADMIN_GUIDE.md](docs/ADMIN_GUIDE.md) | Администрирование: мониторинг, безопасность, бэкапы, пользователи |
+| [docs/API_DOCS.md](docs/API_DOCS.md) | REST API и WebSocket (плюс Swagger UI на `/docs`) |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Компоненты, поток данных, модель БД |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | История версий |
+| [docs/BACKUP.md](docs/BACKUP.md) | Резервное копирование и восстановление PostgreSQL |
