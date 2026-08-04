@@ -2,7 +2,8 @@
 получение событий движения/детекции людей напрямую от камеры, вместо
 постоянного MOG2-префильтра на CPU ("камера делает предобработку на своём
 чипе" — максимальная экономия ресурсов). Плюс WS-Discovery автообнаружение
-камер в сети (вторая часть ТЗ 18.7: "автообнаружение камер в сети").
+камер в сети и получение профилей потоков (третья часть ТЗ 18.7:
+"автообнаружение камер в сети, получение профилей потоков").
 
 Реализован через stdlib (urllib, hashlib, socket, xml.etree) без внешних
 ONVIF-библиотек (onvif-zeep и аналоги тянут zeep/suds — тяжёлые
@@ -30,9 +31,12 @@ import uuid as _uuid
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape as _xml_escape
 
 _SOAP_ENV_NS = "http://www.w3.org/2003/05/soap-envelope"
 _EVENTS_NS = "http://www.onvif.org/ver10/events/wsdl"
+_MEDIA_NS = "http://www.onvif.org/ver10/media/wsdl"
+_SCHEMA_NS = "http://www.onvif.org/ver10/schema"
 
 # Топики, соответствующие движению/присутствию людей в терминах ONVIF Event
 # Topic Namespace (tns1:...) — покрывает основные профили G/S детекторов.
@@ -175,6 +179,68 @@ def pull_messages(
                     state = item.attrib.get("Value")
         events.append({"topic": topic, "utc_time": utc_time, "state": state})
     return events
+
+
+def get_profiles(
+    host: str, port: int, username: str | None, password: str | None, timeout: float = 5.0,
+) -> list[dict]:
+    """GetProfiles ONVIF Media-сервиса: список медиа-профилей камеры
+    (token + Name), из которых потом выбирается один для GetStreamUri —
+    вторая недостающая часть ТЗ 18.7 ("получение профилей потоков").
+    Путь сервиса — по тому же принципу, что и /onvif/Events для событий:
+    большинство прошивок публикуют Media на конвенциональном /onvif/Media
+    (полный вариант — резолвить XAddr через GetCapabilities/GetServices на
+    device_service, но это отдельный раунд запросов ради адреса, который
+    почти всегда один и тот же; при необходимости можно расширить, если
+    реальная камера окажется нестандартной)."""
+    url = f"http://{host}:{port}/onvif/Media"
+    body = f'<GetProfiles xmlns="{_MEDIA_NS}"/>'
+    raw = _post(url, _soap_envelope(body, username, password), timeout)
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as e:
+        raise OnvifError(f"невалидный XML в ответе GetProfiles: {e}") from e
+    profiles = []
+    for p in _find_all(root, "Profiles"):
+        token = p.attrib.get("token")
+        if not token:
+            continue
+        name_elem = _find_one(p, "Name")
+        name = (name_elem.text or "").strip() if name_elem is not None else None
+        profiles.append({"token": token, "name": name or token})
+    return profiles
+
+
+def get_stream_uri(
+    host: str, port: int, profile_token: str, username: str | None, password: str | None,
+    timeout: float = 5.0,
+) -> str:
+    """GetStreamUri ONVIF Media-сервиса: RTSP-адрес RTP-Unicast потока для
+    заданного профиля. profile_token приходит из ответа камеры (GetProfiles)
+    и подставляется обратно в тело SOAP-запроса — экранируется через
+    xml.sax.saxutils.escape, в отличие от username/password (вводятся
+    администратором вручную в форме камеры, тот же уровень доверия, что и
+    остальные поля CameraIn); token же — данные с сети, пусть и локальной,
+    поэтому подставляется в XML безопасно."""
+    url = f"http://{host}:{port}/onvif/Media"
+    body = (
+        f'<GetStreamUri xmlns="{_MEDIA_NS}">'
+        "<StreamSetup>"
+        f'<Stream xmlns="{_SCHEMA_NS}">RTP-Unicast</Stream>'
+        f'<Transport xmlns="{_SCHEMA_NS}"><Protocol>RTSP</Protocol></Transport>'
+        "</StreamSetup>"
+        f"<ProfileToken>{_xml_escape(profile_token)}</ProfileToken>"
+        "</GetStreamUri>"
+    )
+    raw = _post(url, _soap_envelope(body, username, password), timeout)
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as e:
+        raise OnvifError(f"невалидный XML в ответе GetStreamUri: {e}") from e
+    uri_elem = _find_one(root, "Uri")
+    if uri_elem is None or not (uri_elem.text or "").strip():
+        raise OnvifError("в ответе GetStreamUri нет адреса потока (Uri)")
+    return uri_elem.text.strip()
 
 
 _WSDD_NS = "http://schemas.xmlsoap.org/ws/2005/04/discovery"

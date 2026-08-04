@@ -182,6 +182,17 @@ class FaceEventRich(BaseModel):
     bbox: dict | None = None
 
 
+class OnvifProfilesRequest(BaseModel):
+    host: str
+    port: int = 80
+    username: str | None = None
+    password: str | None = None
+
+
+class OnvifStreamUriRequest(OnvifProfilesRequest):
+    profile_token: str
+
+
 class ROIIn(BaseModel):
     polygons: list[list[list[float]]]
 

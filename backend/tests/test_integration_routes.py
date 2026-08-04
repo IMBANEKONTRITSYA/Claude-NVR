@@ -208,6 +208,109 @@ def test_onvif_discover_returns_503_when_worker_unreachable(client, admin_header
     assert r.status_code == 503
 
 
+def test_onvif_profiles_requires_admin(client, admin_headers, request):
+    username = _unique("op-onvif-profiles", request)
+    client.post(
+        "/api/users",
+        json={"username": username, "password": "Op3rator!Pass1", "role": "operator"},
+        headers=admin_headers,
+    )
+    r = client.post("/api/auth/login", data={"username": username, "password": "Op3rator!Pass1"})
+    operator_headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+    r = client.post("/api/cameras/onvif/profiles", json={"host": "192.168.1.64"}, headers=operator_headers)
+    assert r.status_code == 403
+
+    r = client.post("/api/cameras/onvif/profiles", json={"host": "192.168.1.64"})
+    assert r.status_code == 401
+
+
+def test_onvif_profiles_proxies_worker_response(client, admin_headers, monkeypatch):
+    import httpx as httpx_module
+
+    fake_profiles = [{"token": "profile_1", "name": "MainStream"}]
+    captured = {}
+
+    class _FakeResponse:
+        def json(self):
+            return {"ok": True, "profiles": fake_profiles}
+
+    async def _fake_post(self, url, **kwargs):
+        assert url.endswith("/onvif/profiles")
+        captured["json"] = kwargs.get("json")
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx_module.AsyncClient, "post", _fake_post)
+
+    r = client.post(
+        "/api/cameras/onvif/profiles",
+        json={"host": "192.168.1.64", "port": 80, "username": "admin", "password": "s3cret"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200
+    assert r.json() == {"profiles": fake_profiles}
+    assert captured["json"]["host"] == "192.168.1.64"
+    assert captured["json"]["password"] == "s3cret"
+
+
+def test_onvif_profiles_returns_502_on_worker_error(client, admin_headers, monkeypatch):
+    import httpx as httpx_module
+
+    class _FakeResponse:
+        def json(self):
+            return {"ok": False, "error": "ONVIF-запрос не удался: timed out", "profiles": []}
+
+    async def _fake_post(self, url, **kwargs):
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx_module.AsyncClient, "post", _fake_post)
+
+    r = client.post("/api/cameras/onvif/profiles", json={"host": "192.168.1.64"}, headers=admin_headers)
+    assert r.status_code == 502
+    assert "timed out" in r.text
+
+
+def test_onvif_stream_uri_proxies_worker_response(client, admin_headers, monkeypatch):
+    import httpx as httpx_module
+
+    class _FakeResponse:
+        def json(self):
+            return {"ok": True, "uri": "rtsp://192.168.1.64:554/profile1"}
+
+    async def _fake_post(self, url, **kwargs):
+        assert url.endswith("/onvif/stream-uri")
+        assert kwargs["json"]["profile_token"] == "profile_1"
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx_module.AsyncClient, "post", _fake_post)
+
+    r = client.post(
+        "/api/cameras/onvif/stream-uri",
+        json={"host": "192.168.1.64", "profile_token": "profile_1"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200
+    assert r.json() == {"uri": "rtsp://192.168.1.64:554/profile1"}
+
+
+def test_onvif_stream_uri_requires_admin(client, admin_headers, request):
+    username = _unique("op-onvif-streamuri", request)
+    client.post(
+        "/api/users",
+        json={"username": username, "password": "Op3rator!Pass1", "role": "operator"},
+        headers=admin_headers,
+    )
+    r = client.post("/api/auth/login", data={"username": username, "password": "Op3rator!Pass1"})
+    operator_headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+    r = client.post(
+        "/api/cameras/onvif/stream-uri",
+        json={"host": "192.168.1.64", "profile_token": "profile_1"},
+        headers=operator_headers,
+    )
+    assert r.status_code == 403
+
+
 def test_operator_cannot_manage_cameras_but_can_view(client, admin_headers, request):
     username = _unique("operator", request)
     r = client.post(

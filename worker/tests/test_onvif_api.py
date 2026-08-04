@@ -67,3 +67,99 @@ def test_onvif_discover_passes_timeout_query_param(monkeypatch):
 def test_onvif_discover_rejects_timeout_out_of_bounds():
     r = _client().get("/onvif/discover?timeout=100")
     assert r.status_code == 422
+
+
+def test_onvif_profiles_returns_found_profiles(monkeypatch):
+    fake_profiles = [{"token": "profile_1", "name": "MainStream"}]
+    captured = {}
+
+    def fake_get_profiles(host, port, username, password):
+        captured.update(host=host, port=port, username=username, password=password)
+        return fake_profiles
+
+    monkeypatch.setattr(onvif_api, "get_profiles", fake_get_profiles)
+
+    r = _client().post("/onvif/profiles", json={
+        "host": "192.168.1.64", "port": 80, "username": "admin", "password": "s3cret",
+    })
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["profiles"] == fake_profiles
+    assert captured == {"host": "192.168.1.64", "port": 80, "username": "admin", "password": "s3cret"}
+
+
+def test_onvif_profiles_defaults_port_and_optional_credentials(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        onvif_api, "get_profiles",
+        lambda host, port, username, password: captured.setdefault("args", (host, port, username, password)) or [],
+    )
+
+    r = _client().post("/onvif/profiles", json={"host": "192.168.1.64"})
+
+    assert r.status_code == 200
+    assert captured["args"] == ("192.168.1.64", 80, None, None)
+
+
+def test_onvif_profiles_reports_onvif_error_without_500(monkeypatch):
+    def _raise(host, port, username, password):
+        raise onvif_api.OnvifError("ONVIF-запрос к http://192.168.1.64:80/onvif/Media не удался: timed out")
+    monkeypatch.setattr(onvif_api, "get_profiles", _raise)
+
+    r = _client().post("/onvif/profiles", json={"host": "192.168.1.64"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "timed out" in body["error"]
+    assert body["profiles"] == []
+
+
+def test_onvif_profiles_requires_host():
+    r = _client().post("/onvif/profiles", json={})
+    assert r.status_code == 422
+
+
+def test_onvif_stream_uri_returns_uri(monkeypatch):
+    captured = {}
+
+    def fake_get_stream_uri(host, port, profile_token, username, password):
+        captured.update(host=host, port=port, profile_token=profile_token, username=username, password=password)
+        return "rtsp://192.168.1.64:554/profile1"
+
+    monkeypatch.setattr(onvif_api, "get_stream_uri", fake_get_stream_uri)
+
+    r = _client().post("/onvif/stream-uri", json={
+        "host": "192.168.1.64", "port": 80, "profile_token": "profile_1",
+        "username": "admin", "password": "s3cret",
+    })
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["uri"] == "rtsp://192.168.1.64:554/profile1"
+    assert captured == {
+        "host": "192.168.1.64", "port": 80, "profile_token": "profile_1",
+        "username": "admin", "password": "s3cret",
+    }
+
+
+def test_onvif_stream_uri_reports_onvif_error_without_500(monkeypatch):
+    def _raise(host, port, profile_token, username, password):
+        raise onvif_api.OnvifError("в ответе GetStreamUri нет адреса потока (Uri)")
+    monkeypatch.setattr(onvif_api, "get_stream_uri", _raise)
+
+    r = _client().post("/onvif/stream-uri", json={"host": "192.168.1.64", "profile_token": "profile_1"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "нет адреса потока" in body["error"]
+    assert body["uri"] is None
+
+
+def test_onvif_stream_uri_requires_profile_token():
+    r = _client().post("/onvif/stream-uri", json={"host": "192.168.1.64"})
+    assert r.status_code == 422
