@@ -74,3 +74,28 @@ def admin_token(client):
 @pytest.fixture()
 def admin_headers(admin_token):
     return {"Authorization": f"Bearer {admin_token}"}
+
+
+@pytest.fixture()
+def pg_conn():
+    """Синхронное сырое подключение к тому же Postgres, что и приложение —
+    для сидинга строк (persons/face_events/cameras с pgvector-колонками),
+    которые нельзя создать через API без живого worker'а (эмбеддинги в CI
+    не считаются — сервис распознавания в CI не поднимается, см.
+    .github/workflows/ci.yml). Каждый тест получает и коммитит свои строки
+    сам и сам же их подчищает — фикстура только даёт соединение."""
+    import psycopg2
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(settings.DATABASE_URL.replace("+asyncpg", ""))
+    conn = psycopg2.connect(
+        host=parsed.hostname, port=parsed.port or 5432,
+        user=parsed.username, password=parsed.password,
+        dbname=parsed.path.lstrip("/"),
+        connect_timeout=5,
+    )
+    conn.autocommit = True
+    try:
+        yield conn
+    finally:
+        conn.close()
