@@ -8,6 +8,39 @@ on:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    # ТЗ 14: "покрытие кода тестами не менее 70% (back-end)". Раньше юнит-тесты
+    # (auth/шифрование/валидация) шли без реальной БД, поэтому обработчики
+    # роутеров почти не покрывались — service-контейнеры дают
+    # tests/test_integration_routes.py настоящий Postgres+Redis, как в
+    # docker-compose.yml (та же образ pgvector/pgvector:pg16), без
+    # необходимости поднимать полный docker compose стек в CI.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facewatch
+          POSTGRES_PASSWORD: facewatch
+          POSTGRES_DB: facewatch_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U facewatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://facewatch:facewatch@localhost:5432/facewatch_test
+      REDIS_URL: redis://localhost:6379/0
+      ALLOW_INSECURE_DEFAULT_SECRETS: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,13 +53,12 @@ jobs:
           pip install -r requirements.txt pytest pytest-cov aiosqlite
       - name: Run tests with coverage
         working-directory: backend
-        # Текущие тесты — юнит-логика (auth/шифрование/валидация/роутинг),
-        # без реальных Postgres/Redis в CI, поэтому обработчики роутеров
-        # почти не покрыты. Порог ниже цели ТЗ (≥70%) — фиксирует текущий
-        # уровень (не даёт покрытию просесть незаметно), а не заявляет
-        # соответствие цели. Поднять порог к 70% — задача следующего цикла
-        # (нужны интеграционные тесты с БД в CI).
-        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=45 -q
+        # 59% чуть ниже честного текущего уровня (измеряется тут же) — тот же
+        # принцип, что и раньше: фиксирует достигнутый прогресс к цели ТЗ
+        # (≥70%), не заявляет недостоверное соответствие ей. Дальнейший
+        # подъём — покрытие persons/search/reports/ws роутеров
+        # интеграционными тестами (см. docs/reviews/REVIEW_LOG.md).
+        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=55 -q
 
   worker:
     runs-on: ubuntu-latest

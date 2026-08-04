@@ -17,6 +17,16 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 ROLES = ("admin", "operator", "viewer")
 
 
+def _utcnow_naive() -> datetime:
+    """RefreshToken.expires_at/revoked_at — DateTime без timezone (TIMESTAMP
+    WITHOUT TIME ZONE в Postgres, значения по конвенции — UTC). asyncpg (в
+    отличие от aiosqlite, которым пользуются юнит-тесты) отказывается
+    биндить timezone-aware datetime в такую колонку — эта функция для
+    именно записи в БД; при чтении naive-значение по-прежнему трактуется
+    как UTC (см. rotate_refresh_token)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def hash_password(p: str) -> str:
     return pwd_ctx.hash(p)
 
@@ -39,7 +49,7 @@ def _hash_refresh_token(raw: str) -> str:
 
 async def create_refresh_token(db: AsyncSession, user_id: int) -> str:
     raw = secrets.token_urlsafe(48)
-    expires = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    expires = _utcnow_naive() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
     db.add(RefreshToken(user_id=user_id, token_hash=_hash_refresh_token(raw), expires_at=expires))
     await db.commit()
     return raw
@@ -74,7 +84,7 @@ async def rotate_refresh_token(db: AsyncSession, raw_token: str) -> tuple[User, 
     if not user:
         return None
 
-    rt.revoked_at = now
+    rt.revoked_at = now.replace(tzinfo=None)
     rt.rotated = True
     await db.commit()
     new_raw = await create_refresh_token(db, user.id)
@@ -86,7 +96,7 @@ async def revoke_refresh_token(db: AsyncSession, raw_token: str) -> None:
     await db.execute(
         update(RefreshToken)
         .where(RefreshToken.token_hash == token_hash, RefreshToken.revoked_at.is_(None))
-        .values(revoked_at=datetime.now(timezone.utc))
+        .values(revoked_at=_utcnow_naive())
     )
     await db.commit()
 
@@ -95,7 +105,7 @@ async def revoke_all_user_tokens(db: AsyncSession, user_id: int) -> None:
     await db.execute(
         update(RefreshToken)
         .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
-        .values(revoked_at=datetime.now(timezone.utc))
+        .values(revoked_at=_utcnow_naive())
     )
     await db.commit()
 
