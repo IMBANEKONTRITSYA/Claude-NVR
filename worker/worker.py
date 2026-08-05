@@ -288,6 +288,22 @@ def start_republish(cam_id: int, rtsp_url: str) -> subprocess.Popen | None:
 
 _DECODE_ACCEL_LOGGED = False
 
+# ТЗ 12: "детект зависших потоков". Без этих свойств ни cap.open(), ни
+# cap.read() не имеют тайм-аута на FFMPEG-бэкенде OpenCV — классическая
+# поломка RTSP, когда TCP-сессия остаётся формально открытой (NAT-keepalive,
+# зависшая прошивка камеры), приводит к тому, что демультиплексор ffmpeg
+# блокируется внутри cap.read() на неопределённое время вместо того, чтобы
+# вернуть ошибку. В этом случае существующий backoff-реконнект (см. цикл
+# reconnect_attempt в camera_worker()) никогда не срабатывает — нить
+# считается «живой» (заблокирована ≠ мертва), manager() её не перезапускает,
+# а на shutdown join(timeout=...) просто истекает, не освобождая ресурс.
+# Значения — компромисс между устойчивостью к обычным сетевым паузам
+# (слишком короткий тайм-аут даёт ложные переподключения при кратковременных
+# заторах) и временем восстановления (ТЗ: RTO ≤ 5 минут для всей системы,
+# здесь — на один поток из до 16).
+RTSP_OPEN_TIMEOUT_MSEC = 10_000
+RTSP_READ_TIMEOUT_MSEC = 15_000
+
 
 def open_capture(url: str) -> cv2.VideoCapture:
     """Открывает RTSP-поток аналитики с попыткой аппаратного декодирования
@@ -297,10 +313,15 @@ def open_capture(url: str) -> cv2.VideoCapture:
     откатиться на программное декодирование, если ничего не найдено — то же
     поведение и в песочнице без GPU, и на целевом N100 без настроенного
     VAAPI, поэтому безопасно включать по умолчанию.
-    Свойство должно быть выставлено ДО open() — после открытия потока
-    OpenCV его уже не применяет."""
+    Свойства должны быть выставлены ДО open() — после открытия потока
+    OpenCV их уже не применяет."""
     global _DECODE_ACCEL_LOGGED
     cap = cv2.VideoCapture()
+    try:
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, RTSP_OPEN_TIMEOUT_MSEC)
+        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_READ_TIMEOUT_MSEC)
+    except Exception:
+        pass  # сборка OpenCV без поддержки свойства — откат на прежнее поведение без тайм-аута
     if hw_decode_requested():
         try:
             cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
