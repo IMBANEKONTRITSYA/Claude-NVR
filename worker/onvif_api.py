@@ -19,7 +19,9 @@ from onvif_client import (
     get_device_information,
     get_osd_texts,
     get_profiles,
+    get_snapshot_uri,
     get_stream_uri,
+    select_stream_profiles,
     inject_credentials,
     scan_subnet,
     suggest_camera_name,
@@ -134,9 +136,10 @@ async def onvif_describe(payload: OnvifDescribeRequest):
     GetStreamUri по двум профилям. Нужен для массового добавления найденных
     камер — гонять эту цепочку из формы по одной камере медленно и неудобно.
 
-    Профили основного потока и субпотока выбираются по разрешению, а не по
-    порядку в списке: порядок прошивки не гарантируют, а ТЗ 18.1 требует,
-    чтобы детекция шла именно на низкоразрешающем субпотоке.
+    Основной поток и субпоток выбираются по разрешению, когда камера его
+    сообщает, и по порядку профилей, когда нет (см. select_stream_profiles).
+    ТЗ 18.1 требует, чтобы детекция шла именно на низкоразрешающем
+    субпотоке, а запись и просмотр — на основном.
     """
     def _collect():
         info = get_device_information(payload.host, payload.port, payload.username, payload.password)
@@ -156,18 +159,11 @@ async def onvif_describe(payload: OnvifDescribeRequest):
         return {"ok": False, "error": "камера не вернула ни одного медиа-профиля",
                 "name": name, "rtsp_url": None, "sub_rtsp_url": None}
 
-    def _area(p):
-        # Профиль без разрешения не должен вытеснить профиль с разрешением
-        # ни из «самого большого», ни из «самого маленького»: -1 уводит его
-        # в начало сортировки по возрастанию, а условие ниже его отсекает.
-        w, h = p.get("width"), p.get("height")
-        return w * h if w and h else -1
-
-    ranked = sorted(profiles, key=_area)
-    main_profile = ranked[-1]
-    # Субпоток — самый мелкий профиль, но только если он реально другой и с
-    # известным разрешением: у камеры с единственным профилем субпотока нет.
-    sub_profile = ranked[0] if len(ranked) > 1 and _area(ranked[0]) > 0 else None
+    # Выбор по разрешению, а при неизвестном разрешении — по порядку из
+    # GetProfiles (конвенция ONVIF: основной профиль первый). См. подробности
+    # в select_stream_profiles: наивная сортировка по разрешению на прошивках
+    # без VideoEncoderConfiguration выбирала основным как раз субпоток.
+    main_profile, sub_profile = select_stream_profiles(profiles)
 
     async def _uri(profile):
         if profile is None:
@@ -183,6 +179,12 @@ async def onvif_describe(payload: OnvifDescribeRequest):
 
     rtsp_url = await _uri(main_profile)
     sub_rtsp_url = await _uri(sub_profile)
+    # Адрес JPEG-снимка основного потока: из него воркер режет лицо в полном
+    # разрешении вместо кропа из субпотока, на котором идёт детекция.
+    snapshot_uri = await run_in_threadpool(
+        get_snapshot_uri, payload.host, payload.port, main_profile["token"],
+        payload.username, payload.password,
+    )
     if not rtsp_url:
         return {"ok": False, "error": "не удалось получить RTSP-адрес основного потока",
                 "name": name, "rtsp_url": None, "sub_rtsp_url": None}
@@ -194,5 +196,7 @@ async def onvif_describe(payload: OnvifDescribeRequest):
         "sub_rtsp_url": sub_rtsp_url,
         "device_info": info,
         "osd_texts": osd_texts,
+        "snapshot_uri": snapshot_uri,
+        "main_profile_token": main_profile["token"],
         "profiles": profiles,
     }

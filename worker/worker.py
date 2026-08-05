@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 import cv2
 import base64
 import hashlib
+import urllib.request
+
 import numpy as np
 import redis
 from cryptography.fernet import Fernet
@@ -30,6 +32,7 @@ from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, J
 from pgvector.sqlalchemy import Vector
 
 from backoff import reconnect_delay
+from face_select import pick_matching_face
 from record_encode import build_encode_args
 from shutdown import shutdown_event, handle_shutdown_signal
 from logging_utils import configure_logging
@@ -435,6 +438,58 @@ def save_face_snapshot(frame, cam_id: int, bbox) -> str | None:
     return f"snapshots/{fname}"
 
 
+def resolve_snapshot_url(onvif_config: dict | None) -> str | None:
+    """Адрес JPEG-снимка основного потока камеры (ONVIF GetSnapshotUri).
+
+    Вызывается один раз при старте камеры. Детекция идёт на субпотоке
+    (640×360) — резать оттуда лицо значит получить кроп в несколько десятков
+    пикселей, который не спасёт никакой апскейл: информации в исходнике
+    просто нет. Постоянно декодировать основной поток ради снимков нельзя —
+    на 16 камерах это ровно та нагрузка, которую раздел 18 ТЗ велит
+    избегать. Снимок берётся одним HTTP-GET и только в момент события.
+    """
+    if not onvif_config or not onvif_config.get("host"):
+        return None
+    host = onvif_config["host"]
+    port = onvif_config.get("port") or 80
+    user = onvif_config.get("username")
+    pw = onvif_config.get("password")
+    try:
+        profiles = onvif_client.get_profiles(host, port, user, pw)
+    except onvif_client.OnvifError:
+        logger.info("GetProfiles недоступен, снимки будут резаться из кадра аналитики",
+                    extra={"onvif_host": host})
+        return None
+    main_profile, _ = onvif_client.select_stream_profiles(profiles)
+    if not main_profile:
+        return None
+    url = onvif_client.get_snapshot_uri(host, port, main_profile["token"], user, pw)
+    if not url:
+        logger.info("камера не поддерживает GetSnapshotUri, снимки из кадра аналитики",
+                    extra={"onvif_host": host})
+    return url
+
+
+def fetch_snapshot_frame(snapshot_url: str, timeout: float = 4.0):
+    """Скачивает и декодирует один полноразмерный кадр с камеры.
+
+    None при любой проблеме: снимок — улучшение качества, а не обязательный
+    шаг, и недоступная камера не должна ронять обработку события.
+    """
+    try:
+        with urllib.request.urlopen(snapshot_url, timeout=timeout) as resp:  # noqa: S310 — камера локальной сети
+            data = resp.read()
+    except Exception:
+        return None
+    if not data:
+        return None
+    try:
+        buf = np.frombuffer(data, dtype=np.uint8)
+        return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+
+
 def save_latest_frame(frame, cam_id: int):
     fpath = os.path.join(MEDIA_PATH, "snapshots", f"cam{cam_id}_latest.jpg")
     cv2.imwrite(fpath, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -566,7 +621,16 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
     """Двухпоточная схема (ТЗ 18.1): основной поток идёт в архив и HLS,
     аналитика выполняется на субпотоке низкого разрешения, если он задан."""
     analyze_url = sub_rtsp_url or rtsp_url
-    logger.info("старт камеры", extra={"camera_id": cam_id, "analytics_stream": "sub" if sub_rtsp_url else "main"})
+    # Снимки лиц режутся из полноразмерного кадра, который камера отдаёт по
+    # HTTP (ONVIF GetSnapshotUri), а не из кадра аналитики: на субпотоке
+    # 640×360 лицо занимает несколько десятков пикселей. Адрес резолвится
+    # один раз при старте; None означает откат на кроп из кадра аналитики.
+    snapshot_url = resolve_snapshot_url(onvif_config)
+    logger.info("старт камеры", extra={
+        "camera_id": cam_id,
+        "analytics_stream": "sub" if sub_rtsp_url else "main",
+        "hires_snapshots": bool(snapshot_url),
+    })
     republish = start_republish(cam_id, rtsp_url)
     # Цикл 16 (было известным пробелом с цикла 15, см. REVIEW_LOG.md): счётчик
     # и таймер бэкоффа авто-рестарта ffmpeg-репабликации — без них недоступный
@@ -824,13 +888,13 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
 
         fh, fw = frame.shape[:2]
         try:
-            process_faces(cam_id, frame, faces, fw, fh, now, last_event_at)
+            process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url)
         except Exception:
             # Любой сбой на одном кадре не должен убивать нить камеры
             logger.error("ошибка обработки лиц", exc_info=True, extra={"camera_id": cam_id})
 
 
-def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at):
+def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url=None):
     with Session() as s:
         for f in faces:
             emb = np.asarray(f.normed_embedding, dtype=np.float32)
@@ -879,7 +943,40 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at):
                 for k in [k for k, v in last_event_at.items() if v < cutoff_t]:
                     del last_event_at[k]
 
-            snap_rel = save_face_snapshot(frame, cam_id, bbox)
+            # Снимок лица берётся из полноразмерного кадра камеры, а не из
+            # кадра аналитики: детекция идёт на субпотоке 640×360, и лицо в
+            # нём занимает несколько десятков пикселей — такой кроп не
+            # спасает никакой апскейл, информации в исходнике нет. Полный
+            # кадр запрашивается одним HTTP-GET и только здесь, после
+            # прохождения cooldown, а не на каждом кадре, — постоянное
+            # декодирование основного потока на 16 камерах противоречило бы
+            # разделу 18 ТЗ.
+            snap_rel = None
+            hires = fetch_snapshot_frame(snapshot_url) if snapshot_url else None
+            if hires is not None:
+                sh, sw = hires.shape[:2]
+                expected = onvif_client.scale_bbox(bbox, (fw, fh), (sw, sh))
+                detector = FACE_APP
+                try:
+                    hi_faces = detector.get(hires) if detector else []
+                except Exception:
+                    hi_faces = []
+                idx = pick_matching_face([f.bbox.tolist() for f in hi_faces], expected)
+                if idx is not None:
+                    best = hi_faces[idx]
+                    snap_rel = save_face_snapshot(hires, cam_id, best.bbox.tolist())
+                    # Эмбеддинг с полноразмерного кадра точнее — он идёт в
+                    # событие и, значит, в поиск по фото.
+                    hi_emb = np.asarray(best.normed_embedding, dtype=np.float32)
+                    if hi_emb.shape[0] == 512:
+                        emb = hi_emb
+                # Если на снимке лица не нашлось — человек успел уйти за те
+                # 100-300 мс, что снимок ехал. Режем из кадра аналитики:
+                # мыльный, но заведомо тот кадр, где лицо действительно было.
+                # Кроп по пересчитанной рамке был бы чётче и при этом мог бы
+                # содержать что угодно.
+            if snap_rel is None:
+                snap_rel = save_face_snapshot(frame, cam_id, bbox)
             ev = FaceEvent(
                 camera_id=cam_id,
                 person_id=pid,
