@@ -39,5 +39,9 @@ def test_nginx_serves_https_with_certs():
 
 def test_compose_publishes_https_port_and_persists_cert():
     compose = (FRONTEND.parent / "docker-compose.yml").read_text(encoding="utf-8")
-    assert '"8443:443"' in compose
+    # Хост-порт настраиваемый через FRONTEND_HTTPS_HOST_PORT (см. .env.example
+    # и docs/INSTALL.md — нужно, когда порт по умолчанию недоступен на хосте,
+    # например известная проблема биндинга портов на Windows), но контейнер
+    # всегда публикует именно 443 внутри и падает на дефолт 8443 снаружи.
+    assert '"${FRONTEND_HTTPS_HOST_PORT:-8443}:443"' in compose
     assert "frontend_certs:/etc/nginx/certs" in compose
