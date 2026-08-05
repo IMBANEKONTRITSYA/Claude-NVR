@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import json
+import uuid
 import shlex
 import signal
 import threading
@@ -429,7 +430,15 @@ def save_face_snapshot(frame, cam_id: int, bbox) -> str | None:
     if crop.size == 0:
         crop = frame
 
-    fname = f"cam{cam_id}_{int(time.time() * 1000)}.jpg"
+    # Суффикс обязателен, а не косметика: имени из одной миллисекунды не
+    # хватает. Все лица одного кадра режутся подряд, между ними нет ни
+    # запроса к БД, ни сети, — два кропа укладываются в одну миллисекунду
+    # штатно, и тогда второй cv2.imwrite молча затирал первый. Оба события
+    # оставались в БД, но ссылались на один файл: в карточке одного
+    # человека (и в его аватаре) оказывалось лицо другого. Отдельные
+    # камеры не конфликтовали и раньше — cam_id в имени, — а вот лица
+    # внутри кадра конфликтовали.
+    fname = f"cam{cam_id}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.jpg"
     fpath = os.path.join(MEDIA_PATH, "snapshots", fname)
     if not cv2.imwrite(fpath, crop, [cv2.IMWRITE_JPEG_QUALITY, 85]):
         logger.warning("не удалось записать снимок", extra={"camera_id": cam_id, "path": fpath})
@@ -897,40 +906,54 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
             logger.error("ошибка обработки лиц", exc_info=True, extra={"camera_id": cam_id})
 
 
+class _PendingEvent:
+    """Лицо, прошедшее cooldown, — всё нужное для события, снятое с ORM заранее.
+
+    Существует ради того, чтобы фаза сети и инференса (снимок с камеры,
+    прогон модели) шла вообще без открытой сессии SQLAlchemy: значения из
+    `Person` читаются в фазе 1 и дальше живут обычными полями Python, а не
+    ленивыми атрибутами, дёргающими БД в произвольный момент.
+    """
+
+    __slots__ = ("pid", "name", "is_known", "bbox", "bbox_json", "emb", "snap_rel")
+
+    def __init__(self, pid, name, is_known, bbox, bbox_json, emb):
+        self.pid = pid
+        self.name = name
+        self.is_known = is_known
+        self.bbox = bbox
+        self.bbox_json = bbox_json
+        self.emb = emb
+        self.snap_rel = None
+
+
 def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url=None):
-    # Снимок в полном разрешении берётся ОДИН раз на кадр и разбирается на
-    # все лица сразу. Раньше и HTTP-запрос к камере, и прогон детектора по
-    # полноразмерному кадру шли внутри цикла по лицам: кадр с пятью людьми
-    # давал пять скачиваний одного и того же снимка и пять прогонов тяжёлой
-    # модели по нему же — на 16 камерах это ровно та нагрузка, которую
-    # раздел 18 ТЗ велит избегать, и ради неё же снимок и брался вместо
-    # постоянного декодирования основного потока.
-    #
-    # Ленивое вычисление, а не в начале функции: подавляющее большинство
-    # кадров не создаёт ни одного события (все лица отсекает cooldown), и
-    # снимок для них не нужен вовсе.
-    hires_cache: dict = {}
+    """Обработка лиц одного кадра: персоны → снимок → события.
 
-    def _hires():
-        """(полноразмерный кадр, лица на нём) — не более одного раза на кадр."""
-        if "value" not in hires_cache:
-            hires_cache["value"] = (None, [])
-            hi_frame = fetch_snapshot_frame(snapshot_url) if snapshot_url else None
-            if hi_frame is not None:
-                detector = FACE_APP
-                try:
-                    hi_faces = detector.get(hi_frame) if detector else []
-                except Exception:
-                    logger.warning("детекция на снимке камеры не удалась",
-                                   exc_info=True, extra={"camera_id": cam_id})
-                    hi_faces = []
-                hires_cache["value"] = (hi_frame, hi_faces)
-        return hires_cache["value"]
+    Разбита на три фазы, и границы между ними — не стилистика, а требование
+    к 24/7-работе: **сессия БД не должна быть открыта во время сетевого
+    запроса к камере и прогона модели.**
 
-    # Лица снимка, уже отданные персонам этого кадра: один кроп не должен
-    # достаться двоим (см. pick_matching_face).
-    claimed: set[int] = set()
+    Раньше всё это стояло внутри одного `with Session()`. Из-за
+    `expire_on_commit=True` (умолчание sessionmaker) первое же обращение к
+    `person.name` после `s.commit()` реактивировало объект и открывало
+    новую транзакцию, которая жила до следующего коммита — то есть сквозь
+    HTTP-запрос снимка (до 4 с таймаута) и прогон детектора по
+    полноразмерному кадру. На 16 камерах это до 16 соединений в состоянии
+    `idle in transaction` одновременно. До исчерпания пула (20+10) далеко,
+    но длинные транзакции держат горизонт видимости и не дают autovacuum
+    чистить мёртвые версии строк в `face_events` — таблице, куда пишется
+    больше всего и которая чистится по расписанию хранения.
 
+    Фаза 1 (БД) — персоны и cooldown. Атрибуты `Person` читаются **до**
+    `s.commit()`, в уже открытой транзакции, поэтому реактивации не
+    происходит вовсе.
+    Фаза 2 (без БД) — снимок с камеры, детекция на нём, кропы. Самая
+    долгая, и здесь соединение с БД не удерживается.
+    Фаза 3 (БД) — вставка событий одной транзакцией.
+    """
+    # --- Фаза 1: БД. Персоны и cooldown. -------------------------------
+    pending: list = []
     with Session() as s:
         for f in faces:
             emb = np.asarray(f.normed_embedding, dtype=np.float32)
@@ -939,18 +962,24 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url
             bbox = f.bbox.tolist()
             pid, matched = find_or_create_person(s, emb)
             person = s.get(Person, pid)
-            s.commit()  # фиксируем возможную новую персону сразу
 
+            # Всё, что нужно дальше, снимается с ORM здесь — внутри
+            # транзакции, которую откроет find_or_create_person, и до
+            # коммита. Обращение к этим же атрибутам после commit() стоило
+            # бы лишнего SELECT'а и, главное, новой транзакции.
             name = person.name or f"Неизвестный #{pid}"
             is_known = person.status == "known"
+            wants_alert = bool(getattr(person, "alert_on_detection", False))
+            s.commit()  # фиксируем возможную новую персону сразу
+
             bbox_json = {"x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3]}
 
             # Watchlist-оповещение: свой redis-cooldown, шлём из фоновой нити,
             # чтобы HTTP к Telegram (до 5с) не тормозил обработку кадров
-            if is_known and getattr(person, "alert_on_detection", False):
+            if is_known and wants_alert:
                 threading.Thread(
                     target=send_telegram_alert,
-                    args=(pid, person.name or f"#{pid}", cam_id, ""),
+                    args=(pid, name, cam_id, ""),
                     daemon=True,
                 ).start()
 
@@ -979,79 +1008,129 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url
                 for k in [k for k, v in last_event_at.items() if v < cutoff_t]:
                     del last_event_at[k]
 
-            # Снимок лица берётся из полноразмерного кадра камеры, а не из
-            # кадра аналитики: детекция идёт на субпотоке 640×360, и лицо в
-            # нём занимает несколько десятков пикселей — такой кроп не
-            # спасает никакой апскейл, информации в исходнике нет. Полный
-            # кадр запрашивается одним HTTP-GET и только здесь, после
-            # прохождения cooldown, а не на каждом кадре, — постоянное
-            # декодирование основного потока на 16 камерах противоречило бы
-            # разделу 18 ТЗ.
-            snap_rel = None
-            hires, hi_faces = _hires()
-            if hires is not None:
-                sh, sw = hires.shape[:2]
-                expected = onvif_client.scale_bbox(bbox, (fw, fh), (sw, sh))
-                idx = pick_matching_face(
-                    [hf.bbox.tolist() for hf in hi_faces], expected, taken=claimed,
-                )
-                if idx is not None:
-                    claimed.add(idx)
-                    best = hi_faces[idx]
-                    snap_rel = save_face_snapshot(hires, cam_id, best.bbox.tolist())
-                    # Эмбеддинг с полноразмерного кадра точнее — он идёт в
-                    # событие и, значит, в поиск по фото.
-                    hi_emb = np.asarray(best.normed_embedding, dtype=np.float32)
-                    if hi_emb.shape[0] == 512:
-                        emb = hi_emb
-                # Если на снимке лица не нашлось — человек успел уйти за те
-                # 100-300 мс, что снимок ехал. Режем из кадра аналитики:
-                # мыльный, но заведомо тот кадр, где лицо действительно было.
-                # Кроп по пересчитанной рамке был бы чётче и при этом мог бы
-                # содержать что угодно.
-            if snap_rel is None:
-                snap_rel = save_face_snapshot(frame, cam_id, bbox)
+            pending.append(_PendingEvent(pid, name, is_known, bbox, bbox_json, emb))
+
+    # Подавляющее большинство кадров не создаёт ни одного события (все лица
+    # отсекает cooldown) — для них ни снимок, ни вторая сессия не нужны.
+    if not pending:
+        return
+
+    # --- Фаза 2: сеть и инференс. Открытой сессии БД здесь нет. --------
+    # Снимок в полном разрешении берётся ОДИН раз на кадр и разбирается на
+    # все лица сразу. Раньше и HTTP-запрос к камере, и прогон детектора по
+    # полноразмерному кадру шли внутри цикла по лицам: кадр с пятью людьми
+    # давал пять скачиваний одного и того же снимка и пять прогонов тяжёлой
+    # модели по нему же — на 16 камерах это ровно та нагрузка, которую
+    # раздел 18 ТЗ велит избегать, и ради неё же снимок и брался вместо
+    # постоянного декодирования основного потока.
+    #
+    # Снимок лица берётся из полноразмерного кадра камеры, а не из кадра
+    # аналитики: детекция идёт на субпотоке 640×360, и лицо в нём занимает
+    # несколько десятков пикселей — такой кроп не спасает никакой апскейл,
+    # информации в исходнике нет.
+    hires, hi_faces = None, []
+    if snapshot_url:
+        hi_frame = fetch_snapshot_frame(snapshot_url)
+        if hi_frame is not None:
+            hires = hi_frame
+            detector = FACE_APP
+            try:
+                hi_faces = detector.get(hi_frame) if detector else []
+            except Exception:
+                logger.warning("детекция на снимке камеры не удалась",
+                               exc_info=True, extra={"camera_id": cam_id})
+                hi_faces = []
+
+    # Лица снимка, уже отданные персонам этого кадра: один кроп не должен
+    # достаться двоим (см. pick_matching_face).
+    claimed: set[int] = set()
+    for p in pending:
+        if hires is not None:
+            sh, sw = hires.shape[:2]
+            expected = onvif_client.scale_bbox(p.bbox, (fw, fh), (sw, sh))
+            idx = pick_matching_face(
+                [hf.bbox.tolist() for hf in hi_faces], expected, taken=claimed,
+            )
+            if idx is not None:
+                claimed.add(idx)
+                best = hi_faces[idx]
+                p.snap_rel = save_face_snapshot(hires, cam_id, best.bbox.tolist())
+                # Эмбеддинг с полноразмерного кадра точнее — он идёт в
+                # событие и, значит, в поиск по фото.
+                hi_emb = np.asarray(best.normed_embedding, dtype=np.float32)
+                if hi_emb.shape[0] == 512:
+                    p.emb = hi_emb
+        # Если на снимке лица не нашлось — человек успел уйти за те
+        # 100-300 мс, что снимок ехал. Режем из кадра аналитики: мыльный,
+        # но заведомо тот кадр, где лицо действительно было. Кроп по
+        # пересчитанной рамке был бы чётче и при этом мог бы содержать
+        # что угодно.
+        if p.snap_rel is None:
+            p.snap_rel = save_face_snapshot(frame, cam_id, p.bbox)
+
+    # --- Фаза 3: БД. Вставка событий. ----------------------------------
+    # Одной транзакцией на кадр, а не по одной на лицо: событий здесь
+    # немного (cooldown уже отсеял повторы), а публикация в Redis вынесена
+    # за пределы сессии — иначе чтение ev.id после commit() снова открыло
+    # бы транзакцию, теперь уже на время сетевого вызова к Redis.
+    payloads = []
+    with Session() as s:
+        for p in pending:
             ev = FaceEvent(
                 camera_id=cam_id,
-                person_id=pid,
+                person_id=p.pid,
                 ts=datetime.utcnow(),
-                snapshot_path=snap_rel,
-                orig_snapshot_path=snap_rel,
+                snapshot_path=p.snap_rel,
+                orig_snapshot_path=p.snap_rel,
                 enhanced=False,
-                embedding=emb.tolist(),
-                bbox=bbox_json,
-                is_known=is_known,
+                embedding=p.emb.tolist(),
+                bbox=p.bbox_json,
+                is_known=p.is_known,
             )
             s.add(ev)
-            is_new_avatar = person.avatar_path is None and bool(snap_rel)
+            person = s.get(Person, p.pid)
+            is_new_avatar = (
+                person is not None and person.avatar_path is None and bool(p.snap_rel)
+            )
             if is_new_avatar:
-                person.avatar_path = snap_rel
-            s.commit()
-
-            try:
-                r.publish("faces:new", json.dumps({
+                person.avatar_path = p.snap_rel
+            # flush, а не commit: id события нужен для payload'а, а читать
+            # его после commit() значит реактивировать объект и открыть
+            # транзакцию заново.
+            s.flush()
+            payloads.append((
+                {
                     "type": "face",
                     "event_id": ev.id,
                     "camera_id": cam_id,
-                    "person_id": pid,
-                    "name": name,
-                    "is_known": is_known,
-                    "snapshot": snap_rel,
+                    "person_id": p.pid,
+                    "name": p.name,
+                    "is_known": p.is_known,
+                    "snapshot": p.snap_rel,
                     "ts": ev.ts.isoformat(),
-                    "bbox": bbox_json,
+                    "bbox": p.bbox_json,
                     "frame_w": fw,
                     "frame_h": fh,
-                }))
-                # Ленивый апскейл (ТЗ 18.6): в режиме "manual" не делаем ничего,
-                # в "avatar" улучшаем только первый кадр персоны (её аватар),
-                # в "all" — всю галерею. Очередь ограничена, чтобы медленный
-                # CPU-апскейл не копил бэклог часами.
-                mode = CONFIG["upscale_mode"]
-                want = mode == "all" or (mode == "avatar" and is_new_avatar)
-                if want and r.llen("upscale:queue") < 500:
-                    r.lpush("upscale:queue", json.dumps({"event_id": ev.id}))
-            except Exception:
-                pass
+                },
+                ev.id,
+                is_new_avatar,
+            ))
+        s.commit()
+
+    # --- Публикация. Сессия уже закрыта. -------------------------------
+    for payload, ev_id, is_new_avatar in payloads:
+        try:
+            r.publish("faces:new", json.dumps(payload))
+            # Ленивый апскейл (ТЗ 18.6): в режиме "manual" не делаем ничего,
+            # в "avatar" улучшаем только первый кадр персоны (её аватар),
+            # в "all" — всю галерею. Очередь ограничена, чтобы медленный
+            # CPU-апскейл не копил бэклог часами.
+            mode = CONFIG["upscale_mode"]
+            want = mode == "all" or (mode == "avatar" and is_new_avatar)
+            if want and r.llen("upscale:queue") < 500:
+                r.lpush("upscale:queue", json.dumps({"event_id": ev_id}))
+        except Exception:
+            pass
 
 
 def _to_vec(val) -> np.ndarray:
