@@ -37,7 +37,10 @@ def test_onvif_discover_returns_empty_list_when_nothing_found(monkeypatch):
     r = _client().get("/onvif/discover")
 
     assert r.status_code == 200
-    assert r.json() == {"ok": True, "devices": []}
+    # warnings появился вместе с перебором подсети: multicast может не
+    # пройти, а перебор — найти камеры, и такой частичный сбой не должен
+    # выглядеть как ошибка. Здесь ошибок не было, поэтому список пуст.
+    assert r.json() == {"ok": True, "devices": [], "warnings": []}
 
 
 def test_onvif_discover_reports_onvif_error_without_500(monkeypatch):
@@ -139,7 +142,10 @@ def test_onvif_stream_uri_returns_uri(monkeypatch):
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is True
-    assert body["uri"] == "rtsp://192.168.1.64:554/profile1"
+    # Камера отдаёт адрес без учётных данных (так велит спецификация ONVIF),
+    # но ffmpeg/OpenCV читают логин и пароль только из самого URL — без
+    # подстановки автозаполненный в форму адрес сразу давал 401 Unauthorized.
+    assert body["uri"] == "rtsp://admin:s3cret@192.168.1.64:554/profile1"
     assert captured == {
         "host": "192.168.1.64", "port": 80, "profile_token": "profile_1",
         "username": "admin", "password": "s3cret",
@@ -163,3 +169,72 @@ def test_onvif_stream_uri_reports_onvif_error_without_500(monkeypatch):
 def test_onvif_stream_uri_requires_profile_token():
     r = _client().post("/onvif/stream-uri", json={"host": "192.168.1.64"})
     assert r.status_code == 422
+
+
+def test_onvif_discover_with_subnet_merges_scan_results(monkeypatch):
+    """Параметр subnet включает перебор адресов в дополнение к multicast.
+
+    Нужен потому, что WS-Discovery рассылает multicast, а воркер живёт в
+    docker-контейнере на NAT'ированной сети: на Docker Desktop под Windows
+    такая рассылка до физической ЛВС не доходит, и поиск не находит ничего.
+    """
+    monkeypatch.setattr(onvif_api, "discover_devices", lambda timeout: [])
+    monkeypatch.setattr(
+        onvif_api, "scan_subnet",
+        lambda cidr: [{"address": "", "xaddrs": [], "scopes": [],
+                       "host": "192.168.105.19", "port": 80}],
+    )
+
+    r = _client().get("/onvif/discover", params={"subnet": "192.168.105.0/24"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert [d["host"] for d in body["devices"]] == ["192.168.105.19"]
+
+
+def test_onvif_discover_deduplicates_across_both_methods(monkeypatch):
+    """Камера, найденная и multicast'ом, и перебором, не должна дублироваться."""
+    device = {"address": "urn:uuid:1", "xaddrs": [], "scopes": [],
+              "host": "192.168.105.19", "port": 80}
+    monkeypatch.setattr(onvif_api, "discover_devices", lambda timeout: [device])
+    monkeypatch.setattr(onvif_api, "scan_subnet", lambda cidr: [dict(device)])
+
+    body = _client().get("/onvif/discover", params={"subnet": "192.168.105.0/24"}).json()
+
+    assert len(body["devices"]) == 1
+
+
+def test_subnet_scan_succeeds_even_when_multicast_fails(monkeypatch):
+    """Ровно ситуация пользователя: multicast не проходит через сеть Docker.
+    Его сбой не должен превращать успешный перебор в ошибку — иначе фикс
+    не помог бы там, где он и нужен."""
+    def _raise(timeout):
+        raise onvif_api.OnvifError("не удалось отправить WS-Discovery Probe: network unreachable")
+    monkeypatch.setattr(onvif_api, "discover_devices", _raise)
+    monkeypatch.setattr(
+        onvif_api, "scan_subnet",
+        lambda cidr: [{"address": "", "xaddrs": [], "scopes": [],
+                       "host": "192.168.105.19", "port": 80}],
+    )
+
+    body = _client().get("/onvif/discover", params={"subnet": "192.168.105.0/24"}).json()
+
+    assert body["ok"] is True, "перебор нашёл камеру — это успех, а не ошибка"
+    assert [d["host"] for d in body["devices"]] == ["192.168.105.19"]
+    assert body["warnings"], "но о сбое multicast стоит сообщить"
+
+
+def test_bad_subnet_reported_without_500(monkeypatch):
+    monkeypatch.setattr(onvif_api, "discover_devices", lambda timeout: [])
+
+    def _raise(cidr):
+        raise onvif_api.OnvifError("некорректный диапазон 'мусор'")
+    monkeypatch.setattr(onvif_api, "scan_subnet", _raise)
+
+    r = _client().get("/onvif/discover", params={"subnet": "мусор"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "некорректный диапазон" in body["error"]

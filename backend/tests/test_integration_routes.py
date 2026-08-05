@@ -166,7 +166,7 @@ def test_onvif_discover_proxies_worker_devices(client, admin_headers, monkeypatc
 
     class _FakeResponse:
         def json(self):
-            return {"ok": True, "devices": fake_devices}
+            return {"ok": True, "devices": fake_devices, "warnings": []}
 
     async def _fake_get(self, url, **kwargs):
         assert url.endswith("/onvif/discover")
@@ -176,7 +176,43 @@ def test_onvif_discover_proxies_worker_devices(client, admin_headers, monkeypatc
 
     r = client.get("/api/cameras/onvif/discover", headers=admin_headers)
     assert r.status_code == 200
-    assert r.json() == {"devices": fake_devices}
+    # warnings добавлен вместе с перебором подсети: multicast может не пройти,
+    # а перебор — найти камеры, и такой частичный сбой не ошибка.
+    assert r.json() == {"devices": fake_devices, "warnings": []}
+
+
+def test_onvif_discover_passes_subnet_to_worker(client, admin_headers, monkeypatch):
+    """Диапазон должен доходить до воркера: без него поиск идёт только
+    multicast'ом, который не проходит через NAT docker-сети и на Docker
+    Desktop под Windows не находит камер вообще."""
+    import httpx as httpx_module
+
+    captured = {}
+
+    class _FakeResponse:
+        def json(self):
+            return {"ok": True, "devices": [], "warnings": []}
+
+    async def _fake_get(self, url, **kwargs):
+        captured["params"] = kwargs.get("params")
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx_module.AsyncClient, "get", _fake_get)
+
+    r = client.get(
+        "/api/cameras/onvif/discover",
+        params={"subnet": "192.168.105.0/24"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200
+    assert captured["params"] == {"subnet": "192.168.105.0/24"}
+
+
+def test_onvif_discover_is_admin_only(client, monkeypatch):
+    """Сканирование сети — операция уровня администратора, как и остальное
+    управление камерами."""
+    r = client.get("/api/cameras/onvif/discover", params={"subnet": "192.168.1.0/24"})
+    assert r.status_code == 401
 
 
 def test_onvif_discover_returns_502_on_worker_error(client, admin_headers, monkeypatch):

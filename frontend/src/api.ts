@@ -133,7 +133,8 @@ export const api = {
     req("/api/auth/change-password", { method: "POST", body: JSON.stringify({ old_password, new_password }) }),
   testRtsp: (rtsp_url: string) =>
     req("/api/cameras/test", { method: "POST", body: JSON.stringify({ rtsp_url }) }),
-  onvifDiscover: () => req("/api/cameras/onvif/discover"),
+  onvifDiscover: (subnet?: string) =>
+    req(`/api/cameras/onvif/discover${subnet ? `?subnet=${encodeURIComponent(subnet)}` : ""}`),
   onvifProfiles: (host: string, port: number, username: string, password: string) =>
     req("/api/cameras/onvif/profiles", { method: "POST", body: JSON.stringify({ host, port, username, password }) }),
   onvifStreamUri: (host: string, port: number, username: string, password: string, profile_token: string) =>

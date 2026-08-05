@@ -159,21 +159,32 @@ async def hls_auth(_=Depends(get_current_user)):
 
 
 @router.get("/onvif/discover")
-async def onvif_discover(_=Depends(require_role("admin"))):
+async def onvif_discover(
+    subnet: str | None = Query(None, description="CIDR для перебора, например 192.168.1.0/24"),
+    _=Depends(require_role("admin")),
+):
     """Автообнаружение ONVIF-камер в сети (ТЗ 18.7: "автообнаружение камер
-    в сети"). Сама WS-Discovery multicast-рассылка выполняется воркером
-    (worker/onvif_api.py) — он в той же docker-сети, что и камеры, backend
-    туда не имеет прямого сетевого пути для UDP multicast. admin-only, как
-    и остальное управление камерами (add/update/delete/rtsp)."""
-    async with httpx.AsyncClient(timeout=15) as client:
+    в сети"). Выполняется воркером (worker/onvif_api.py) — он в той же
+    docker-сети, что и камеры, backend туда прямого сетевого пути не имеет.
+    admin-only, как и остальное управление камерами.
+
+    Необязательный subnet включает перебор адресов диапазона вместо одной
+    лишь multicast-рассылки WS-Discovery: multicast не проходит через NAT
+    docker-сети (на Docker Desktop под Windows — гарантированно), из-за чего
+    поиск не находил камер вообще. Таймаут запроса к воркеру при переборе
+    выше: 1024 адреса × несколько портов не укладываются в 15 секунд.
+    """
+    timeout = 180 if subnet else 15
+    params = {"subnet": subnet} if subnet else None
+    async with httpx.AsyncClient(timeout=timeout) as client:
         try:
-            resp = await client.get(f"{settings.WORKER_URL}/onvif/discover")
+            resp = await client.get(f"{settings.WORKER_URL}/onvif/discover", params=params)
         except httpx.HTTPError as e:
             raise HTTPException(503, f"Сервис распознавания недоступен: {e}")
     data = resp.json()
     if not data.get("ok"):
         raise HTTPException(502, data.get("error") or "Не удалось выполнить автообнаружение")
-    return {"devices": data.get("devices", [])}
+    return {"devices": data.get("devices", []), "warnings": data.get("warnings", [])}
 
 
 @router.post("/onvif/profiles")

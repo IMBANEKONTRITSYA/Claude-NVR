@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 import uuid as _uuid
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 from xml.sax.saxutils import escape as _xml_escape
 
 # defusedxml.ElementTree — не stdlib xml.etree.ElementTree: все ответы,
@@ -275,6 +275,40 @@ def get_stream_uri(
     return uri_elem.text.strip()
 
 
+def inject_credentials(uri: str, username: str | None, password: str | None) -> str:
+    """Подставляет учётные данные в RTSP-URI, возвращённый камерой.
+
+    GetStreamUri почти всегда отдаёт адрес без учётных данных — например
+    `rtsp://192.168.1.10/media/video1`, — потому что по спецификации ONVIF
+    они передаются отдельно. Но ffmpeg/OpenCV берут логин и пароль только
+    из самого URL, поэтому такой адрес, подставленный в форму камеры как
+    есть, даёт `401 Unauthorized` на первой же проверке RTSP. Камеры
+    используют для RTSP те же учётные данные, что и для ONVIF, а их
+    администратор уже ввёл в форму — подставляем их.
+
+    Уже присутствующие в URI учётные данные не трогаем: если администратор
+    (или сама камера) их указал — значит, знает лучше.
+    """
+    if not username or not uri:
+        return uri
+    parts = urlsplit(uri)
+    if not parts.hostname or "@" in parts.netloc:
+        # Нечего или некуда подставлять: адрес без хоста (мусор в ответе)
+        # либо учётные данные уже есть.
+        return uri
+
+    # quote с safe="" кодирует и ':', и '@', и '/', иначе пароль вида
+    # "p@ss:w/ord" развалил бы разбор URL на стороне ffmpeg.
+    userinfo = quote(username, safe="")
+    if password:
+        userinfo += ":" + quote(password, safe="")
+
+    netloc = f"{userinfo}@{parts.hostname}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
 _WSDD_NS = "http://schemas.xmlsoap.org/ws/2005/04/discovery"
 _WSA_NS = "http://schemas.xmlsoap.org/ws/2004/08/addressing"
 _WSDD_MULTICAST_ADDR = "239.255.255.250"
@@ -381,6 +415,108 @@ def discover_devices(timeout: float = 3.0, socket_factory=socket.socket) -> list
         return list(devices_by_key.values())
     finally:
         sock.close()
+
+
+_DEVICE_NS = "http://www.onvif.org/ver10/device/wsdl"
+
+# Порты, на которых ONVIF-устройства держат device_service чаще всего.
+DEFAULT_SCAN_PORTS = (80, 8000, 8080, 2020)
+
+# Потолок на размер сканируемой сети. /22 — это 1024 адреса, верхняя граница
+# разумной локальной подсети; всё, что больше, почти наверняка опечатка в
+# маске, а не намерение, и превратило бы кнопку в многочасовой перебор.
+MAX_SCAN_HOSTS = 1024
+
+
+def _is_onvif_device(host: str, port: int, timeout: float) -> dict | None:
+    """Проверяет один адрес: похоже ли, что там ONVIF-устройство.
+
+    Сначала TCP-connect — он отсеивает подавляющее большинство адресов за
+    миллисекунды, и только выжившие получают SOAP-запрос. Запрос —
+    GetSystemDateAndTime: по спецификации ONVIF это единственная команда,
+    которую устройство обязано отдавать без аутентификации, поэтому проба
+    работает до того, как администратор ввёл логин с паролем.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            pass
+    except OSError:
+        return None
+
+    url = f"http://{host}:{port}/onvif/device_service"
+    body = f'<GetSystemDateAndTime xmlns="{_DEVICE_NS}"/>'
+    try:
+        raw = _post(url, _soap_envelope(body, None, None), timeout)
+    except OnvifError:
+        return None
+    try:
+        root = ET.fromstring(raw)
+    except (ET.ParseError, DefusedXmlException):
+        return None
+    # Открытый HTTP-порт есть у чего угодно (роутер, принтер, сам FaceWatch);
+    # ONVIF-устройство выдаёт именно этот элемент в ответе.
+    if _find_one(root, "SystemDateAndTime") is None and _find_one(root, "UTCDateTime") is None:
+        return None
+    return {
+        "address": "",
+        "xaddrs": [url],
+        "scopes": [],
+        "host": host,
+        "port": port,
+    }
+
+
+def scan_subnet(
+    cidr: str,
+    ports: tuple[int, ...] = DEFAULT_SCAN_PORTS,
+    timeout: float = 1.0,
+    max_workers: int = 64,
+) -> list[dict]:
+    """Ищет ONVIF-камеры перебором адресов подсети вместо multicast.
+
+    Зачем нужен отдельный путь, когда есть discover_devices(): WS-Discovery
+    работает через multicast-датаграмму на 239.255.255.250, а воркер живёт в
+    docker-контейнере на NAT'ированной bridge-сети. На Linux с host-сетью
+    это ещё может сработать, но на Docker Desktop под Windows (WSL2)
+    multicast до физической ЛВС не доходит вовсе — кнопка «Найти камеры в
+    сети» честно рассылает Probe и не получает ни одного ответа. Перебор
+    адресов идёт обычными unicast-пакетами и через NAT проходит.
+
+    Диапазон ограничен приватными сетями (RFC1918 и link-local): это NVR
+    для локальной сети, и возможность запустить с него сканирование
+    произвольного публичного диапазона — лишняя, а в чужих руках вредная.
+    """
+    import ipaddress
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        network = ipaddress.ip_network(cidr.strip(), strict=False)
+    except ValueError as e:
+        raise OnvifError(f"некорректный диапазон {cidr!r}: {e}") from e
+    if network.version != 4:
+        raise OnvifError("поддерживаются только IPv4-диапазоны")
+    if not (network.is_private or network.is_link_local):
+        raise OnvifError(
+            f"{network} — не приватная сеть. Сканирование ограничено локальными "
+            "диапазонами (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)"
+        )
+
+    hosts = list(network.hosts()) or [network.network_address]
+    if len(hosts) > MAX_SCAN_HOSTS:
+        raise OnvifError(
+            f"{network} — это {len(hosts)} адресов, больше лимита {MAX_SCAN_HOSTS}. "
+            "Укажите более узкую маску, например /24"
+        )
+
+    targets = [(str(ip), port) for ip in hosts for port in ports]
+    found: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for device in pool.map(lambda t: _is_onvif_device(t[0], t[1], timeout), targets):
+            if device:
+                # Камера может слушать несколько портов сразу — оставляем первый
+                # найденный, порядок targets детерминирован (порты по возрастанию).
+                found.setdefault(device["host"], device)
+    return list(found.values())
 
 
 def is_motion_event(topic: str | None, state: str | None = None) -> bool:
