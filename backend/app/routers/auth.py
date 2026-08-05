@@ -48,23 +48,33 @@ async def login(request: Request, form: OAuth2PasswordRequestForm = Depends(), d
     redis = get_redis()
     ip = real_ip(request)
     key = f"login_fail:{ip}:{form.username}"
+    # Резервируем слот попытки через атомарный INCR *до* bcrypt-проверки, а
+    # не инкрементируем счётчик только при неудаче постфактум. До PR #35
+    # verify_password() выполнялся синхронно внутри async-обработчика и
+    # блокировал единственный event loop uvicorn на всё время подсчёта
+    # хэша — это случайно сериализовало конкурентные /login-запросы и
+    # маскировало гонку в TOCTOU-паттерне "читаем счётчик → проверяем
+    # пароль → инкрементируем при неудаче": пачка одновременных запросов
+    # могла прочитать один и тот же счётчик "ещё не превышен" ДО того, как
+    # хоть один из них успевал его увеличить. PR #35 перенёс bcrypt в
+    # threadpool (asyncio.to_thread) специально для того, чтобы конкурентные
+    # запросы больше не блокировали друг друга — но тем самым снял и
+    # случайную сериализацию, которая держала гонку не эксплуатируемой на
+    # практике. INCR в Redis атомарен независимо от того, сколько bcrypt-
+    # вызовов выполняется параллельно в threadpool'е — счётчик сам стал
+    # точкой синхронизации вместо однопоточности event loop'а.
     try:
-        attempts = int(await redis.get(key) or 0)
+        attempts = await redis.incr(key)
+        if attempts == 1:
+            await redis.expire(key, WINDOW_SEC)
     except Exception:
         attempts = 0
-    if attempts >= MAX_ATTEMPTS:
+    if attempts > MAX_ATTEMPTS:
         raise HTTPException(status_code=429, detail="Слишком много попыток. Повторите через несколько минут.")
 
     r = await db.execute(select(User).where(User.username == form.username))
     user = r.scalar_one_or_none()
     if not user or not await verify_password_async(form.password, user.password_hash):
-        try:
-            pipe = redis.pipeline()
-            pipe.incr(key)
-            pipe.expire(key, WINDOW_SEC)
-            await pipe.execute()
-        except Exception:
-            pass
         raise HTTPException(status_code=401, detail="Неверный логин или пароль")
 
     try:
@@ -126,21 +136,19 @@ async def change_password(
     # идентифицирует атакующего, чем IP (токен можно использовать с любого).
     redis = get_redis()
     key = f"changepw_fail:{user.id}"
+    # Тот же атомарный INCR-до-проверки паттерн, что и в /login выше — см.
+    # комментарий там про TOCTOU-гонку, которую PR #35 сделал эксплуатируемой,
+    # перенеся bcrypt в threadpool.
     try:
-        attempts = int(await redis.get(key) or 0)
+        attempts = await redis.incr(key)
+        if attempts == 1:
+            await redis.expire(key, CHANGE_PW_WINDOW_SEC)
     except Exception:
         attempts = 0
-    if attempts >= CHANGE_PW_MAX_ATTEMPTS:
+    if attempts > CHANGE_PW_MAX_ATTEMPTS:
         raise HTTPException(status_code=429, detail="Слишком много попыток. Повторите через несколько минут.")
 
     if not await verify_password_async(payload.old_password, user.password_hash):
-        try:
-            pipe = redis.pipeline()
-            pipe.incr(key)
-            pipe.expire(key, CHANGE_PW_WINDOW_SEC)
-            await pipe.execute()
-        except Exception:
-            pass
         raise HTTPException(400, "Старый пароль неверен")
 
     try:
