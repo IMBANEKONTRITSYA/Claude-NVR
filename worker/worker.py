@@ -20,8 +20,6 @@ from datetime import datetime, timedelta
 import cv2
 import base64
 import hashlib
-import urllib.request
-
 import numpy as np
 import redis
 from cryptography.fernet import Fernet
@@ -34,6 +32,7 @@ from pgvector.sqlalchemy import Vector
 from backoff import reconnect_delay
 from face_select import pick_matching_face
 from record_encode import build_encode_args
+from snapshot_http import fetch_snapshot_bytes
 from shutdown import shutdown_event, handle_shutdown_signal
 from logging_utils import configure_logging
 from hwaccel import hw_decode_requested, detect_hw_accelerator_name
@@ -473,20 +472,24 @@ def resolve_snapshot_url(onvif_config: dict | None) -> str | None:
 def fetch_snapshot_frame(snapshot_url: str, timeout: float = 4.0):
     """Скачивает и декодирует один полноразмерный кадр с камеры.
 
-    None при любой проблеме: снимок — улучшение качества, а не обязательный
-    шаг, и недоступная камера не должна ронять обработку события.
+    Само скачивание — в snapshot_http.fetch_snapshot_bytes: учётные данные
+    приходят внутри URI (их туда подставляет inject_credentials, потому что
+    ffmpeg и OpenCV читают их только из URL), а HTTP так не умеет —
+    urlopen() принимает "user:pass@host" за имя хоста и падает на резолве.
+    Там же они превращаются в нормальную Basic/Digest-аутентификацию.
+
+    None при любой проблеме: снимок — улучшение качества кропа, а не
+    обязательный шаг, и недоступная камера не должна ронять обработку
+    события; отказ при этом виден в логе, а не глохнет молча.
     """
-    try:
-        with urllib.request.urlopen(snapshot_url, timeout=timeout) as resp:  # noqa: S310 — камера локальной сети
-            data = resp.read()
-    except Exception:
-        return None
+    data = fetch_snapshot_bytes(snapshot_url, timeout)
     if not data:
         return None
     try:
         buf = np.frombuffer(data, dtype=np.uint8)
         return cv2.imdecode(buf, cv2.IMREAD_COLOR)
     except Exception:
+        logger.warning("не удалось декодировать снимок камеры", exc_info=True)
         return None
 
 
