@@ -1,14 +1,13 @@
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi import HTTPException
-from jose import jwt, JWTError
 from sqlalchemy import select, text
 from .db import engine, Base, SessionLocal
 from .models import User
-from .auth import hash_password
+from .auth import hash_password, get_user_from_query_token
 from .config import settings, insecure_secret_problems
 from .profiles import DEFAULT_PROFILE, profile_settings
 from .routers import auth as r_auth, users as r_users, cameras as r_cameras
@@ -222,15 +221,15 @@ MEDIA_KIND_ROLES: dict[str, tuple[str, ...]] = {
 
 
 @app.get("/api/media/{kind}/{name}")
-async def media_file(kind: str, name: str, token: str = Query(...)):
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
-    except JWTError:
-        raise HTTPException(401, "Не авторизован")
+async def media_file(kind: str, name: str, user=Depends(get_user_from_query_token)):
+    # Роль берётся из БД (get_user_from_query_token), а не из claim'а токена:
+    # набор разрешённых ролей здесь зависит от вида медиа, и разжалованный из
+    # operator в viewer не должен скачивать сегменты архива ещё 30 минут до
+    # истечения access-токена — ровно то, что MEDIA_KIND_ROLES и запрещает.
     allowed_roles = MEDIA_KIND_ROLES.get(kind)
     if allowed_roles is None:
         raise HTTPException(404)
-    if payload.get("role") not in allowed_roles:
+    if user.role not in allowed_roles:
         raise HTTPException(403, "Недостаточно прав")
     name = os.path.basename(name)  # защита от ../ в имени
     path = os.path.join(settings.MEDIA_PATH, kind, name)

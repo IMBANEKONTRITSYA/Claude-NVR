@@ -1,14 +1,12 @@
 import os
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
-from jose import jwt, JWTError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from ..config import settings
 from ..db import get_db
 from ..models import VideoSegment, FaceEvent
-from ..auth import require_role
+from ..auth import require_role, require_role_query
 from ..schemas import SegmentOut
 
 router = APIRouter(prefix="/api/archive", tags=["archive"])
@@ -53,13 +51,18 @@ async def list_segments(
 
 
 @router.get("/file/{seg_id}")
-async def download_segment(seg_id: int, token: str = Query(...), db: AsyncSession = Depends(get_db)):
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
-        if payload.get("role") not in ("admin", "operator"):
-            raise HTTPException(403, "Недостаточно прав")
-    except JWTError:
-        raise HTTPException(401, "Не авторизован")
+async def download_segment(
+    seg_id: int,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_role_query("admin", "operator")),
+):
+    """Скачивание файла сегмента архива.
+
+    Токен в query string (ссылка открывается браузером напрямую), но роль
+    сверяется с БД: разжалованный в viewer не должен скачивать записи ещё
+    30 минут до истечения access-токена — матрица прав ТЗ отдаёт архив
+    только admin/operator.
+    """
     seg = await db.get(VideoSegment, seg_id)
     if not seg or not os.path.exists(seg.file_path):
         raise HTTPException(404, "Файл не найден")

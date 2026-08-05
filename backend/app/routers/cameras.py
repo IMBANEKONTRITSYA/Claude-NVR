@@ -2,13 +2,12 @@ import os
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
-from jose import jwt, JWTError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from ..config import settings
 from ..db import get_db
 from ..models import Camera
-from ..auth import require_role, get_current_user
+from ..auth import require_role, get_current_user, get_user_from_query_token
 from ..schemas import OnvifBulkAddRequest, OnvifDescribeRequest, CameraIn, CameraOut, OnvifProfilesRequest, OnvifStreamUriRequest, ROIIn, RtspTest
 from ..services.encryption import encrypt, decrypt
 from ..services.pubsub import get_redis
@@ -129,11 +128,16 @@ async def put_roi(cam_id: int, payload: ROIIn, _=Depends(require_role("admin", "
 
 
 @router.get("/{cam_id}/snapshot")
-async def snapshot(cam_id: int, token: str = Query(...)):
-    try:
-        jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
-    except JWTError:
-        raise HTTPException(401, "Не авторизован")
+async def snapshot(cam_id: int, _=Depends(get_user_from_query_token)):
+    """Последний кадр камеры (Стена, дашборд) — токен в query, потому что
+    <img src> не умеет слать заголовок Authorization.
+
+    Роль не проверяется намеренно: матрица прав ТЗ разрешает живой просмотр
+    всем трём ролям, тот же контракт, что у hls_auth(). Но существование
+    учётной записи проверяется по БД, а не одной лишь подписью токена, —
+    иначе удалённый пользователь продолжал бы смотреть кадры со всех камер
+    до истечения access-токена.
+    """
     path = os.path.join(settings.MEDIA_PATH, "snapshots", f"cam{cam_id}_latest.jpg")
     if not os.path.exists(path):
         raise HTTPException(404, "Нет кадра")

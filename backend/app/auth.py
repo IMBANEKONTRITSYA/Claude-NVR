@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Query, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
 from passlib.context import CryptContext
@@ -137,7 +137,14 @@ async def revoke_all_user_tokens(db: AsyncSession, user_id: int) -> None:
     await db.commit()
 
 
-async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)) -> User:
+async def user_from_token(token: str, db: AsyncSession) -> User:
+    """Разбирает access-токен и возвращает пользователя ИЗ БД.
+
+    Единственное место, где токен превращается в личность: и заголовочный
+    путь (get_current_user), и «ссылочный» (get_user_from_query_token)
+    проходят здесь, поэтому подпись, наличие `sub` и существование учётной
+    записи проверяются для обоих одинаково.
+    """
     cred_exc = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Не авторизован")
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
@@ -153,8 +160,52 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
     return user
 
 
+async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)) -> User:
+    return await user_from_token(token, db)
+
+
+async def get_user_from_query_token(
+    token: str = Query(..., description="JWT access-токен"),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """То же, что get_current_user, но токен берётся из query string.
+
+    Часть эндпоинтов открывается браузером как обычная ссылка (медиа-файлы,
+    выгрузки отчётов и аудита, скачивание сегмента архива, Prometheus,
+    WebSocket'ы) — там нет возможности поставить заголовок Authorization,
+    поэтому токен передаётся параметром `?token=`. Способ доставки токена —
+    единственное, что отличает эти эндпоинты от остальных; проверки должны
+    быть теми же.
+
+    Раньше каждый такой обработчик звал `jwt.decode` сам и брал роль прямо
+    из claim'а, не заглядывая в БД. Токен подписан, так что подделать роль
+    было нельзя, но claim фиксирует состояние на момент выдачи, а не
+    текущее: до истечения access-токена (30 минут по умолчанию) удалённый
+    пользователь продолжал скачивать записи архива, медиа-файлы и выгрузки,
+    а разжалованный из admin в viewer — экспортировать журнал аудита
+    целиком. На эндпоинтах с `require_role` то же самое отсекалось сразу,
+    потому что get_current_user ходит в БД за пользователем и его ролью, —
+    расхождение выходило не в дизайне, а в том, что проверка была написана
+    руками в обход общей.
+    """
+    return await user_from_token(token, db)
+
+
 def require_role(*roles: str):
     async def checker(user: User = Depends(get_current_user)) -> User:
+        if user.role not in roles:
+            raise HTTPException(status_code=403, detail="Недостаточно прав")
+        return user
+    return checker
+
+
+def require_role_query(*roles: str):
+    """require_role для эндпоинтов с токеном в query string.
+
+    Роль сверяется с `User.role` из БД, а не с claim'ом токена, — см.
+    get_user_from_query_token.
+    """
+    async def checker(user: User = Depends(get_user_from_query_token)) -> User:
         if user.role not in roles:
             raise HTTPException(status_code=403, detail="Недостаточно прав")
         return user
