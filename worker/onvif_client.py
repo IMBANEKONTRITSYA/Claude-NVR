@@ -256,6 +256,84 @@ def get_profiles(
     return profiles
 
 
+def select_stream_profiles(profiles: list[dict]) -> tuple[dict | None, dict | None]:
+    """Выбирает (основной поток, субпоток) из списка профилей камеры.
+
+    По разрешению — только когда оно известно минимум у двух профилей.
+    Иначе по порядку из GetProfiles: по конвенции ONVIF основной профиль
+    идёт первым.
+
+    Первая версия сортировала по разрешению всегда, а профилям без него
+    давала вес -1. На прошивках, которые не возвращают
+    VideoEncoderConfiguration в GetProfiles (таких много — камера отдаёт
+    только token и Name), это давало ровно обратный результат: «самым
+    большим» оказывался последний профиль списка, то есть субпоток, и он
+    записывался в камеру как основной поток, а субпоток оставался пустым.
+    Дальше воркер и анализировал, и писал архив с низкоразрешающего
+    субпотока — лица в карточках получались нечитаемыми.
+    """
+    if not profiles:
+        return None, None
+    with_resolution = [p for p in profiles if p.get("width") and p.get("height")]
+    if len(with_resolution) >= 2:
+        ranked = sorted(with_resolution, key=lambda p: p["width"] * p["height"])
+        return ranked[-1], ranked[0]
+    return profiles[0], (profiles[1] if len(profiles) > 1 else None)
+
+
+def get_snapshot_uri(
+    host: str, port: int, profile_token: str, username: str | None, password: str | None,
+    timeout: float = 5.0,
+) -> str | None:
+    """GetSnapshotUri: HTTP-адрес, по которому камера отдаёт один кадр JPEG.
+
+    Нужен, чтобы снимок лица резался из полноразмерного кадра, а не из
+    субпотока 640×360, на котором идёт детекция. Постоянно декодировать
+    основной поток ради этого нельзя — на 16 камерах это ровно та нагрузка,
+    которую раздел 18 ТЗ велит избегать. Снимок же берётся одним HTTP-GET и
+    только в момент события, а не на каждый кадр.
+
+    None вместо исключения: GetSnapshotUri поддерживают не все прошивки, и
+    его отсутствие должно означать откат на кроп из кадра аналитики, а не
+    отказ обрабатывать камеру.
+    """
+    url = f"http://{host}:{port}/onvif/Media"
+    body = (
+        f'<GetSnapshotUri xmlns="{_MEDIA_NS}">'
+        f"<ProfileToken>{_xml_escape(profile_token)}</ProfileToken>"
+        "</GetSnapshotUri>"
+    )
+    try:
+        raw = _post(url, _soap_envelope(body, username, password), timeout)
+        root = ET.fromstring(raw)
+    except (OnvifError, ET.ParseError, DefusedXmlException):
+        return None
+    uri_elem = _find_one(root, "Uri")
+    if uri_elem is None or not (uri_elem.text or "").strip():
+        return None
+    return inject_credentials(uri_elem.text.strip(), username, password)
+
+
+def scale_bbox(bbox, from_size: tuple[int, int], to_size: tuple[int, int]) -> tuple[int, int, int, int]:
+    """Переносит рамку лица из системы координат одного кадра в другую.
+
+    Детекция идёт на субпотоке, а кроп — из полноразмерного снимка, поэтому
+    координаты рамки нужно пересчитать. Стороны масштабируются независимо:
+    у основного потока и субпотока соотношение сторон совпадает не всегда
+    (16:9 против 4:3 встречается на практике).
+    """
+    fw, fh = from_size
+    tw, th = to_size
+    if not fw or not fh:
+        return tuple(int(v) for v in bbox)
+    kx, ky = tw / fw, th / fh
+    x1, y1, x2, y2 = bbox
+    return (
+        max(0, int(x1 * kx)), max(0, int(y1 * ky)),
+        min(tw, int(x2 * kx)), min(th, int(y2 * ky)),
+    )
+
+
 def get_device_information(
     host: str, port: int, username: str | None, password: str | None, timeout: float = 5.0,
 ) -> dict:
