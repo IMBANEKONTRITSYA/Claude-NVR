@@ -107,6 +107,27 @@ def abspath(rel: str) -> str:
 
 
 def process_event(event_id: int, force: bool = False):
+    """Улучшение снимка одного события: чтение → инференс → запись.
+
+    Три фазы, и граница между ними — требование к 24/7-работе, а не
+    стилистика: **сессия БД не должна быть открыта во время улучшения
+    картинки.** Раньше всё стояло внутри одного `with Session()`, и
+    транзакция, открытая первым же `s.get(FaceEvent, ...)`, жила до
+    `s.commit()` — то есть сквозь `cv2.imread`, весь прогон GFPGAN и
+    `cv2.imwrite`.
+
+    Это дольше, чем звучит: апскейл идёт под `os.nice(10)` (ТЗ 18.6 —
+    фоновые задачи не конкурируют с детекцией за CPU), поэтому на целевом
+    железе (N100) секунды на кадр — норма, а OpenCV-fallback с
+    `fastNlMeansDenoisingColored` немногим быстрее GFPGAN. Всё это время
+    строка `face_events` оставалась заблокированной на запись, и `DELETE`
+    из ротации (`worker.cleanup_old`) ждал её, вместо того чтобы чистить
+    архив. Плюс постоянно открытая транзакция не даёт autovacuum убирать
+    мёртвые версии строк — при пуле по умолчанию (5 соединений) этого
+    сервиса хватало, чтобы держать горизонт видимости открытым почти
+    всегда.
+    """
+    # --- Фаза 1: БД. Что улучшать. -------------------------------------
     with Session() as s:
         ev = s.get(FaceEvent, event_id)
         if not ev:
@@ -116,41 +137,60 @@ def process_event(event_id: int, force: bool = False):
         src_rel = ev.orig_snapshot_path or ev.snapshot_path
         if not src_rel:
             return
-        src = abspath(src_rel)
-        if not os.path.exists(src):
-            print(f"[upscaler] нет файла {src}", flush=True)
-            return
-        img = cv2.imread(src)
-        if img is None:
-            return
-
-        out_img, backend = enhance(img)
-
-        name = os.path.basename(src_rel)
-        enh_rel = f"snapshots/enh_{name}"
-        cv2.imwrite(abspath(enh_rel), out_img, [cv2.IMWRITE_JPEG_QUALITY, 92])
-
         prev_snapshot = ev.snapshot_path
+        person_id = ev.person_id
+
+    # --- Фаза 2: инференс. Открытой сессии БД здесь нет. ---------------
+    src = abspath(src_rel)
+    if not os.path.exists(src):
+        print(f"[upscaler] нет файла {src}", flush=True)
+        return
+    img = cv2.imread(src)
+    if img is None:
+        return
+
+    out_img, backend = enhance(img)
+
+    name = os.path.basename(src_rel)
+    enh_rel = f"snapshots/enh_{name}"
+    cv2.imwrite(abspath(enh_rel), out_img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+
+    # --- Фаза 3: БД. Результат. ----------------------------------------
+    with Session() as s:
+        ev = s.get(FaceEvent, event_id)
+        if ev is None:
+            # Пока шёл апскейл, событие удалила ротация по сроку хранения.
+            # Раньше такого исхода не бывало: открытая транзакция держала
+            # строку, и удаление ждало. Теперь оно проходит, а улучшенный
+            # файл остаётся сиротой — убираем сразу, не дожидаясь, пока
+            # его подберёт очистка по mtime.
+            try:
+                os.remove(abspath(enh_rel))
+            except OSError:
+                pass
+            print(f"[upscaler] событие {event_id} удалено во время апскейла", flush=True)
+            return
         ev.snapshot_path = enh_rel
         ev.enhanced = True
 
         # Обновляем аватар персоны, если он указывал на исходный/прежний снимок
-        person = s.get(Person, ev.person_id) if ev.person_id else None
+        person = s.get(Person, person_id) if person_id else None
         if person and person.avatar_path in (src_rel, prev_snapshot, None):
             person.avatar_path = enh_rel
         s.commit()
 
-        try:
-            r.publish("faces:enhanced", json.dumps({
-                "type": "enhanced",
-                "event_id": ev.id,
-                "person_id": ev.person_id,
-                "snapshot": enh_rel,
-                "backend": backend,
-            }))
-        except Exception:
-            pass
-        print(f"[upscaler] событие {event_id} улучшено ({backend})", flush=True)
+    # --- Публикация. Сессия уже закрыта. -------------------------------
+    try:
+        r.publish("faces:enhanced", json.dumps({
+            "type": "enhanced",
+            "event_id": event_id,
+            "person_id": person_id,
+            "snapshot": enh_rel,
+            "backend": backend,
+        }))
+    except Exception:
+        pass
+    print(f"[upscaler] событие {event_id} улучшено ({backend})", flush=True)
 
 
 def _lower_priority():
