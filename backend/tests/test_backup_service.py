@@ -42,3 +42,36 @@ def test_backup_retention_cleans_old_dumps():
         "run.sh должен удалять дампы старше BACKUP_RETENTION_DAYS, иначе диск "
         "заполнится бэкапами бесконечно"
     )
+
+
+def test_backup_mount_is_readonly():
+    """./backup смонтирован :ro в docker-compose.yml — сам скрипт не должен
+    модифицироваться из контейнера. Это делает следующий тест обязательным:
+    любая команда в entrypoint.sh, пишущая в /backup (включая chmod),
+    обязана быть не-фатальной."""
+    mount = _compose()["services"]["backup"]["volumes"]
+    assert any(v.startswith("./backup:/backup:ro") for v in mount)
+
+
+def test_backup_entrypoint_chmod_is_not_fatal_on_readonly_mount():
+    """Регрессия: entrypoint.sh раньше делал безусловный `chmod +x
+    /backup/run.sh` под `set -eu`, при том что ./backup смонтирован :ro
+    (см. test_backup_mount_is_readonly) — chmod на read-only bind-mount
+    всегда возвращает "Read-only file system", и `set -eu` валил entrypoint
+    целиком на каждом старте контейнера. Бэкап не работал вообще, не
+    только на Windows: `docker compose up` на любом хосте гарантированно
+    приводил к CrashLoop сервиса backup. run.sh уже имеет +x, закоммиченный
+    в git (режим 755) — chmod здесь нужен только как best-effort защита от
+    чекаутов, теряющих exec-бит, и не должен быть фатальным."""
+    entrypoint = (ROOT / "backup" / "entrypoint.sh").read_text(encoding="utf-8")
+    for line in entrypoint.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("chmod") and "run.sh" in stripped:
+            assert "|| true" in stripped or "2>/dev/null" in stripped, (
+                f"chmod на файл внутри read-only mount ./backup должен быть "
+                f"не-фатальным (|| true), иначе валит весь entrypoint под "
+                f"set -eu: {stripped!r}"
+            )
+            return
+    # Строки chmod run.sh больше нет вообще — тоже приемлемо (run.sh и так
+    # +x в git), просто нечего проверять дальше.
