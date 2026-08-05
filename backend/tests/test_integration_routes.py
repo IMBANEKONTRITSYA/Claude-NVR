@@ -447,6 +447,35 @@ def test_audit_log_records_export_operations(client, admin_token):
         assert rec["status_code"] == 200
 
 
+def test_audit_log_records_plaintext_rtsp_credential_read(client, admin_headers, request):
+    """Production path: настоящая камера в Postgres с зашифрованной ссылкой,
+    настоящее чтение `GET /api/cameras/{id}/rtsp`, которое возвращает адрес с
+    логином и паролем расшифрованными. Раскрытие секрета должно оставлять
+    след — до фикса цикла 20 не оставляло (GET не аудировался вообще)."""
+    name = _unique("audit-rtsp-cam", request)
+    r = client.post(
+        "/api/cameras",
+        json={"name": name, "rtsp_url": "rtsp://user:secret@cam/stream"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    cam_id = r.json()["id"]
+    try:
+        r = client.get(f"/api/cameras/{cam_id}/rtsp", headers=admin_headers)
+        assert r.status_code == 200, r.text
+        assert "secret" in r.json()["rtsp_url"]  # секрет действительно раскрыт
+
+        found = _audit_records(
+            client, admin_headers,
+            action="Просмотр RTSP-адреса", path=f"/api/cameras/{cam_id}/rtsp", username="admin",
+        )
+        assert found, "чтение RTSP-адреса с учётными данными не попало в журнал аудита"
+        assert found[0]["method"] == "GET"
+        assert found[0]["status_code"] == 200
+    finally:
+        client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
+
+
 def test_audit_log_records_performance_profile_change(client, admin_headers):
     """Строка матрицы прав «Смена профиля производительности» (только admin)
     не писалась в журнал вовсе: ключа с этим путём в карте не было, а

@@ -97,6 +97,22 @@ def test_audit_map_has_no_entries_for_routes_that_no_longer_exist():
     assert not stale, f"ключи карты аудита без соответствующего роута: {stale}"
 
 
+def test_plaintext_secret_reads_are_audited():
+    """Роуты, отдающие секреты расшифрованными, должны оставлять след.
+
+    Статически «выдаёт секрет» не определить, поэтому список явный — но
+    зафиксировать его тестом всё равно нужно: оба роута GET, то есть до
+    фикса цикла 20 не аудировались в принципе, а выдают они RTSP-адрес с
+    паролем камеры и токен Telegram-бота.
+    """
+    for key in (
+        ("GET", "/api/cameras/{cam_id}/rtsp"),
+        ("GET", "/api/settings"),
+    ):
+        assert key in _app_routes(), f"роут {key} исчез — обновите список"
+        assert key in ACTIONS, f"чтение секрета {key} не пишется в журнал аудита"
+
+
 def test_not_audited_entries_carry_a_reason():
     empty = sorted(k for k, reason in NOT_AUDITED.items() if not (reason or "").strip())
     assert not empty, f"NOT_AUDITED без причины: {empty}"
