@@ -91,6 +91,50 @@ jobs:
           pip install pytest fastapi httpx defusedxml
           pytest tests/ -q
 
+  upscaler:
+    runs-on: ubuntu-latest
+    # До цикла 20 у сервиса апскейла не было ни тестов, ни CI-джобы —
+    # единственный сервис проекта без покрытия вообще, и найденный в цикле
+    # 20 P1 (сессия БД, открытая на всё время инференса) сидел именно там.
+    # Postgres нужен по-настоящему: проверка смотрит в pg_stat_activity и
+    # проверяет, что ротация может удалить строку во время апскейла, —
+    # на моках ни то, ни другое не наблюдаемо.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facewatch
+          POSTGRES_PASSWORD: facewatch
+          POSTGRES_DB: facewatch_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U facewatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://facewatch:facewatch@localhost:5432/facewatch_test
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install upscaler deps (без GFPGAN/torch)
+        working-directory: upscaler
+        # Полный requirements.txt тянет torch/basicsr/gfpgan — гигабайты и
+        # минуты сборки. Сам GFPGAN импортируется лениво, внутри
+        # _load_gfpgan(), поэтому модуль импортируется и тестируется без
+        # него; в тестах enhance() и так подменяется, потому что прогон
+        # модели в CI недопустимо долгий.
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy opencv-python-headless sqlalchemy psycopg2-binary redis pytest
+      - name: Run upscaler tests
+        working-directory: upscaler
+        run: pytest tests/ -q
+
   frontend:
     runs-on: ubuntu-latest
     steps:
