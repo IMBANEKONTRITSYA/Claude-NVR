@@ -8,6 +8,11 @@ from ..db import get_db
 from ..models import Setting
 from ..auth import require_role
 from ..profiles import PROFILES, profile_settings
+from ..services.encryption import (
+    SECRET_SETTING_KEYS,
+    decrypt_setting,
+    encrypt_setting,
+)
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -64,10 +69,25 @@ class SettingsUpdate(BaseModel):
     record_iframe_only: int | None = None
 
 
+def _visible(rows) -> dict[str, str]:
+    """Настройки в виде, пригодном для админки: секреты расшифровываются.
+
+    Эндпоинт и так admin-only и и до этого фикса отдавал токен бота открытым
+    (форма настроек сохраняется целиком, поэтому маска вместо значения
+    затёрла бы токен при первом же сохранении) — шифрование здесь про
+    хранение, не про передачу: цель в том, чтобы токена не было открытым
+    текстом в БД и в дампах pg_dump, которые backup/run.sh держит 14 дней.
+    """
+    out = {}
+    for s in rows:
+        out[s.key] = decrypt_setting(s.value) if s.key in SECRET_SETTING_KEYS else s.value
+    return out
+
+
 @router.get("")
 async def get_settings(_=Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(select(Setting))).scalars().all()
-    return {s.key: s.value for s in rows}
+    return _visible(rows)
 
 
 @router.put("")
@@ -87,11 +107,14 @@ async def update_settings(payload: SettingsUpdate, _=Depends(require_role("admin
         allowed = ENUMS.get(key)
         if allowed and casted not in allowed:
             raise HTTPException(400, f"{key}: допустимые значения — {', '.join(sorted(allowed))}")
+        stored = str(casted)
+        if key in SECRET_SETTING_KEYS:
+            stored = encrypt_setting(stored)
         existing = await db.get(Setting, key)
         if existing:
-            existing.value = str(casted)
+            existing.value = stored
         else:
-            db.add(Setting(key=key, value=str(casted)))
+            db.add(Setting(key=key, value=stored))
     # Ручная правка параметра профиля переводит его в режим «своя настройка»
     if any(k in PROFILE_TUNABLES for k in data):
         prof = await db.get(Setting, "performance_profile")
@@ -99,7 +122,7 @@ async def update_settings(payload: SettingsUpdate, _=Depends(require_role("admin
             prof.value = "custom"
     await db.commit()
     rows = (await db.execute(select(Setting))).scalars().all()
-    return {s.key: s.value for s in rows}
+    return _visible(rows)
 
 
 PROFILE_TUNABLES = {
@@ -136,12 +159,12 @@ async def apply_profile(name: str, _=Depends(require_role("admin")), db: AsyncSe
             db.add(Setting(key=key, value=val))
     await db.commit()
     rows = (await db.execute(select(Setting))).scalars().all()
-    return {s.key: s.value for s in rows}
+    return _visible(rows)
 
 
 @router.post("/test-telegram")
 async def test_telegram(_=Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
-    rows = {s.key: s.value for s in (await db.execute(select(Setting))).scalars().all()}
+    rows = _visible((await db.execute(select(Setting))).scalars().all())
     token = rows.get("telegram_bot_token", "")
     chat = rows.get("telegram_chat_id", "")
     if not token or not chat:
