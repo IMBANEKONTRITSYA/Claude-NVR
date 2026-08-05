@@ -32,6 +32,7 @@ from pgvector.sqlalchemy import Vector
 
 from backoff import reconnect_delay
 from face_select import pick_matching_face
+from fileage import prune_media
 from record_encode import build_encode_args
 from snapshot_http import fetch_snapshot_bytes
 from shutdown import shutdown_event, handle_shutdown_signal
@@ -1211,30 +1212,14 @@ def cleanup_old():
             s.delete(seg)
         s.execute(delete(FaceEvent).where(FaceEvent.ts < cutoff))
         s.commit()
-    snap_dir = os.path.join(MEDIA_PATH, "snapshots")
-    if os.path.isdir(snap_dir):
-        for f in os.listdir(snap_dir):
-            if f.endswith("_latest.jpg"):
-                continue
-            p = os.path.join(snap_dir, f)
-            try:
-                if datetime.fromtimestamp(os.path.getmtime(p)) < cutoff:
-                    os.remove(p)
-            except Exception:
-                pass
-    # Осиротевшие временные сегменты (например, после падения процесса)
-    seg_dir = os.path.join(MEDIA_PATH, "segments")
-    hour_ago = datetime.utcnow() - timedelta(hours=1)
-    if os.path.isdir(seg_dir):
-        for f in os.listdir(seg_dir):
-            if not f.endswith("_tmp.mp4"):
-                continue
-            p = os.path.join(seg_dir, f)
-            try:
-                if datetime.fromtimestamp(os.path.getmtime(p)) < hour_ago:
-                    os.remove(p)
-            except Exception:
-                pass
+
+    # Возраст файлов считается в naive-UTC (fileage.mtime_utc), тем же видом
+    # времени, что и cutoff от utcnow(). Раньше здесь стоял
+    # datetime.fromtimestamp() без tz, то есть локальное время хоста, и
+    # сравнение уезжало на смещение часового пояса — см. fileage.py.
+    removed = prune_media(MEDIA_PATH, cutoff, datetime.utcnow() - timedelta(hours=1))
+    if any(removed.values()):
+        logger.info("уборка медиа-файлов", extra={"removed": removed})
 
 
 def manager():
