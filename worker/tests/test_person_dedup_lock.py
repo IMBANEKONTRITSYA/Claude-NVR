@@ -14,7 +14,6 @@ pg_advisory_xact_lock ДО SELECT ближайшего центроида (по�
 test_camera_worker_onvif_thread.py) — pytest.importorskip как и там."""
 import os
 
-import numpy as np
 import pytest
 
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
@@ -22,6 +21,12 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 worker = pytest.importorskip(
     "worker", reason="требует полный requirements.txt воркера (cv2 и т.д.), см. докстринг модуля"
 )
+# numpy импортируется только после importorskip("worker") выше: в CI (без
+# полного requirements.txt воркера) сам import numpy до этой точки уронил бы
+# сборку теста ImportError'ом вместо чистого skip, потому что worker.py
+# отсутствует именно из-за cv2, а не numpy — importorskip не успевает
+# сработать раньше жёсткого top-level import.
+np = pytest.importorskip("numpy")
 
 
 class _FakeResult:
