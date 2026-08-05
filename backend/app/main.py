@@ -187,14 +187,37 @@ async def health():
     return JSONResponse(status, status_code=200 if status["ok"] else 503)
 
 
+# Матрица прав (SPEC.md) на уровне каталогов медиа. Раньше эндпоинт ниже
+# проверял только валидность токена и раздавал любой из трёх каталогов
+# любой аутентифицированной роли — включая `segments`, то есть файлы
+# видеоархива, которые по матрице прав (строка «Архив») наблюдателю
+# запрещены. Роутер архива это ограничение соблюдает
+# (routers/archive.py: и список сегментов, и /api/archive/file/{id}
+# требуют admin/operator), но /api/media/segments/<файл> давал обходной
+# путь мимо него: имена сегментов детерминированы и легко перебираются
+# (worker.py пишет их как `cam{camera_id}_{unix_ts}.mp4`, а id камер
+# наблюдателю известны — живой просмотр ему разрешён), так что перебор
+# секунд за интересующий период выдаёт наблюдателю записи архива целиком.
+# snapshots/avatars остаются доступны всем ролям осознанно: на них
+# построены Стена и дашборд, разрешённые наблюдателю той же матрицей.
+MEDIA_KIND_ROLES: dict[str, tuple[str, ...]] = {
+    "snapshots": ("admin", "operator", "viewer"),
+    "avatars": ("admin", "operator", "viewer"),
+    "segments": ("admin", "operator"),
+}
+
+
 @app.get("/api/media/{kind}/{name}")
 async def media_file(kind: str, name: str, token: str = Query(...)):
     try:
-        jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
     except JWTError:
         raise HTTPException(401, "Не авторизован")
-    if kind not in ("snapshots", "avatars", "segments"):
+    allowed_roles = MEDIA_KIND_ROLES.get(kind)
+    if allowed_roles is None:
         raise HTTPException(404)
+    if payload.get("role") not in allowed_roles:
+        raise HTTPException(403, "Недостаточно прав")
     name = os.path.basename(name)  # защита от ../ в имени
     path = os.path.join(settings.MEDIA_PATH, kind, name)
     if not os.path.exists(path):
