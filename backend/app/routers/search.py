@@ -12,6 +12,7 @@ from sqlalchemy import text
 from ..config import settings
 from ..db import get_db
 from ..auth import require_role
+from ..params import limit_form, threshold_form
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
@@ -32,11 +33,11 @@ async def _embed(image_bytes: bytes, filename: str) -> list[float]:
 @router.post("/face")
 async def search_face(
     file: UploadFile = File(...),
-    threshold: float = Form(0.4),
+    threshold: float = threshold_form(0.4),
     date_from: datetime | None = Form(None),
     date_to: datetime | None = Form(None),
     status: str | None = Form(None),
-    limit: int = Form(100),
+    limit: int = limit_form(100),
     _=Depends(require_role("admin", "operator")),
     db: AsyncSession = Depends(get_db),
 ):

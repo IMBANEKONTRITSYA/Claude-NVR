@@ -5,6 +5,7 @@ from sqlalchemy import select, func
 from ..db import get_db
 from ..models import FaceEvent, Person
 from ..auth import get_current_user
+from ..params import days_param, limit_param
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
 
@@ -27,7 +28,7 @@ async def kpi(_=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/by-day")
-async def by_day(days: int = 14, _=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def by_day(days: int = days_param(14), _=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     since = datetime.utcnow() - timedelta(days=days)
     r = await db.execute(
         select(func.date_trunc("day", FaceEvent.ts).label("d"), func.count(FaceEvent.id))
@@ -50,7 +51,7 @@ async def by_hour(_=Depends(get_current_user), db: AsyncSession = Depends(get_db
 
 
 @router.get("/heatmap")
-async def heatmap(days: int = 30, _=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def heatmap(days: int = days_param(30), _=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """Тепловая карта: день недели (0=Пн..6=Вс) × час (0..23)."""
     since = datetime.utcnow() - timedelta(days=days)
     r = await db.execute(
@@ -69,7 +70,7 @@ async def heatmap(days: int = 30, _=Depends(get_current_user), db: AsyncSession 
 
 
 @router.get("/top-persons")
-async def top_persons(days: int = 30, limit: int = 10, _=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def top_persons(days: int = days_param(30), limit: int = limit_param(10), _=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     since = datetime.utcnow() - timedelta(days=days)
     r = await db.execute(
         select(Person.id, Person.name, Person.status, func.count(FaceEvent.id).label("c"))

@@ -68,7 +68,9 @@ jobs:
         # Цикл 19: тесты «ссылочных» эндпоинтов (test_query_token_identity.py,
         # переписанный test_media_rbac.py) подняли покрытие до 76% — порог
         # поднят до 74, чтобы разрыв с фактическим покрытием снова не рос.
-        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=74 -q
+        # Цикл 21: test_query_param_bounds.py (границы числовых параметров на
+        # 12 эндпоинтах) поднял покрытие до 78% — порог поднят до 76.
+        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=76 -q
 
   worker:
     runs-on: ubuntu-latest
