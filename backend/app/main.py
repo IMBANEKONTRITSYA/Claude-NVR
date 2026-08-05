@@ -129,10 +129,24 @@ async def lifespan(app: FastAPI):
             # detection_fps, frame_skip, face_model, upscale_mode и т.д.
             **profile_settings(DEFAULT_PROFILE),
         }
-        existing = {s.key for s in (await db.execute(select(Setting))).scalars().all()}
+        rows = (await db.execute(select(Setting))).scalars().all()
+        existing = {s.key for s in rows}
         for k, v in defaults.items():
             if k not in existing:
                 db.add(Setting(key=k, value=v))
+        # Миграция секретов на шифрование (ТЗ 13). В БД, развёрнутых до этого
+        # фикса, telegram_bot_token лежит открытым текстом — и попадает таким
+        # в дампы pg_dump, которые backup/run.sh хранит 14 дней. Значение без
+        # префикса SECRET_SETTING_PREFIX — как раз такой legacy-plaintext:
+        # дошифровываем его на старте, чтобы фикс подействовал сам, а не
+        # только после того, как администратор вручную пересохранит форму
+        # настроек. Уже зашифрованные значения префикс отсеивает, так что
+        # повторный запуск ничего не портит.
+        from .services.encryption import encrypt_setting, needs_secret_migration
+        for s in rows:
+            if needs_secret_migration(s.key, s.value):
+                s.value = encrypt_setting(s.value)
+                logger.info("секрет настроек зашифрован при миграции", extra={"key": s.key})
         await db.commit()
     yield
 

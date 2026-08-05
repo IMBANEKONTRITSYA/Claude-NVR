@@ -108,6 +108,28 @@ def _normalize_fernet_key(raw: str) -> bytes:
 fernet = Fernet(_normalize_fernet_key(FERNET_KEY))
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
+# Секреты в таблице settings хранятся зашифрованными (ТЗ 13) — см.
+# backend/app/services/encryption.py, откуда взяты и префикс, и набор ключей.
+# Значение без префикса — legacy-plaintext из БД, развёрнутой до этого фикса;
+# backend дошифровывает такие значения при старте, но воркер может прочитать
+# настройки раньше, чем это произойдёт, поэтому читает оба вида.
+SECRET_SETTING_PREFIX = "enc:v1:"
+SECRET_SETTING_KEYS = frozenset({"telegram_bot_token"})
+
+
+def _decrypt_setting(stored: str) -> str:
+    """Зеркало decrypt_setting() из backend/app/services/encryption.py."""
+    if not stored or not stored.startswith(SECRET_SETTING_PREFIX):
+        return stored or ""
+    try:
+        return fernet.decrypt(stored[len(SECRET_SETTING_PREFIX):].encode()).decode()
+    except Exception:
+        # Тот же выбор, что и на бэкенде: нерасшифровываемое значение — не
+        # plaintext-токен, слать его в Telegram API нельзя. Оповещения
+        # отключатся, о причине скажет лог.
+        logger.error("не удалось расшифровать секрет настроек")
+        return ""
+
 
 class Setting(Base):
     __tablename__ = "settings"
@@ -123,8 +145,9 @@ def refresh_config():
                 caster = _CONFIG_TYPES.get(row.key)
                 if caster is None:
                     continue  # ключ не влияет на воркер (например, performance_profile)
+                value = _decrypt_setting(row.value) if row.key in SECRET_SETTING_KEYS else row.value
                 try:
-                    CONFIG[row.key] = caster(row.value) if row.value != "" else ("" if caster is str else CONFIG[row.key])
+                    CONFIG[row.key] = caster(value) if value != "" else ("" if caster is str else CONFIG[row.key])
                 except (TypeError, ValueError):
                     pass
     except Exception:
