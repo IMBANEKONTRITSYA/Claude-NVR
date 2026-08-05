@@ -11,7 +11,8 @@ FaceWatch upscaler: фоновый сервис нейросетевого ул�
 (Lanczos-апскейл + деноизинг + повышение резкости), чтобы пайплайн всегда работал.
 """
 import os
-import time
+import signal
+import threading
 import json
 
 import cv2
@@ -19,6 +20,8 @@ import numpy as np
 import redis
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey
 from sqlalchemy.orm import sessionmaker, declarative_base
+
+from logging_utils import configure_logging
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -29,7 +32,29 @@ GFPGAN_MODEL_URL = os.environ.get(
     "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth",
 )
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+logger = configure_logging("facewatch.upscaler")
+
+# Сигнал остановки. Апскейл — единственный сервис проекта, у которого до
+# цикла 21 не было graceful shutdown: `main()` крутил `while True`, и
+# `docker compose stop` глушил его SIGKILL'ом через grace period. Убить его
+# посреди `process_event()` — это осиротевший `enh_*.jpg` на диске (файл
+# записан, фаза 3 не дошла до `ev.snapshot_path = enh_rel`) плюс
+# невозвращённое в пул соединение.
+shutdown_event = threading.Event()
+
+
+def handle_shutdown_signal(signum, _frame):
+    logger.info("получен сигнал, начинаю graceful shutdown", extra={"signum": signum})
+    shutdown_event.set()
+
+
+# pool_size=2 вместо дефолтных 5+10: сервис однопоточный, больше одного
+# соединения одновременно ему не нужно никогда — второе оставлено на
+# случай, если `pool_pre_ping` признает текущее мёртвым. Дефолт означал,
+# что при каждом всплеске ошибок и переоткрытий пул мог держать до 15
+# бэкендов Postgres под сервис, которому хватает одного; на целевом железе
+# (N100, `max_connections` по умолчанию) это отнимало слоты у backend'а.
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=2, max_overflow=1)
 Session = sessionmaker(bind=engine)
 Base = declarative_base()
 r = redis.from_url(REDIS_URL, decode_responses=True)
@@ -95,8 +120,8 @@ def enhance(img: np.ndarray) -> tuple[np.ndarray, str]:
     if UPSCALE_BACKEND == "gfpgan":
         try:
             return enhance_gfpgan(img), "gfpgan"
-        except Exception as e:
-            print(f"[upscaler] GFPGAN недоступен ({e}); fallback на OpenCV", flush=True)
+        except Exception:
+            logger.warning("GFPGAN недоступен, fallback на OpenCV", exc_info=True)
     return enhance_opencv(img), "opencv"
 
 
@@ -143,7 +168,7 @@ def process_event(event_id: int, force: bool = False):
     # --- Фаза 2: инференс. Открытой сессии БД здесь нет. ---------------
     src = abspath(src_rel)
     if not os.path.exists(src):
-        print(f"[upscaler] нет файла {src}", flush=True)
+        logger.warning("нет исходного файла снимка", extra={"event_id": event_id, "path": src})
         return
     img = cv2.imread(src)
     if img is None:
@@ -168,7 +193,7 @@ def process_event(event_id: int, force: bool = False):
                 os.remove(abspath(enh_rel))
             except OSError:
                 pass
-            print(f"[upscaler] событие {event_id} удалено во время апскейла", flush=True)
+            logger.info("событие удалено во время апскейла", extra={"event_id": event_id})
             return
         ev.snapshot_path = enh_rel
         ev.enhanced = True
@@ -189,8 +214,9 @@ def process_event(event_id: int, force: bool = False):
             "backend": backend,
         }))
     except Exception:
-        pass
-    print(f"[upscaler] событие {event_id} улучшено ({backend})", flush=True)
+        logger.warning("не удалось опубликовать faces:enhanced", exc_info=True,
+                       extra={"event_id": event_id})
+    logger.info("событие улучшено", extra={"event_id": event_id, "backend": backend})
 
 
 def _lower_priority():
@@ -205,27 +231,53 @@ def _lower_priority():
 
 def main():
     _lower_priority()
-    print(f"[upscaler] старт, backend={UPSCALE_BACKEND}", flush=True)
+    logger.info("старт апскейлера", extra={"backend": UPSCALE_BACKEND})
     if UPSCALE_BACKEND == "gfpgan":
         try:
             _load_gfpgan()
-            print("[upscaler] модель GFPGAN загружена", flush=True)
-        except Exception as e:
-            print(f"[upscaler] не удалось загрузить GFPGAN заранее ({e})", flush=True)
-    while True:
+            logger.info("модель GFPGAN загружена")
+        except Exception:
+            logger.warning("не удалось загрузить GFPGAN заранее", exc_info=True)
+    # Таймаут blpop — верхняя граница задержки реакции на SIGTERM: пока
+    # висит блокирующее чтение очереди, установленный из обработчика сигнала
+    # флаг не проверяется. 2с с запасом укладываются в grace period
+    # `docker compose stop` (10с по умолчанию).
+    while not shutdown_event.is_set():
         try:
-            item = r.blpop("upscale:queue", timeout=5)
+            item = r.blpop("upscale:queue", timeout=2)
             if not item:
                 continue
             payload = json.loads(item[1])
             eid = payload.get("event_id")
             if eid is not None:
                 process_event(int(eid), force=bool(payload.get("force")))
-        except Exception as e:
-            print(f"[upscaler] ошибка: {e}", flush=True)
-            time.sleep(1)
+        except Exception:
+            logger.error("ошибка обработки задачи апскейла", exc_info=True)
+            # Прерываемая пауза: на нерабочем Redis/БД сервис не должен
+            # игнорировать сигнал остановки лишнюю секунду на каждой итерации.
+            shutdown_event.wait(1)
+
+    # Освобождение ресурсов — то, ради чего graceful shutdown и нужен:
+    # соединения пула закрываются штатным `terminate`, а не остаются
+    # висеть на сервере до `tcp_keepalives_idle`.
+    logger.info("завершение: закрываю соединения")
+    try:
+        engine.dispose()
+    except Exception:
+        logger.warning("не удалось закрыть пул соединений БД", exc_info=True)
+    try:
+        r.close()
+    except Exception:
+        logger.warning("не удалось закрыть соединение Redis", exc_info=True)
+    logger.info("апскейлер остановлен")
 
 
 if __name__ == "__main__":
-    time.sleep(8)
-    main()
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
+    # Стартовая пауза (БД/Redis поднимаются параллельно) — тоже прерываемая:
+    # SIGTERM в первые 8 секунд после `docker compose up` не должен ждать
+    # их истечения.
+    shutdown_event.wait(8)
+    if not shutdown_event.is_set():
+        main()
