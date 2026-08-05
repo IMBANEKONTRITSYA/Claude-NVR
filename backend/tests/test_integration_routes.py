@@ -499,3 +499,73 @@ def test_change_password_succeeds_and_resets_counter_below_limit(client, admin_h
         headers=headers,
     )
     assert r.status_code == 200, r.text
+
+
+def test_onvif_bulk_add_creates_cameras_and_reports_failures(client, admin_headers, monkeypatch):
+    """Массовое добавление найденных камер (ТЗ 18.7).
+
+    Проверяется главное свойство: ошибка на одной камере не отменяет
+    остальных. В сети из двух-трёх десятков устройств одно почти наверняка
+    окажется недоступным или с другим паролем, и терять из-за него всю
+    операцию — плохой обмен.
+    """
+    import httpx as httpx_module
+
+    responses = {
+        "10.9.9.1": {"ok": True, "name": "NewEntraceKPP",
+                     "rtsp_url": "rtsp://admin:pw@10.9.9.1/main",
+                     "sub_rtsp_url": "rtsp://admin:pw@10.9.9.1/sub"},
+        "10.9.9.2": {"ok": True, "name": "Склад",
+                     "rtsp_url": "rtsp://admin:pw@10.9.9.2/main", "sub_rtsp_url": None},
+        "10.9.9.3": {"ok": False, "error": "неверный пароль"},
+    }
+
+    class _FakeResponse:
+        def __init__(self, body):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    async def _fake_post(self, url, **kwargs):
+        host = kwargs["json"]["host"]
+        return _FakeResponse(responses[host])
+
+    monkeypatch.setattr(httpx_module.AsyncClient, "post", _fake_post)
+
+    r = client.post(
+        "/api/cameras/onvif/bulk-add",
+        json={"cameras": [
+            {"host": "10.9.9.1", "port": 80, "username": "admin", "password": "pw"},
+            {"host": "10.9.9.2", "port": 80, "username": "admin", "password": "pw"},
+            {"host": "10.9.9.3", "port": 80, "username": "admin", "password": "wrong"},
+        ]},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert [a["name"] for a in body["added"]] == ["NewEntraceKPP", "Склад"]
+    assert body["added"][0]["has_substream"] is True
+    assert body["added"][1]["has_substream"] is False, "камера с одним профилем — без субпотока"
+    assert [f["host"] for f in body["failed"]] == ["10.9.9.3"]
+    assert "неверный пароль" in body["failed"][0]["error"]
+
+    # Повторный запуск не должен задваивать уже добавленные камеры: поиск
+    # по сети администратор запускает не один раз.
+    again = client.post(
+        "/api/cameras/onvif/bulk-add",
+        json={"cameras": [{"host": "10.9.9.1", "port": 80, "username": "admin", "password": "pw"}]},
+        headers=admin_headers,
+    )
+    assert again.status_code == 200
+    assert again.json()["added"] == []
+    assert again.json()["skipped"][0]["host"] == "10.9.9.1"
+
+    for cam in body["added"]:
+        client.delete(f"/api/cameras/{cam['id']}", headers=admin_headers)
+
+
+def test_onvif_bulk_add_is_admin_only(client):
+    r = client.post("/api/cameras/onvif/bulk-add", json={"cameras": []})
+    assert r.status_code == 401

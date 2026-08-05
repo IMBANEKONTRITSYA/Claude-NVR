@@ -135,6 +135,11 @@ export const api = {
     req("/api/cameras/test", { method: "POST", body: JSON.stringify({ rtsp_url }) }),
   onvifDiscover: (subnet?: string) =>
     req(`/api/cameras/onvif/discover${subnet ? `?subnet=${encodeURIComponent(subnet)}` : ""}`),
+  onvifBulkAdd: (cameras: any[], enabled = true, onvif_enabled = true) =>
+    req("/api/cameras/onvif/bulk-add", {
+      method: "POST",
+      body: JSON.stringify({ cameras, enabled, onvif_enabled }),
+    }),
   onvifProfiles: (host: string, port: number, username: string, password: string) =>
     req("/api/cameras/onvif/profiles", { method: "POST", body: JSON.stringify({ host, port, username, password }) }),
   onvifStreamUri: (host: string, port: number, username: string, password: string, profile_token: string) =>

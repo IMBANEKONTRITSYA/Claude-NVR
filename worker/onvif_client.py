@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 import uuid as _uuid
 from datetime import datetime, timezone
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 from xml.sax.saxutils import escape as _xml_escape
 
 # defusedxml.ElementTree — не stdlib xml.etree.ElementTree: все ответы,
@@ -239,8 +239,167 @@ def get_profiles(
             continue
         name_elem = _find_one(p, "Name")
         name = (name_elem.text or "").strip() if name_elem is not None else None
-        profiles.append({"token": token, "name": name or token})
+        # Разрешение из VideoEncoderConfiguration — по нему выбирается, какой
+        # профиль основной, а какой субпоток (ТЗ 18.1: детекция идёт на
+        # низкоразрешающем субпотоке). Выбирать по порядку в списке ненадёжно:
+        # порядок профилей прошивки не гарантируют.
+        width = height = None
+        res = _find_one(p, "Resolution")
+        if res is not None:
+            w_elem, h_elem = _find_one(res, "Width"), _find_one(res, "Height")
+            try:
+                width = int((w_elem.text or "").strip()) if w_elem is not None else None
+                height = int((h_elem.text or "").strip()) if h_elem is not None else None
+            except ValueError:
+                width = height = None
+        profiles.append({"token": token, "name": name or token, "width": width, "height": height})
     return profiles
+
+
+def get_device_information(
+    host: str, port: int, username: str | None, password: str | None, timeout: float = 5.0,
+) -> dict:
+    """GetDeviceInformation: производитель, модель, серийный номер.
+
+    Используется, чтобы предложить осмысленное имя камеры при массовом
+    добавлении. Ошибку не бросает — имя это удобство, а не обязательное
+    поле, и камера, не отдавшая его, всё равно должна добавляться.
+    """
+    url = f"http://{host}:{port}/onvif/device_service"
+    body = f'<GetDeviceInformation xmlns="{_DEVICE_NS}"/>'
+    info: dict[str, str] = {}
+    try:
+        raw = _post(url, _soap_envelope(body, username, password), timeout)
+        root = ET.fromstring(raw)
+    except (OnvifError, ET.ParseError, DefusedXmlException):
+        return info
+    for field in ("Manufacturer", "Model", "SerialNumber", "FirmwareVersion"):
+        elem = _find_one(root, field)
+        if elem is not None and (elem.text or "").strip():
+            info[field] = elem.text.strip()
+    return info
+
+
+def get_osd_texts(
+    host: str, port: int, username: str | None, password: str | None, timeout: float = 5.0,
+) -> list[str]:
+    """GetOSDs Media-сервиса: текстовые наложения, которые камера рисует
+    поверх картинки.
+
+    Именно здесь лежит самое осмысленное имя точки: администратор,
+    настраивая камеру, обычно подписывает её тем же названием, что видит на
+    экране («NewEntraceKPP», «Проходная», «Склад-2»). Поэтому OSD —
+    приоритетный источник имени при массовом добавлении.
+
+    Возвращаются только наложения типа Plain. Штатные «дата и время»
+    (Type = Date/Time/DateAndTime) отфильтровываются: как имя камеры они
+    бесполезны, а присутствуют почти всегда.
+
+    Ошибку не бросает: GetOSDs — необязательная часть Media-сервиса, и
+    камера без её поддержки должна добавляться обычным порядком, просто с
+    именем из другого источника.
+    """
+    url = f"http://{host}:{port}/onvif/Media"
+    body = f'<GetOSDs xmlns="{_MEDIA_NS}"/>'
+    try:
+        raw = _post(url, _soap_envelope(body, username, password), timeout)
+        root = ET.fromstring(raw)
+    except (OnvifError, ET.ParseError, DefusedXmlException):
+        return []
+
+    texts = []
+    for osd in _find_all(root, "OSDs"):
+        text_string = _find_one(osd, "TextString")
+        if text_string is None:
+            continue
+        type_elem = _find_one(text_string, "Type")
+        osd_type = (type_elem.text or "").strip() if type_elem is not None else ""
+        if osd_type and osd_type.lower() != "plain":
+            continue  # Date/Time/DateAndTime — не имя камеры
+        plain = _find_one(text_string, "PlainText")
+        value = (plain.text or "").strip() if plain is not None else ""
+        if value:
+            texts.append(value)
+    return texts
+
+
+# Наложения, которые встречаются как «имя», но именем не являются: часть
+# прошивок пишет в Plain-строку подстановку даты вместо типа Date.
+_OSD_NOT_A_NAME = ("дата", "время", "date", "time")
+
+
+def _osd_name_candidate(texts: list[str]) -> str | None:
+    for value in texts:
+        low = value.lower()
+        if any(marker in low for marker in _OSD_NOT_A_NAME):
+            continue
+        # Строка из одних цифр, двоеточий, точек и слэшей — это отформатированные
+        # дата/время, попавшие в Plain-текст.
+        if all(ch.isdigit() or ch in " :./-" for ch in value):
+            continue
+        return value
+    return None
+
+
+def parse_scope_name(scopes: list[str]) -> str | None:
+    """Достаёт имя устройства из ONVIF-скоупов ответа WS-Discovery.
+
+    Камера публикует своё настроенное имя в скоупе вида
+    `onvif://www.onvif.org/name/Hall%20Camera` — это ровно то имя, которое
+    администратор задал в её собственном веб-интерфейсе, поэтому лучший
+    источник для автозаполнения. Значение percent-кодировано (пробелы и
+    кириллица), поэтому раскодируется.
+
+    Текст OSD (наложение поверх картинки) здесь недоступен: он не входит в
+    WS-Discovery и вообще относится к необязательной части Media-сервиса —
+    см. комментарий к suggest_camera_name().
+    """
+    for scope in scopes or []:
+        marker = "/name/"
+        idx = scope.find(marker)
+        if idx == -1:
+            continue
+        value = unquote(scope[idx + len(marker):]).strip()
+        if value:
+            return value
+    return None
+
+
+def suggest_camera_name(
+    device: dict, info: dict | None = None, osd_texts: list[str] | None = None,
+) -> str:
+    """Предлагает имя камеры для массового добавления.
+
+    Приоритет источников — от самого осмысленного к самому техническому:
+
+    1. Текстовое наложение OSD (`GetOSDs`) — то, чем администратор подписал
+       камеру на самой картинке: «NewEntraceKPP», «Проходная». Самое
+       человеческое из доступного, поэтому первым. Дата и время
+       отфильтрованы (см. _osd_name_candidate).
+    2. Скоуп `onvif://www.onvif.org/name/...` из WS-Discovery — имя
+       устройства, заданное в его веб-интерфейсе.
+    3. `GetDeviceInformation` — «Производитель Модель»: технически, но
+       различимо. Часто единственный источник для камер, найденных
+       перебором подсети — они отвечают на пробу без скоупов.
+    4. IP-адрес — чтобы поле не осталось пустым.
+
+    Ни один источник не обязателен: GetOSDs — необязательная часть
+    Media-сервиса, скоупы приходят только из WS-Discovery, а
+    GetDeviceInformation на части прошивок требует прав, которых у
+    введённой учётки может не быть.
+    """
+    osd_name = _osd_name_candidate(osd_texts or [])
+    if osd_name:
+        return osd_name
+    name = parse_scope_name(device.get("scopes") or [])
+    if name:
+        return name
+    if info:
+        parts = [info.get("Manufacturer"), info.get("Model")]
+        combined = " ".join(p for p in parts if p).strip()
+        if combined:
+            return combined
+    return device.get("host") or "Камера"
 
 
 def get_stream_uri(

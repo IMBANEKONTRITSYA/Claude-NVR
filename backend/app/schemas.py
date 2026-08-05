@@ -193,6 +193,29 @@ class OnvifStreamUriRequest(OnvifProfilesRequest):
     profile_token: str
 
 
+class OnvifDescribeRequest(OnvifProfilesRequest):
+    """Скоупы приходят вместе с устройством из WS-Discovery — они содержат
+    имя, заданное в веб-интерфейсе камеры, и служат источником имени, когда
+    у камеры нет текстового OSD."""
+    scopes: list[str] = []
+
+
+class OnvifBulkAddItem(OnvifDescribeRequest):
+    # Имя можно переопределить в интерфейсе до добавления; пусто — берётся
+    # предложенное (OSD → скоуп → модель → IP).
+    name: str | None = None
+    location: str = ""
+
+
+class OnvifBulkAddRequest(BaseModel):
+    """Массовое добавление найденных камер. Учётные данные у каждой камеры
+    свои: в сети может быть смесь устройств с разными паролями, а требовать
+    единый пароль на все — лишнее ограничение."""
+    cameras: list[OnvifBulkAddItem]
+    enabled: bool = True
+    onvif_enabled: bool = True
+
+
 class ROIIn(BaseModel):
     polygons: list[list[list[float]]]
 

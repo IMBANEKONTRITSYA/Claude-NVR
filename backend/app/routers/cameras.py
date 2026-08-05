@@ -9,7 +9,7 @@ from ..config import settings
 from ..db import get_db
 from ..models import Camera
 from ..auth import require_role, get_current_user
-from ..schemas import CameraIn, CameraOut, OnvifProfilesRequest, OnvifStreamUriRequest, ROIIn, RtspTest
+from ..schemas import OnvifBulkAddRequest, OnvifDescribeRequest, CameraIn, CameraOut, OnvifProfilesRequest, OnvifStreamUriRequest, ROIIn, RtspTest
 from ..services.encryption import encrypt, decrypt
 from ..services.pubsub import get_redis
 
@@ -245,3 +245,119 @@ async def test_rtsp(payload: RtspTest, _=Depends(require_role("admin"))):
         return {"ok": True, "info": info}
     except FileNotFoundError:
         return {"ok": False, "error": "ffprobe недоступен на сервере"}
+
+
+async def _onvif_describe(client: httpx.AsyncClient, item) -> dict:
+    """Спрашивает у воркера имя и RTSP-адреса одной камеры."""
+    resp = await client.post(
+        f"{settings.WORKER_URL}/onvif/describe",
+        json={
+            "host": item.host, "port": item.port,
+            "username": item.username, "password": item.password,
+            "scopes": item.scopes,
+        },
+    )
+    return resp.json()
+
+
+@router.post("/onvif/describe")
+async def onvif_describe(payload: OnvifDescribeRequest, _=Depends(require_role("admin"))):
+    """Предлагаемое имя камеры и готовые RTSP-адреса основного и субпотока.
+
+    Имя берётся из текстового OSD камеры, а если его нет — из ONVIF-скоупа,
+    затем из модели устройства, затем из IP (см. suggest_camera_name в
+    worker/onvif_client.py)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            data = await _onvif_describe(client, payload)
+        except httpx.HTTPError as e:
+            raise HTTPException(503, f"Сервис распознавания недоступен: {e}")
+    if not data.get("ok"):
+        raise HTTPException(502, data.get("error") or "Не удалось опросить камеру")
+    return data
+
+
+@router.post("/onvif/bulk-add")
+async def onvif_bulk_add(
+    payload: OnvifBulkAddRequest,
+    _=Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Добавляет разом все выбранные найденные камеры (ТЗ 18.7).
+
+    Для каждой камеры запрашивается имя и оба потока, затем создаётся
+    запись. Ошибка на одной камере не отменяет остальных: в сети из десятка
+    устройств одно может оказаться недоступным или с другим паролем, и
+    терять из-за него всю операцию — плохой обмен. Итог возвращается
+    списком, чтобы интерфейс показал, что именно не получилось.
+
+    Повторно уже заведённые камеры не создаются: сверка идёт по ONVIF-хосту,
+    иначе второй запуск поиска задваивал бы весь список.
+    """
+    existing_hosts = {
+        h for (h,) in (await db.execute(select(Camera.onvif_host).where(Camera.onvif_host.isnot(None)))).all()
+    }
+
+    import asyncio
+
+    added, skipped, failed = [], [], []
+    to_query = []
+    for item in payload.cameras:
+        if item.host in existing_hosts:
+            skipped.append({"host": item.host, "reason": "камера с таким ONVIF-адресом уже добавлена"})
+        else:
+            to_query.append(item)
+
+    # Опрос камер идёт параллельно: на каждую приходится пять SOAP-запросов
+    # (сведения об устройстве, OSD, профили и два GetStreamUri), и в сети из
+    # двух-трёх десятков камер последовательный обход занимал бы минуты.
+    # Ограничение в 8 одновременных — чтобы не завалить воркер и сеть разом.
+    semaphore = asyncio.Semaphore(8)
+
+    async def _describe_one(client, item):
+        async with semaphore:
+            try:
+                return item, await _onvif_describe(client, item), None
+            except httpx.HTTPError as e:
+                return item, None, f"сервис распознавания недоступен: {e}"
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        results = await asyncio.gather(*(_describe_one(client, i) for i in to_query))
+
+    for item, data, error in results:
+        if error:
+            failed.append({"host": item.host, "error": error})
+            continue
+        if not data.get("ok") or not data.get("rtsp_url"):
+            failed.append({"host": item.host, "error": data.get("error") or "не удалось получить поток"})
+            continue
+
+        # Дубликат внутри самого запроса: одна и та же камера могла прийти
+        # дважды, если её нашли и multicast'ом, и перебором подсети.
+        if item.host in existing_hosts:
+            skipped.append({"host": item.host, "reason": "камера с таким ONVIF-адресом уже добавлена"})
+            continue
+
+        cam = Camera(
+            name=(item.name or "").strip() or data.get("name") or item.host,
+            rtsp_url_enc=encrypt(data["rtsp_url"]),
+            sub_rtsp_url_enc=encrypt(data["sub_rtsp_url"]) if data.get("sub_rtsp_url") else None,
+            location=item.location,
+            enabled=payload.enabled,
+            status="offline",
+            onvif_enabled=payload.onvif_enabled,
+            onvif_host=item.host,
+            onvif_port=item.port,
+            onvif_username=item.username or None,
+            onvif_password_enc=encrypt(item.password) if item.password else None,
+        )
+        db.add(cam)
+        await db.commit()
+        await db.refresh(cam)
+        existing_hosts.add(item.host)
+        added.append({"id": cam.id, "name": cam.name, "host": item.host,
+                      "has_substream": bool(data.get("sub_rtsp_url"))})
+
+    if added:
+        await get_redis().publish("cameras:changed", "bulk")
+    return {"added": added, "skipped": skipped, "failed": failed}

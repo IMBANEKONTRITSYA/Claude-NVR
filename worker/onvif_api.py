@@ -16,10 +16,13 @@ from starlette.concurrency import run_in_threadpool
 
 from onvif_client import (
     discover_devices,
+    get_device_information,
+    get_osd_texts,
     get_profiles,
     get_stream_uri,
     inject_credentials,
     scan_subnet,
+    suggest_camera_name,
     OnvifError,
 )
 
@@ -113,3 +116,83 @@ async def onvif_stream_uri(payload: OnvifStreamUriRequest):
     except OnvifError as e:
         return {"ok": False, "error": str(e), "uri": None}
     return {"ok": True, "uri": inject_credentials(uri, payload.username, payload.password)}
+
+
+class OnvifDescribeRequest(OnvifCredentials):
+    """Учётные данные плюс скоупы, если устройство пришло из WS-Discovery:
+    имя из скоупа лучше любого, что можно вывести из GetDeviceInformation."""
+    scopes: list[str] = []
+
+
+@router.post("/onvif/describe")
+async def onvif_describe(payload: OnvifDescribeRequest):
+    """Всё, что нужно для добавления камеры одним нажатием: предлагаемое имя
+    и готовые RTSP-адреса основного потока и субпотока.
+
+    Собирает в один вызов то, что иначе администратору пришлось бы делать
+    вручную для каждой камеры: GetDeviceInformation (имя), GetProfiles и
+    GetStreamUri по двум профилям. Нужен для массового добавления найденных
+    камер — гонять эту цепочку из формы по одной камере медленно и неудобно.
+
+    Профили основного потока и субпотока выбираются по разрешению, а не по
+    порядку в списке: порядок прошивки не гарантируют, а ТЗ 18.1 требует,
+    чтобы детекция шла именно на низкоразрешающем субпотоке.
+    """
+    def _collect():
+        info = get_device_information(payload.host, payload.port, payload.username, payload.password)
+        # OSD — приоритетный источник имени: администратор подписывает камеру
+        # на самой картинке тем же названием точки, что хочет видеть в списке.
+        osd = get_osd_texts(payload.host, payload.port, payload.username, payload.password)
+        profiles = get_profiles(payload.host, payload.port, payload.username, payload.password)
+        return info, osd, profiles
+
+    try:
+        info, osd_texts, profiles = await run_in_threadpool(_collect)
+    except OnvifError as e:
+        return {"ok": False, "error": str(e), "name": None, "rtsp_url": None, "sub_rtsp_url": None}
+
+    name = suggest_camera_name({"scopes": payload.scopes, "host": payload.host}, info, osd_texts)
+    if not profiles:
+        return {"ok": False, "error": "камера не вернула ни одного медиа-профиля",
+                "name": name, "rtsp_url": None, "sub_rtsp_url": None}
+
+    def _area(p):
+        # Профиль без разрешения не должен вытеснить профиль с разрешением
+        # ни из «самого большого», ни из «самого маленького»: -1 уводит его
+        # в начало сортировки по возрастанию, а условие ниже его отсекает.
+        w, h = p.get("width"), p.get("height")
+        return w * h if w and h else -1
+
+    ranked = sorted(profiles, key=_area)
+    main_profile = ranked[-1]
+    # Субпоток — самый мелкий профиль, но только если он реально другой и с
+    # известным разрешением: у камеры с единственным профилем субпотока нет.
+    sub_profile = ranked[0] if len(ranked) > 1 and _area(ranked[0]) > 0 else None
+
+    async def _uri(profile):
+        if profile is None:
+            return None
+        try:
+            uri = await run_in_threadpool(
+                get_stream_uri, payload.host, payload.port, profile["token"],
+                payload.username, payload.password,
+            )
+        except OnvifError:
+            return None
+        return inject_credentials(uri, payload.username, payload.password)
+
+    rtsp_url = await _uri(main_profile)
+    sub_rtsp_url = await _uri(sub_profile)
+    if not rtsp_url:
+        return {"ok": False, "error": "не удалось получить RTSP-адрес основного потока",
+                "name": name, "rtsp_url": None, "sub_rtsp_url": None}
+
+    return {
+        "ok": True,
+        "name": name,
+        "rtsp_url": rtsp_url,
+        "sub_rtsp_url": sub_rtsp_url,
+        "device_info": info,
+        "osd_texts": osd_texts,
+        "profiles": profiles,
+    }

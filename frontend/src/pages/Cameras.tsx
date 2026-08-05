@@ -17,6 +17,9 @@ export function Cameras() {
   const [discovering, setDiscovering] = useState(false);
   const [discovered, setDiscovered] = useState<any[] | null>(null);
   const [subnet, setSubnet] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [bulkAdding, setBulkAdding] = useState(false);
+  const [bulkResult, setBulkResult] = useState<any | null>(null);
   const [loadingProfiles, setLoadingProfiles] = useState(false);
   const [profiles, setProfiles] = useState<any[] | null>(null);
 
@@ -65,6 +68,31 @@ export function Cameras() {
       if (!r.profiles?.length) toast("Профили потоков не найдены", "err");
     } catch (e: any) { toast(e.message, "err"); }
     finally { setLoadingProfiles(false); }
+  };
+
+  // Массовое добавление: имя, основной поток и субпоток каждой камеры
+  // запрашиваются бэкендом у неё самой (OSD → ONVIF-скоуп → модель → IP),
+  // поэтому здесь достаточно передать адрес и учётные данные.
+  const bulkAdd = async () => {
+    setBulkAdding(true); setBulkResult(null);
+    try {
+      const cameras = (discovered || [])
+        .filter(d => selected.includes(d.host))
+        .map(d => ({
+          host: d.host,
+          port: d.port || 80,
+          username: form.onvif_username,
+          password: form.onvif_password,
+          scopes: d.scopes || [],
+        }));
+      const r = await api.onvifBulkAdd(cameras);
+      setBulkResult(r);
+      setSelected([]);
+      load();
+      if (r.added.length) toast(`Добавлено камер: ${r.added.length}`, "ok");
+      else toast("Ни одной камеры добавить не удалось", "err");
+    } catch (e: any) { toast(e.message, "err"); }
+    finally { setBulkAdding(false); }
   };
 
   const pickProfile = async (token: string) => {
@@ -147,18 +175,93 @@ export function Cameras() {
                 {discovering ? "Поиск..." : "Найти камеры в сети"}
               </button>
               {discovered && discovered.length > 0 && (
-                <ul style={{ marginTop: 8, paddingLeft: 0, listStyle: "none" }}>
-                  {discovered.map((d, i) => (
-                    <li key={i} style={{ marginBottom: 4 }}>
-                      <button type="button" className="btn secondary"
-                        onClick={() => setForm({ ...form, onvif_host: d.host, onvif_port: d.port || 80 })}>
-                        {d.host}:{d.port || 80}
-                        {d.scopes?.find((s: string) => s.includes("/name/")) &&
-                          ` — ${d.scopes.find((s: string) => s.includes("/name/")).split("/name/")[1]}`}
-                      </button>
-                    </li>
-                  ))}
-                </ul>
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 6 }}>
+                    <strong>Найдено камер: {discovered.length}</strong>
+                    <button type="button" className="btn secondary" style={{ padding: "2px 10px", fontSize: 12 }}
+                      onClick={() => setSelected(
+                        selected.length === discovered.length ? [] : discovered.map(d => d.host),
+                      )}>
+                      {selected.length === discovered.length ? "Снять все" : "Выбрать все"}
+                    </button>
+                    <span className="muted" style={{ fontSize: 12 }}>выбрано: {selected.length}</span>
+                  </div>
+                  <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>
+                    Отметьте камеры и нажмите «Добавить выбранные» — имя, основной поток
+                    и субпоток подтянутся с каждой камеры автоматически. Логин и пароль
+                    берутся из полей выше и должны подходить ко всем отмеченным.
+                    Клик по адресу заполняет форму одной камерой.
+                  </div>
+                  {/* Сетка, а не список в столбик: в реальной сети находится
+                      несколько десятков камер, и одна колонка на всю высоту
+                      страницы нечитаема. Ограничение по высоте с прокруткой
+                      не даёт списку вытеснить кнопку добавления за экран. */}
+                  <div style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fill, minmax(230px, 1fr))",
+                    gap: 6,
+                    maxHeight: 320,
+                    overflowY: "auto",
+                    padding: 6,
+                    border: "1px solid var(--border, #2a3142)",
+                    borderRadius: 6,
+                  }}>
+                    {discovered.map((d, i) => {
+                      const scope = d.scopes?.find((s: string) => s.includes("/name/"));
+                      const label = scope ? decodeURIComponent(scope.split("/name/")[1]) : null;
+                      const isSelected = selected.includes(d.host);
+                      return (
+                        <label key={i} title={label ? `${d.host} — ${label}` : d.host}
+                          style={{
+                            display: "flex", alignItems: "center", gap: 6, cursor: "pointer",
+                            padding: "5px 7px", borderRadius: 4, minWidth: 0,
+                            background: isSelected ? "var(--accent-bg, #1e3a5f)" : "transparent",
+                          }}>
+                          <input type="checkbox" checked={isSelected}
+                            onChange={e => setSelected(e.target.checked
+                              ? [...selected, d.host]
+                              : selected.filter(h => h !== d.host))} />
+                          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+                            <span style={{ fontFamily: "monospace", fontSize: 12 }}>{d.host}</span>
+                            {label && <span className="muted" style={{ fontSize: 11 }}> · {label}</span>}
+                          </span>
+                          <button type="button" className="btn secondary"
+                            style={{ marginLeft: "auto", padding: "1px 7px", fontSize: 11, flexShrink: 0 }}
+                            onClick={ev => {
+                              ev.preventDefault();
+                              setForm({ ...form, onvif_host: d.host, onvif_port: d.port || 80 });
+                            }}>
+                            в форму
+                          </button>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  <button type="button" className="btn" style={{ marginTop: 8 }}
+                    disabled={!selected.length || bulkAdding} onClick={bulkAdd}>
+                    {bulkAdding ? "Добавление..." : `Добавить выбранные (${selected.length})`}
+                  </button>
+                  {bulkResult && (
+                    <div style={{ marginTop: 8, fontSize: 12 }}>
+                      {bulkResult.added.length > 0 && (
+                        <div style={{ color: "var(--ok, #4ade80)" }}>
+                          Добавлено: {bulkResult.added.map((a: any) =>
+                            `${a.name}${a.has_substream ? "" : " (без субпотока)"}`).join(", ")}
+                        </div>
+                      )}
+                      {bulkResult.skipped.length > 0 && (
+                        <div className="muted">
+                          Пропущено: {bulkResult.skipped.map((s: any) => `${s.host} — ${s.reason}`).join("; ")}
+                        </div>
+                      )}
+                      {bulkResult.failed.length > 0 && (
+                        <div style={{ color: "var(--err, #f87171)" }}>
+                          Не удалось: {bulkResult.failed.map((f: any) => `${f.host} — ${f.error}`).join("; ")}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
               )}
 
               <button type="button" className="btn secondary" style={{ marginTop: 8, marginLeft: 8 }}
