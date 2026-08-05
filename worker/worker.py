@@ -49,6 +49,7 @@ MEDIAMTX_PORT = int(os.environ.get("MEDIAMTX_PORT", "8554"))
 DBSCAN_EPS = 0.35
 DBSCAN_MIN_SAMPLES = 3
 SEGMENT_MAX_SEC = 60
+REPUBLISH_STABLE_SEC = 30  # ffmpeg-репабликация жива дольше этого — бэкофф сброшен
 
 # Рантайм-конфиг, обновляется из таблицы settings (см. refresh_config)
 CONFIG = {
@@ -524,6 +525,20 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
     analyze_url = sub_rtsp_url or rtsp_url
     logger.info("старт камеры", extra={"camera_id": cam_id, "analytics_stream": "sub" if sub_rtsp_url else "main"})
     republish = start_republish(cam_id, rtsp_url)
+    # Цикл 16 (было известным пробелом с цикла 15, см. REVIEW_LOG.md): счётчик
+    # и таймер бэкоффа авто-рестарта ffmpeg-репабликации — без них недоступный
+    # основной RTSP-поток (неверный пароль/URL, отключённая камера) означал
+    # попытку заново поднять ffmpeg на каждой итерации цикла кадров, т.е. до
+    # нескольких раз в секунду — fork/connect-storm без всякой пользы, пока
+    # RTSP не восстановится сам. Используем тот же экспоненциальный бэкофф,
+    # что и для RTSP-реконнекта (backoff.reconnect_delay).
+    republish_attempt = 0
+    republish_started_at = time.time()
+    # Даже если ffmpeg падает мгновенно после самого первого запуска выше,
+    # первый перезапуск внутри цикла кадров всё равно ждёт базовую задержку
+    # бэкоффа — иначе первая проверка (сразу следующая итерация цикла)
+    # рестартовала бы ffmpeg без задержки вообще, до применения бэкоффа.
+    republish_retry_at = republish_started_at + reconnect_delay(0)
 
     cap = open_capture(analyze_url)
     if not cap.isOpened():
@@ -634,12 +649,28 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         if reconnect_attempt:
             reconnect_attempt = 0
 
-        # Авто-перезапуск ffmpeg-репабликации, если он умер
-        if republish and republish.poll() is not None:
-            logger.warning("ffmpeg-репабликация упала, перезапускаю", extra={"camera_id": cam_id})
-            republish = start_republish(cam_id, rtsp_url)
-
         now = time.time()
+        # Авто-перезапуск ffmpeg-репабликации, если он умер — с тем же
+        # экспоненциальным бэкоффом, что и у RTSP-реконнекта, иначе
+        # недоступный основной поток означает попытку перезапуска ffmpeg на
+        # каждой итерации цикла кадров (fork/connect-storm, см. докстринг
+        # инициализации republish_attempt выше).
+        if republish and republish.poll() is not None:
+            if now >= republish_retry_at:
+                delay = reconnect_delay(republish_attempt)
+                logger.warning(
+                    "ffmpeg-репабликация упала, перезапускаю",
+                    extra={"camera_id": cam_id, "retry_in_sec": round(delay, 1), "attempt": republish_attempt + 1},
+                )
+                republish = start_republish(cam_id, rtsp_url)
+                republish_started_at = now
+                republish_attempt += 1
+                republish_retry_at = now + delay
+        elif republish and republish_attempt and (now - republish_started_at) > REPUBLISH_STABLE_SEC:
+            # Продержался достаточно долго живым — считаем восстановленным,
+            # следующий сбой снова начнёт бэкофф с базовой задержки.
+            republish_attempt = 0
+
         # Адаптивная частота (ТЗ 18.3): при длительном покое опускаемся до idle_fps,
         # при первом же движении мгновенно возвращаемся к полной частоте.
         idle = (now - last_motion) > IDLE_AFTER_SEC
