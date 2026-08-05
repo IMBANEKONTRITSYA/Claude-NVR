@@ -55,3 +55,44 @@ def test_zero_size_expected_bbox_does_not_crash():
 def test_helpers():
     assert bbox_center((0, 0, 100, 200)) == (50.0, 100.0)
     assert bbox_diagonal((0, 0, 3, 4)) == 5.0
+
+
+# --- Один кроп не должен достаться двоим (цикл 19) --------------------------
+#
+# Снимок в полном разрешении теперь скачивается и прогоняется через детектор
+# один раз на кадр, а не отдельно на каждое лицо, — иначе кадр с пятью
+# людьми давал пять скачиваний одного и того же JPEG и пять прогонов тяжёлой
+# модели по нему же. Побочный эффект общего списка лиц: два человека с кадра
+# аналитики могут выбрать одно и то же лицо на снимке, если второго на нём
+# уже нет (успел уйти за те 100-300 мс, что снимок ехал). Тогда обоим
+# достался бы один кроп и один эмбеддинг — то есть в поиск по фото ушло бы
+# чужое лицо, ровно та ошибка, ради которой сопоставление и делается.
+
+
+def test_taken_face_is_not_given_to_a_second_person():
+    """Уже отданное лицо пропускается, даже если оно ближайшее."""
+    boxes = [(100, 100, 200, 200)]
+    expected = (105, 105, 205, 205)
+    assert pick_matching_face(boxes, expected) == 0
+    assert pick_matching_face(boxes, expected, taken={0}) is None
+
+
+def test_second_person_gets_the_next_best_free_face():
+    """Когда свободное лицо есть, второй персоне достаётся именно оно, а не
+    отказ: перебор идёт по всем незанятым, а не только по глобально
+    ближайшему."""
+    boxes = [(100, 100, 200, 200), (140, 100, 240, 200)]
+    expected = (110, 100, 210, 200)
+    first = pick_matching_face(boxes, expected)
+    assert first == 0
+    second = pick_matching_face(boxes, expected, taken={first})
+    assert second == 1
+
+
+def test_taken_none_or_empty_behaves_as_before():
+    """Отсутствие множества занятых — прежнее поведение (обратная
+    совместимость вызова из мест, где занятых не бывает)."""
+    boxes = [(0, 0, 100, 100)]
+    expected = (0, 0, 100, 100)
+    assert pick_matching_face(boxes, expected, taken=None) == 0
+    assert pick_matching_face(boxes, expected, taken=set()) == 0
