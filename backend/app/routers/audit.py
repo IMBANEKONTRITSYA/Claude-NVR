@@ -1,16 +1,14 @@
 import io
 import csv
 from datetime import datetime
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
-from jose import jwt, JWTError
 from openpyxl import Workbook
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from ..config import settings
 from ..db import get_db
 from ..models import AuditLog
-from ..auth import require_role
+from ..auth import require_role, require_role_query
 from ..pagination import PageParams
 
 
@@ -63,13 +61,11 @@ async def list_audit(
 
 # --- Экспорт (token в query, чтобы открывалось как обычная ссылка) -----------
 
-def _check_token(token: str):
-    try:
-        p = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
-        if p.get("role") != "admin":
-            raise HTTPException(403, "Только для администратора")
-    except JWTError:
-        raise HTTPException(401, "Не авторизован")
+# Выгрузки открываются браузером по прямой ссылке (токен в query string),
+# но роль берётся из БД, а не из claim'а токена: журнал аудита — самые
+# чувствительные данные системы, и разжалованный администратор не должен
+# выгружать его целиком ещё 30 минут до истечения access-токена.
+_require_audit_export = require_role_query("admin")
 
 
 async def _all_rows(db: AsyncSession, username, action, date_from, date_to, hard_limit: int = 10000):
@@ -86,12 +82,11 @@ def _row_tuple(r):
 
 @router.get("/export.csv")
 async def export_csv(
-    token: str = Query(...),
+    _=Depends(_require_audit_export),
     username: str | None = None, action: str | None = None,
     date_from: datetime | None = None, date_to: datetime | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    _check_token(token)
     rows = await _all_rows(db, username, action, date_from, date_to)
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -105,12 +100,11 @@ async def export_csv(
 
 @router.get("/export.xlsx")
 async def export_xlsx(
-    token: str = Query(...),
+    _=Depends(_require_audit_export),
     username: str | None = None, action: str | None = None,
     date_from: datetime | None = None, date_to: datetime | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    _check_token(token)
     rows = await _all_rows(db, username, action, date_from, date_to)
     wb = Workbook()
     ws = wb.active

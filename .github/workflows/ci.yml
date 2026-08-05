@@ -65,7 +65,10 @@ jobs:
         # измеренных 71%, запас на мелкие колебания между прогонами), чтобы
         # CI действительно проваливался при просадке покрытия, а не только
         # показывал его в отчёте (см. docs/reviews/REVIEW_LOG.md, цикл 6).
-        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=68 -q
+        # Цикл 19: тесты «ссылочных» эндпоинтов (test_query_token_identity.py,
+        # переписанный test_media_rbac.py) подняли покрытие до 76% — порог
+        # поднят до 74, чтобы разрыв с фактическим покрытием снова не рос.
+        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=74 -q
 
   worker:
     runs-on: ubuntu-latest

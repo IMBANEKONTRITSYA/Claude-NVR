@@ -1,6 +1,6 @@
 import asyncio
 import json
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, HTTPException
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from jose import jwt, JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,11 +12,23 @@ from ..services.pubsub import get_redis
 router = APIRouter()
 
 
-def _auth(token: str) -> dict:
-    try:
-        return jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
-    except JWTError:
-        raise HTTPException(401, "Не авторизован")
+async def _auth(ws: WebSocket, token: str) -> bool:
+    """Проверка на этапе рукопожатия: подпись токена И существование
+    пользователя в БД.
+
+    Проверять только подпись было недостаточно: удалённый пользователь
+    открывал новый сокет и получал поток событий до первого цикла пинга
+    (~30 секунд), хотя REST-эндпоинты отказывали ему сразу. Теперь вход и
+    удержание соединения (_still_valid) проверяют одно и то же.
+
+    Закрытие вместо HTTPException: до accept() Starlette превращает close в
+    отказ рукопожатия, и клиент видит обычный WebSocketDisconnect.
+    """
+    async with SessionLocal() as db:
+        if await _still_valid(token, db):
+            return True
+    await ws.close(code=4401)
+    return False
 
 
 async def _still_valid(token: str, db: AsyncSession) -> bool:
@@ -40,7 +52,8 @@ async def _still_valid(token: str, db: AsyncSession) -> bool:
 
 @router.websocket("/ws/faces")
 async def ws_faces(ws: WebSocket, token: str = Query(...)):
-    _auth(token)
+    if not await _auth(ws, token):
+        return
     await ws.accept()
     r = get_redis()
     pubsub = r.pubsub()
@@ -65,7 +78,8 @@ async def ws_faces(ws: WebSocket, token: str = Query(...)):
 
 @router.websocket("/ws/cameras")
 async def ws_cameras(ws: WebSocket, token: str = Query(...)):
-    _auth(token)
+    if not await _auth(ws, token):
+        return
     await ws.accept()
     r = get_redis()
     pubsub = r.pubsub()

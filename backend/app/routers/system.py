@@ -3,14 +3,13 @@ import shutil
 from datetime import datetime
 
 import psutil
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from jose import jwt, JWTError
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy import select, func
 
 from ..config import settings
 from ..db import SessionLocal
 from ..models import Camera, FaceEvent, VideoSegment
-from ..auth import require_role
+from ..auth import require_role, require_role_query
 from ..services.pubsub import get_redis
 
 router = APIRouter(prefix="/api/system", tags=["system"])
@@ -88,18 +87,15 @@ async def system_metrics(_=Depends(require_role("admin", "operator"))):
 
 
 @router.get("/prometheus")
-async def prometheus_metrics(token: str = Query(...)):
+async def prometheus_metrics(_=Depends(require_role_query("admin"))):
     """Экспорт в формате Prometheus (ТЗ 12: интеграция с Prometheus + Grafana).
 
     Скрейперы не умеют слать Bearer-заголовок, поэтому токен передаётся
     в query — как и для остальных «ссылочных» эндпоинтов (отчёты, медиа).
+    Роль при этом сверяется с БД, а не берётся из claim'а: учётка, заведённая
+    для скрейпера и затем удалённая или разжалованная, должна терять доступ
+    к метрикам сразу, а не по истечении access-токена.
     """
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
-        if payload.get("role") != "admin":
-            raise HTTPException(403, "Только для администратора")
-    except JWTError:
-        raise HTTPException(401, "Не авторизован")
     m = await _collect()
     lines = [
         "# HELP facewatch_cpu_percent Загрузка CPU, %",
