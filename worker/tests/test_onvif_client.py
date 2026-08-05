@@ -252,9 +252,13 @@ def test_get_profiles_parses_token_and_name(monkeypatch):
     capture = {}
     _mock_urlopen(monkeypatch, response_bytes=GET_PROFILES_RESPONSE.encode(), capture=capture)
     profiles = oc.get_profiles("192.168.1.64", 80, "admin", "s3cret")
+    # width/height добавлены к профилю, чтобы выбирать основной поток и
+    # субпоток по разрешению, а не по порядку в списке: ТЗ 18.1 требует, чтобы
+    # детекция шла на низкоразрешающем субпотоке, а порядок профилей прошивки
+    # не гарантируют. В этом фикстурном ответе разрешения нет — отсюда None.
     assert profiles == [
-        {"token": "profile_1", "name": "MainStream"},
-        {"token": "profile_2", "name": "SubStream"},
+        {"token": "profile_1", "name": "MainStream", "width": None, "height": None},
+        {"token": "profile_2", "name": "SubStream", "width": None, "height": None},
     ]
     assert capture["url"] == "http://192.168.1.64:80/onvif/Media"
     assert "UsernameToken" in capture["body"]
@@ -265,7 +269,9 @@ def test_get_profiles_falls_back_to_token_when_name_missing(monkeypatch):
     <SOAP-ENV:Body><trt:GetProfilesResponse xmlns:trt="http://www.onvif.org/ver10/media/wsdl">
     <trt:Profiles token="profile_x"/></trt:GetProfilesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>"""
     _mock_urlopen(monkeypatch, response_bytes=no_name.encode())
-    assert oc.get_profiles("192.168.1.64", 80, None, None) == [{"token": "profile_x", "name": "profile_x"}]
+    assert oc.get_profiles("192.168.1.64", 80, None, None) == [
+        {"token": "profile_x", "name": "profile_x", "width": None, "height": None}
+    ]
 
 
 def test_get_profiles_empty_response_returns_empty_list(monkeypatch):
