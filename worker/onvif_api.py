@@ -14,7 +14,14 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
-from onvif_client import discover_devices, get_profiles, get_stream_uri, OnvifError
+from onvif_client import (
+    discover_devices,
+    get_profiles,
+    get_stream_uri,
+    inject_credentials,
+    scan_subnet,
+    OnvifError,
+)
 
 router = APIRouter()
 
@@ -31,16 +38,46 @@ class OnvifStreamUriRequest(OnvifCredentials):
 
 
 @router.get("/onvif/discover")
-async def onvif_discover(timeout: float = Query(3.0, ge=0.5, le=10.0)):
-    """WS-Discovery блокирует поток на до timeout секунд (ждёт UDP-ответы
-    камер) — run_in_threadpool, чтобы не заморозить остальной embed API
-    (в т.ч. /embed для поиска по фото) на время ручного сканирования сети
-    администратором."""
+async def onvif_discover(
+    timeout: float = Query(3.0, ge=0.5, le=10.0),
+    subnet: str | None = Query(None, description="CIDR, например 192.168.1.0/24"),
+):
+    """Автообнаружение камер: WS-Discovery, а при указанном subnet — перебор
+    адресов диапазона.
+
+    Перебор нужен потому, что WS-Discovery рассылает multicast-датаграмму, а
+    воркер живёт в docker-контейнере на NAT'ированной сети: на Docker Desktop
+    под Windows multicast до физической ЛВС не доходит, и поиск честно не
+    находит ничего. Перебор идёт unicast'ом и через NAT проходит.
+
+    Оба способа блокируют поток на секунды — run_in_threadpool, чтобы не
+    заморозить остальной API воркера (в т.ч. /embed для поиска по фото) на
+    время ручного сканирования сети администратором.
+    """
+    devices: list[dict] = []
+    errors: list[str] = []
+
     try:
         devices = await run_in_threadpool(discover_devices, timeout)
     except OnvifError as e:
-        return {"ok": False, "error": str(e), "devices": []}
-    return {"ok": True, "devices": devices}
+        errors.append(f"WS-Discovery: {e}")
+
+    if subnet:
+        try:
+            scanned = await run_in_threadpool(scan_subnet, subnet)
+        except OnvifError as e:
+            errors.append(str(e))
+        else:
+            # Один и тот же адрес мог прийти обоими путями.
+            known = {d.get("host") for d in devices}
+            devices += [d for d in scanned if d.get("host") not in known]
+
+    # ok=False только когда не осталось ни одного результата: частичный сбой
+    # (multicast не прошёл, а перебор нашёл камеры) — это успех для
+    # пользователя, а не ошибка.
+    if not devices and errors:
+        return {"ok": False, "error": "; ".join(errors), "devices": []}
+    return {"ok": True, "devices": devices, "warnings": errors}
 
 
 @router.post("/onvif/profiles")
@@ -60,7 +97,14 @@ async def onvif_profiles(payload: OnvifCredentials):
 
 @router.post("/onvif/stream-uri")
 async def onvif_stream_uri(payload: OnvifStreamUriRequest):
-    """RTSP-адрес потока для выбранного профиля (GetStreamUri)."""
+    """RTSP-адрес потока для выбранного профиля (GetStreamUri).
+
+    Учётные данные подставляются в возвращённый URI: камеры отдают адрес без
+    них (по спецификации ONVIF они передаются отдельно), а ffmpeg/OpenCV
+    читают логин и пароль только из самого URL — без подстановки адрес,
+    автозаполненный в форму, сразу давал бы `401 Unauthorized` на кнопке
+    «Проверить RTSP».
+    """
     try:
         uri = await run_in_threadpool(
             get_stream_uri, payload.host, payload.port, payload.profile_token,
@@ -68,4 +112,4 @@ async def onvif_stream_uri(payload: OnvifStreamUriRequest):
         )
     except OnvifError as e:
         return {"ok": False, "error": str(e), "uri": None}
-    return {"ok": True, "uri": uri}
+    return {"ok": True, "uri": inject_credentials(uri, payload.username, payload.password)}

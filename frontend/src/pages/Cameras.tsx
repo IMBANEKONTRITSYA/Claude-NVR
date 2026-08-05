@@ -16,6 +16,7 @@ export function Cameras() {
   const [testResult, setTestResult] = useState<string>("");
   const [discovering, setDiscovering] = useState(false);
   const [discovered, setDiscovered] = useState<any[] | null>(null);
+  const [subnet, setSubnet] = useState("");
   const [loadingProfiles, setLoadingProfiles] = useState(false);
   const [profiles, setProfiles] = useState<any[] | null>(null);
 
@@ -36,9 +37,19 @@ export function Cameras() {
   const discoverOnvif = async () => {
     setDiscovering(true); setDiscovered(null);
     try {
-      const r = await api.onvifDiscover();
+      // Пустой диапазон = только WS-Discovery (multicast). Он не проходит
+      // через NAT docker-сети, поэтому подсказка в поле объясняет, что при
+      // пустом результате нужно указать подсеть.
+      const r = await api.onvifDiscover(subnet.trim() || undefined);
       setDiscovered(r.devices || []);
-      if (!r.devices?.length) toast("Камеры в сети не найдены", "err");
+      if (!r.devices?.length) {
+        toast(
+          subnet.trim()
+            ? "Камеры в этом диапазоне не найдены"
+            : "Камеры не найдены. Укажите диапазон подсети — multicast-поиск не проходит через сеть Docker",
+          "err",
+        );
+      }
     } catch (e: any) { toast(e.message, "err"); }
     finally { setDiscovering(false); }
   };
@@ -118,6 +129,18 @@ export function Cameras() {
                 <div><label>Пароль{editing ? " (оставить пустым — не менять)" : ""}</label>
                   <input type="password" value={form.onvif_password}
                     onChange={e => setForm({ ...form, onvif_password: e.target.value })} /></div>
+              </div>
+              <div style={{ marginTop: 8 }}>
+                <label>Диапазон поиска (CIDR)</label>
+                <input value={subnet} placeholder="192.168.1.0/24 — оставьте пустым для multicast-поиска"
+                  onChange={e => setSubnet(e.target.value)} />
+                <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+                  Поиск через multicast (WS-Discovery) не проходит через сеть Docker,
+                  поэтому обычно ничего не находит. Укажите подсеть, в которой стоят
+                  камеры — например, если камера доступна по 192.168.105.19,
+                  введите 192.168.105.0/24. Перебор до 1024 адресов, только приватные
+                  диапазоны.
+                </div>
               </div>
               <button type="button" className="btn secondary" style={{ marginTop: 8 }} disabled={discovering}
                 onClick={discoverOnvif}>
