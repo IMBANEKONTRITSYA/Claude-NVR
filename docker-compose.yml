@@ -28,7 +28,12 @@ services:
       # отладки psql с той же машины. POSTGRES_PASSWORD по умолчанию —
       # публично известное значение "facewatch" (ТЗ 13), поэтому открывать
       # порт на все интерфейсы означало бы БД без реальной защиты.
-      - "127.0.0.1:5432:5432"
+      # Хост-порт настраиваемый (POSTGRES_HOST_PORT, по умолчанию 5432) —
+      # на Windows этот порт иногда недоступен для докера из-за особенностей
+      # Hyper-V/WSL2-сети или сторонних security-агентов (WSAEACCES при
+      # биндинге, не видно ни в netstat, ни в excludedportrange), тогда
+      # проще переопределить хост-порт в .env, чем разбираться с ОС.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-facewatch}"]
       interval: 5s
@@ -43,7 +48,10 @@ services:
     ports:
       # Redis не требует пароля по умолчанию — публикация на все интерфейсы
       # дала бы любому в локальной сети полный доступ к очередям/кэшу.
-      - "127.0.0.1:6379:6379"
+      # Хост-порт настраиваемый (REDIS_HOST_PORT) — см. комментарий у
+      # postgres выше про недоступность фиксированных портов на некоторых
+      # Windows-машинах.
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -61,9 +69,10 @@ services:
       # (хост "mediamtx") — публикация наружу никому не нужна и означала бы,
       # что любой в локальной сети смотрит камеры без входа в систему.
       # Оставлено на loopback только для локальной отладки через VLC/ffplay.
-      - "127.0.0.1:8554:8554"   # RTSP
-      - "127.0.0.1:8888:8888"   # HLS
-      - "127.0.0.1:8889:8889"   # WebRTC
+      # Хост-порты настраиваемые (см. комментарий у postgres про Windows).
+      - "127.0.0.1:${MEDIAMTX_RTSP_HOST_PORT:-8554}:8554"     # RTSP
+      - "127.0.0.1:${MEDIAMTX_HLS_HOST_PORT:-8888}:8888"      # HLS
+      - "127.0.0.1:${MEDIAMTX_WEBRTC_HOST_PORT:-8889}:8889"   # WebRTC
     volumes:
       - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
     restart: unless-stopped
@@ -89,7 +98,9 @@ services:
     volumes:
       - media:/media
     ports:
-      - "8000:8000"
+      # Хост-порт настраиваемый (BACKEND_HOST_PORT) — см. комментарий у
+      # postgres про Windows.
+      - "${BACKEND_HOST_PORT:-8000}:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health',timeout=3).status==200 else 1)"]
       interval: 15s
@@ -206,10 +217,11 @@ services:
     depends_on:
       - backend
     ports:
-      - "8080:80"
+      # Хост-порты настраиваемые (см. комментарий у postgres про Windows).
+      - "${FRONTEND_HTTP_HOST_PORT:-8080}:80"
       # ТЗ 13: TLS/HTTPS доступен по умолчанию — самоподписанный сертификат
       # генерируется автоматически при первом запуске (docker-entrypoint.sh).
-      - "8443:443"
+      - "${FRONTEND_HTTPS_HOST_PORT:-8443}:443"
     volumes:
       # Сертификат переживает пересоздание контейнера — иначе браузеру
       # пришлось бы заново принимать предупреждение при каждом обновлении.
