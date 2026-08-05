@@ -504,14 +504,6 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
     logger.info("старт камеры", extra={"camera_id": cam_id, "analytics_stream": "sub" if sub_rtsp_url else "main"})
     republish = start_republish(cam_id, rtsp_url)
 
-    if onvif_config and onvif_config.get("host"):
-        threading.Thread(
-            target=onvif_poll_worker,
-            args=(cam_id, onvif_config["host"], onvif_config.get("port") or 80,
-                  onvif_config.get("username"), onvif_config.get("password")),
-            daemon=True,
-        ).start()
-
     cap = open_capture(analyze_url)
     if not cap.isOpened():
         logger.error("не удалось открыть RTSP", extra={"camera_id": cam_id})
@@ -520,6 +512,29 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
             republish.terminate()
         return
     update_status(cam_id, "online")
+
+    # Запускается только после успешного открытия потока аналитики, а не
+    # безусловно при входе в функцию: onvif_poll_worker — daemon-нить без
+    # собственного условия остановки, кроме глобального shutdown_event
+    # (см. её докстринг), поэтому раньше она переживала любой ранний return
+    # camera_worker() выше. Для камеры с валидным onvif_host, но постоянно
+    # неоткрывающимся RTSP (частая реальная поломка — неверный URL/пароль
+    # именно субпотока при рабочем основном потоке) manager() пересоздаёт
+    # camera_worker() каждые ~10с (см. цикл ниже в manager()), и каждый
+    # перезапуск плодил ещё одну независимую ONVIF-нить со своей PullPoint-
+    # подпиской и сокетом — ни одна из них никогда не останавливалась,
+    # утечка нитей неограниченно росла со временем и в итоге валила процесс
+    # воркера целиком (все камеры, не только сбойную). ONVIF-события всё
+    # равно потребляются только внутри цикла кадров ниже (onvif_healthy()/
+    # onvif_motion_recent()), который не выполняется без открытого cap —
+    # переносить старт нити раньше этой точки не давало никакой пользы.
+    if onvif_config and onvif_config.get("host"):
+        threading.Thread(
+            target=onvif_poll_worker,
+            args=(cam_id, onvif_config["host"], onvif_config.get("port") or 80,
+                  onvif_config.get("username"), onvif_config.get("password")),
+            daemon=True,
+        ).start()
 
     bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=False)
     last_proc = 0.0
