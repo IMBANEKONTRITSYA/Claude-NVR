@@ -402,6 +402,136 @@ def test_audit_log_records_mutating_action_and_is_admin_only(client, admin_heade
     client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
 
 
+def _audit_records(client, headers, *, action: str, path: str, username: str) -> list[dict]:
+    """Записи журнала по конкретному действию, пути и пользователю.
+
+    Фильтр `?action=` в API — `ILIKE %...%`, то есть под него попадают записи
+    и других тестов: те же выгрузки дергает `test_query_token_identity.py`
+    (пользователи `qt_admin`/`qt_fired`), а неизвестный профиль —
+    `test_settings_profile_*` ниже. Брать `items[0]` поэтому нельзя: тест
+    стал бы зависеть от порядка выполнения. Сверяем путь и пользователя.
+    """
+    r = client.get("/api/audit", params={"action": action, "page_size": 200}, headers=headers)
+    assert r.status_code == 200, r.text
+    return [it for it in r.json()["items"] if it["path"] == path and it["username"] == username]
+
+
+def test_audit_log_records_export_operations(client, admin_token):
+    """ТЗ 13: «операции экспорта фиксируются в журнале аудита».
+
+    Полный production path, не только моки: настоящий HTTP-запрос выгрузки
+    через TestClient с токеном в query string (так её открывает браузер),
+    настоящая запись middleware в Postgres, настоящее чтение через
+    /api/audit. До фикса цикла 20 записей не появлялось ни одной —
+    middleware выходила до поиска действия для всех методов, кроме
+    POST/PUT/PATCH/DELETE, а все выгрузки это GET.
+    """
+    headers = {"Authorization": f"Bearer {admin_token}"}
+
+    # Журнал аудита — сам объект экспорта, поэтому проверяем и его выгрузку:
+    # именно она выносит из системы весь накопленный след действий.
+    for path, expected in (
+        ("/api/reports/persons.csv", "Экспорт отчёта: персоны (CSV)"),
+        ("/api/audit/export.csv", "Экспорт журнала аудита (CSV)"),
+    ):
+        r = client.get(f"{path}?token={admin_token}")
+        assert r.status_code == 200, r.text
+
+        # Личность берётся из токена в query string, а не остаётся пустой —
+        # поэтому и фильтруем по username="admin".
+        found = _audit_records(client, headers, action=expected, path=path, username="admin")
+        assert found, f"выгрузка {path} не попала в журнал аудита"
+        rec = found[0]
+        assert rec["action"] == expected
+        assert rec["method"] == "GET"
+        assert rec["status_code"] == 200
+
+
+def test_audit_log_records_plaintext_rtsp_credential_read(client, admin_headers, request):
+    """Production path: настоящая камера в Postgres с зашифрованной ссылкой,
+    настоящее чтение `GET /api/cameras/{id}/rtsp`, которое возвращает адрес с
+    логином и паролем расшифрованными. Раскрытие секрета должно оставлять
+    след — до фикса цикла 20 не оставляло (GET не аудировался вообще)."""
+    name = _unique("audit-rtsp-cam", request)
+    r = client.post(
+        "/api/cameras",
+        json={"name": name, "rtsp_url": "rtsp://user:secret@cam/stream"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    cam_id = r.json()["id"]
+    try:
+        r = client.get(f"/api/cameras/{cam_id}/rtsp", headers=admin_headers)
+        assert r.status_code == 200, r.text
+        assert "secret" in r.json()["rtsp_url"]  # секрет действительно раскрыт
+
+        found = _audit_records(
+            client, admin_headers,
+            action="Просмотр RTSP-адреса", path=f"/api/cameras/{cam_id}/rtsp", username="admin",
+        )
+        assert found, "чтение RTSP-адреса с учётными данными не попало в журнал аудита"
+        assert found[0]["method"] == "GET"
+        assert found[0]["status_code"] == 200
+    finally:
+        client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
+
+
+def test_audit_log_records_performance_profile_change(client, admin_headers):
+    """Строка матрицы прав «Смена профиля производительности» (только admin)
+    не писалась в журнал вовсе: ключа с этим путём в карте не было, а
+    ("PUT", "/api/settings") не подходил по методу. Production path —
+    настоящее применение профиля к настройкам в Postgres."""
+    # Применяем профиль, который уже активен: запись в журнале появиться
+    # должна, а управляемые профилем настройки (face_model, detect_width, …)
+    # при этом не меняются — иначе тест испортил бы состояние общей на всю
+    # сессию БД для остальных тестов.
+    cur = client.get("/api/settings", headers=admin_headers)
+    assert cur.status_code == 200, cur.text
+    name = cur.json().get("performance_profile") or "economy"
+    profiles = client.get("/api/settings/profiles", headers=admin_headers)
+    assert name in profiles.json()["profiles"], profiles.text
+
+    r = client.post(f"/api/settings/profile/{name}", headers=admin_headers)
+    assert r.status_code == 200, r.text
+
+    found = _audit_records(
+        client, admin_headers,
+        action="Смена профиля", path=f"/api/settings/profile/{name}", username="admin",
+    )
+    assert found, "смена профиля производительности не попала в журнал аудита"
+    assert found[0]["method"] == "POST"
+    assert found[0]["status_code"] == 200
+
+
+def test_audit_log_labels_onvif_describe_separately_from_camera_creation(client, admin_headers):
+    """Матч по префиксу писал все `POST /api/cameras/onvif/*` как
+    «Добавлена камера». Запрос уходит к несуществующей камере — важно, что
+    запись в журнале появляется и для неуспешного вызова (след попытки), с
+    правильным ярлыком и фактическим кодом ответа."""
+    r = client.post(
+        "/api/cameras/onvif/describe",
+        json={"host": "192.0.2.1", "port": 80, "username": "x", "password": "y"},
+        headers=admin_headers,
+    )
+    assert r.status_code != 404, r.text  # роут существует; результат вызова не важен
+
+    found = _audit_records(
+        client, admin_headers,
+        action="Диагностический дамп", path="/api/cameras/onvif/describe", username="admin",
+    )
+    assert found, "ONVIF-дамп не попал в журнал аудита"
+    assert found[0]["action"] != "Добавлена камера"
+    assert found[0]["status_code"] == r.status_code
+
+    # И обратная сторона регрессии: под ярлыком добавления камеры этого пути
+    # быть не должно вовсе.
+    mislabelled = _audit_records(
+        client, admin_headers,
+        action="Добавлена камера", path="/api/cameras/onvif/describe", username="admin",
+    )
+    assert not mislabelled, "ONVIF-дамп записан в журнал как добавление камеры"
+
+
 def test_settings_update_persists_and_validates_range(client, admin_headers):
     r = client.put("/api/settings", json={"retention_days": 45}, headers=admin_headers)
     assert r.status_code == 200
