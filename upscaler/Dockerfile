@@ -17,6 +17,10 @@ RUN pip install -r requirements.txt
 RUN F="$(python -c 'import basicsr,os;print(os.path.dirname(basicsr.__file__))')/data/degradations.py"; \
     sed -i 's/from torchvision.transforms.functional_tensor import/from torchvision.transforms.functional import/' "$F" || true
 
-COPY upscaler.py .
+# Глоб, а не поимённый список: ровно на поимённом списке воркер несколько
+# раз собирался успешно и падал в CrashLoop с ModuleNotFoundError, потому
+# что про добавление нового модуля в COPY забывали (см.
+# backend/tests/test_dockerfile_modules.py).
+COPY *.py ./
 
 CMD ["python", "upscaler.py"]
