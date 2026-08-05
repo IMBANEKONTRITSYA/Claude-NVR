@@ -898,6 +898,39 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
 
 
 def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url=None):
+    # Снимок в полном разрешении берётся ОДИН раз на кадр и разбирается на
+    # все лица сразу. Раньше и HTTP-запрос к камере, и прогон детектора по
+    # полноразмерному кадру шли внутри цикла по лицам: кадр с пятью людьми
+    # давал пять скачиваний одного и того же снимка и пять прогонов тяжёлой
+    # модели по нему же — на 16 камерах это ровно та нагрузка, которую
+    # раздел 18 ТЗ велит избегать, и ради неё же снимок и брался вместо
+    # постоянного декодирования основного потока.
+    #
+    # Ленивое вычисление, а не в начале функции: подавляющее большинство
+    # кадров не создаёт ни одного события (все лица отсекает cooldown), и
+    # снимок для них не нужен вовсе.
+    hires_cache: dict = {}
+
+    def _hires():
+        """(полноразмерный кадр, лица на нём) — не более одного раза на кадр."""
+        if "value" not in hires_cache:
+            hires_cache["value"] = (None, [])
+            hi_frame = fetch_snapshot_frame(snapshot_url) if snapshot_url else None
+            if hi_frame is not None:
+                detector = FACE_APP
+                try:
+                    hi_faces = detector.get(hi_frame) if detector else []
+                except Exception:
+                    logger.warning("детекция на снимке камеры не удалась",
+                                   exc_info=True, extra={"camera_id": cam_id})
+                    hi_faces = []
+                hires_cache["value"] = (hi_frame, hi_faces)
+        return hires_cache["value"]
+
+    # Лица снимка, уже отданные персонам этого кадра: один кроп не должен
+    # достаться двоим (см. pick_matching_face).
+    claimed: set[int] = set()
+
     with Session() as s:
         for f in faces:
             emb = np.asarray(f.normed_embedding, dtype=np.float32)
@@ -955,17 +988,15 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url
             # декодирование основного потока на 16 камерах противоречило бы
             # разделу 18 ТЗ.
             snap_rel = None
-            hires = fetch_snapshot_frame(snapshot_url) if snapshot_url else None
+            hires, hi_faces = _hires()
             if hires is not None:
                 sh, sw = hires.shape[:2]
                 expected = onvif_client.scale_bbox(bbox, (fw, fh), (sw, sh))
-                detector = FACE_APP
-                try:
-                    hi_faces = detector.get(hires) if detector else []
-                except Exception:
-                    hi_faces = []
-                idx = pick_matching_face([f.bbox.tolist() for f in hi_faces], expected)
+                idx = pick_matching_face(
+                    [hf.bbox.tolist() for hf in hi_faces], expected, taken=claimed,
+                )
                 if idx is not None:
+                    claimed.add(idx)
                     best = hi_faces[idx]
                     snap_rel = save_face_snapshot(hires, cam_id, best.bbox.tolist())
                     # Эмбеддинг с полноразмерного кадра точнее — он идёт в
