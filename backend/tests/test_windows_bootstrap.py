@@ -250,6 +250,20 @@ def test_start_bat_pins_working_directory():
     assert src.index('cd /d "%~dp0"') < src.index("if not exist .env")
 
 
+def test_gitattributes_forces_crlf_for_batch_files():
+    """start.bat перешёл на метки goto в конце файла, а cmd.exe ищет их
+    посимвольным сканированием и документированно сбоит на файлах с одними
+    LF. В репозитории файлы лежат с LF, поэтому окончания строк на checkout
+    должен фиксировать .gitattributes — иначе клонирование с
+    core.autocrlf=false отдаёт .bat, у которого может не найтись :no_env."""
+    ga = ROOT / ".gitattributes"
+    assert ga.exists(), ".gitattributes нужен, чтобы .bat приезжал с CRLF"
+    text = ga.read_text(encoding="utf-8")
+    assert re.search(r"^\*\.bat\s+text\s+eol=crlf", text, re.M), (
+        "*.bat должен принудительно получать CRLF на checkout"
+    )
+
+
 def test_start_bat_is_ascii_only():
     """cmd.exe читает .bat в OEM-кодировке (CP866 на русской Windows), а файл
     хранится в UTF-8 — кириллица в .bat вывелась бы мозаикой. Та же природа,
