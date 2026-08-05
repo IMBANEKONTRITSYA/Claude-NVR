@@ -4,6 +4,7 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   backend:
@@ -137,3 +138,82 @@ jobs:
         working-directory: frontend
         continue-on-error: true
         run: npm audit --audit-level=moderate
+
+  # SPEC.md §14: "Нагрузочное тестирование: сценарий на 16 камер, проверка
+  # стабильности FPS и задержек". loadtest/locustfile.py закрывает API-слой
+  # этого требования (см. loadtest/README.md для честных границ теста —
+  # не покрывает реальную RTSP-декодировку/инференс воркера, нужны физические
+  # камеры/GPU). Рекомендация цикла 13 (docs/reviews/REVIEW_LOG.md): держать
+  # это необязательным workflow_dispatch-джобом, а не частью обычного
+  # push/PR-конвейера — прогон занимает минуты, а не секунды, и не должен
+  # блокировать обычную разработку. Запускается вручную из вкладки Actions
+  # или через `gh workflow run ci.yml`.
+  loadtest:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facewatch
+          POSTGRES_PASSWORD: facewatch
+          POSTGRES_DB: facewatch_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U facewatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://facewatch:facewatch@localhost:5432/facewatch_test
+      REDIS_URL: redis://localhost:6379/0
+      ALLOW_INSECURE_DEFAULT_SECRETS: "true"
+      MEDIA_PATH: /tmp/facewatch-media
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install backend deps + locust
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt locust
+      - name: Start backend
+        working-directory: backend
+        run: |
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/backend.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/api/health && exit 0
+            sleep 1
+          done
+          echo "backend did not become healthy in time"
+          cat /tmp/backend.log
+          exit 1
+      - name: Run 16-camera load test (SPEC 14)
+        run: |
+          locust -f loadtest/locustfile.py --headless \
+              -u 16 -r 4 -t 2m \
+              --host http://127.0.0.1:8000 \
+              --csv loadtest/results/ci-run \
+              --exit-code-on-error 1
+      - name: Show backend log on failure
+        if: failure()
+        run: cat /tmp/backend.log || true
+      - name: Upload load test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-results
+          path: loadtest/results/
+          retention-days: 14
