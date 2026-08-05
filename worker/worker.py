@@ -357,7 +357,27 @@ def bbox_in_roi(bbox, mask: np.ndarray | None) -> bool:
     return False
 
 
+# Цикл 16 (было известным пробелом с цикла 15, см. REVIEW_LOG.md):
+# SELECT ближайшего центроида → сравнение с порогом → INSERT в
+# find_or_create_person() ниже не были атомарны. До 16 нитей camera_worker()
+# (по одной на камеру) делят одну БД — если две камеры видят одного и того
+# же неизвестного человека в одном узком временном окне, обе могут пройти
+# SELECT до того, как другая сделает INSERT, и каждая решит «совпадения
+# нет» — на выходе два разных Person для одного физического человека
+# (классический TOCTOU). Питоновский Lock() эту гонку не закрыл бы — нити
+# разных camera_worker() внутри одного процесса он бы сериализовал, но
+# несколько процессов воркера с общей БД снова гонялись бы. Транзакционный
+# advisory lock Postgres сериализует блок между всеми процессами и нитями,
+# которые используют эту БД, и снимается автоматически на ближайшем
+# commit()/rollback() текущей транзакции — держать его руками не нужно.
+PERSON_DEDUP_LOCK_KEY = 0x46575044  # 'FWPD' (FaceWatch Person Dedup) как bigint-ключ
+
+
 def find_or_create_person(s, emb: np.ndarray) -> tuple[int, bool]:
+    # Держит лок до commit()/rollback() вызывающей стороны — в process_faces()
+    # это s.commit() сразу после вызова, так что окно блокировки — одна
+    # SELECT + опциональный INSERT, не весь цикл обработки кадра.
+    s.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": PERSON_DEDUP_LOCK_KEY})
     res = s.execute(text(
         "SELECT id, 1 - (centroid <=> CAST(:e AS vector)) AS sim FROM persons "
         "WHERE centroid IS NOT NULL ORDER BY centroid <=> CAST(:e AS vector) LIMIT 1"
