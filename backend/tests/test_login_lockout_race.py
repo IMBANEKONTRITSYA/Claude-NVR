@@ -101,6 +101,18 @@ async def test_control_get_then_increment_pattern_exceeds_limit_under_race():
     from app.config import settings
 
     r = redis_asyncio.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        await r.ping()
+    except Exception as e:
+        # Соседние тесты этого файла идут через фикстуру `client`, которая
+        # аккуратно пропускается без Postgres/Redis (см. conftest.py). Этот
+        # тест поднимает своё соединение и до этой правки падал жёстким
+        # ConnectionError, давая ложное "1 failed" в локальном прогоне без
+        # docker-compose. В CI Redis есть сервис-контейнером, так что там
+        # тест как выполнялся, так и выполняется.
+        await r.aclose()
+        pytest.skip(f"Redis недоступен ({settings.REDIS_URL}): {e}")
+
     key = f"login_fail:control-{uuid.uuid4()}:admin"
     n = MAX_ATTEMPTS * 3
 
