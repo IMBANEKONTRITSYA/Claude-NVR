@@ -496,3 +496,62 @@ def test_discover_devices_closes_socket_on_send_failure():
     with pytest.raises(oc.OnvifError):
         oc.discover_devices(timeout=0.01, socket_factory=lambda *a, **kw: fake)
     assert fake.closed is True
+
+
+# ---------------------------------------------------------------------------
+# XML entity expansion ("billion laughs") — все ответы, разбираемые этим
+# модулем, приходят от устройств локальной сети (камера/спуфинг/MITM), не от
+# доверенного сервера. Голый xml.etree.ElementTree раскручивает вложенные
+# ENTITY из DOCTYPE без ограничений; onvif_client.py использует defusedxml,
+# который вместо этого бросает DefusedXmlException (обёрнутый здесь в
+# OnvifError вместе с обычным ET.ParseError — см. импорты в onvif_client.py).
+# ---------------------------------------------------------------------------
+
+_BILLION_LAUGHS = """<?xml version="1.0"?>
+<!DOCTYPE lolz [
+ <!ENTITY lol "lol">
+ <!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+ <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
+ <!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">
+]>
+<root>&lol4;</root>"""
+
+
+def test_create_pull_point_subscription_rejects_entity_expansion_bomb(monkeypatch):
+    _mock_urlopen(monkeypatch, response_bytes=_BILLION_LAUGHS.encode())
+    with pytest.raises(oc.OnvifError):
+        oc.create_pull_point_subscription("192.168.1.64", 80, "admin", "s3cret")
+
+
+def test_pull_messages_rejects_entity_expansion_bomb(monkeypatch):
+    _mock_urlopen(monkeypatch, response_bytes=_BILLION_LAUGHS.encode())
+    with pytest.raises(oc.OnvifError):
+        oc.pull_messages("http://192.168.1.64/onvif/Subscription1", "admin", "s3cret")
+
+
+def test_get_profiles_rejects_entity_expansion_bomb(monkeypatch):
+    _mock_urlopen(monkeypatch, response_bytes=_BILLION_LAUGHS.encode())
+    with pytest.raises(oc.OnvifError):
+        oc.get_profiles("192.168.1.64", 80, "admin", "s3cret")
+
+
+def test_get_stream_uri_rejects_entity_expansion_bomb(monkeypatch):
+    _mock_urlopen(monkeypatch, response_bytes=_BILLION_LAUGHS.encode())
+    with pytest.raises(oc.OnvifError):
+        oc.get_stream_uri("192.168.1.64", 80, "Profile1", "admin", "s3cret")
+
+
+def test_discover_devices_ignores_entity_expansion_bomb_packet():
+    """Вредоносный/скомпрометированный ответчик WS-Discovery не должен суметь
+    раздуть память воркера одним UDP-пакетом — как и с обычным мусорным
+    пакетом (test_discover_devices_ignores_garbage_packets_from_other_wsdd_
+    devices), это не должно ронять всё обнаружение, просто пропускается этот
+    один ответ."""
+    responses = [
+        (_BILLION_LAUGHS.encode(), ("192.168.1.5", 3702)),
+        (PROBE_MATCH_RESPONSE.encode(), ("192.168.1.64", 3702)),
+    ]
+    fake = _FakeDiscoverySocket(responses)
+    devices = oc.discover_devices(timeout=0.01, socket_factory=lambda *a, **kw: fake)
+    assert len(devices) == 1
+    assert devices[0]["host"] == "192.168.1.64"

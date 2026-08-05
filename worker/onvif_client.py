@@ -5,8 +5,9 @@
 камер в сети и получение профилей потоков (третья часть ТЗ 18.7:
 "автообнаружение камер в сети, получение профилей потоков").
 
-Реализован через stdlib (urllib, hashlib, socket, xml.etree) без внешних
-ONVIF-библиотек (onvif-zeep и аналоги тянут zeep/suds — тяжёлые
+Реализован через stdlib (urllib, hashlib, socket) плюс лёгкий defusedxml
+вместо голого xml.etree (см. импорт ниже — защита от XML entity expansion)
+без внешних ONVIF-библиотек (onvif-zeep и аналоги тянут zeep/suds — тяжёлые
 транзитивные зависимости, которых нет и не должно быть в требованиях
 воркера). WS-Security UsernameToken (PasswordDigest) собирается вручную по
 спецификации WS-Security 1.0.
@@ -30,8 +31,28 @@ import urllib.request
 import uuid as _uuid
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
-from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as _xml_escape
+
+# defusedxml.ElementTree — не stdlib xml.etree.ElementTree: все ответы,
+# разбираемые в этом модуле (PullPoint/Media SOAP-ответы, WS-Discovery
+# ProbeMatches), приходят от устройств локальной сети, не от доверенного
+# сервера — камера может быть скомпрометирована, подменена (spoofed device
+# отвечает на multicast Probe) или атакующий может быть MITM на том же
+# сегменте сети. stdlib ElementTree расширяет ENTITY-определения из DOCTYPE
+# без ограничений (нет защиты от "billion laughs": экспоненциальный рост
+# через вложенные entity превращает сотни байт XML в сотни МБ/ГБ в памяти
+# за миллисекунды) — классическая DoS-инъекция через XML (OWASP A03/A05,
+# ТЗ 13 "инъекции... OWASP Top 10"). defusedxml — тот же API (fromstring
+# возвращает обычный xml.etree.ElementTree.Element), но запрещает DOCTYPE/
+# ENTITY/внешние ссылки по умолчанию, бросая DefusedXmlException вместо
+# раскрутки бомбы.
+import defusedxml.ElementTree as ET
+from defusedxml.common import DefusedXmlException
+# defusedxml.ElementTree — только безопасный fromstring/ParseError, без
+# re-export'а самого класса Element; сам Element — просто структура данных
+# (не парсер), импортировать его из stdlib безопасно, парсинг по-прежнему
+# идёт исключительно через defusedxml.ElementTree.fromstring выше.
+from xml.etree.ElementTree import Element
 
 _SOAP_ENV_NS = "http://www.w3.org/2003/05/soap-envelope"
 _EVENTS_NS = "http://www.onvif.org/ver10/events/wsdl"
@@ -57,11 +78,11 @@ def _local(tag: str) -> str:
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
 
-def _find_all(elem: ET.Element, name: str) -> list[ET.Element]:
+def _find_all(elem: Element, name: str) -> list[Element]:
     return [e for e in elem.iter() if _local(e.tag) == name]
 
 
-def _find_one(elem: ET.Element, name: str) -> ET.Element | None:
+def _find_one(elem: Element, name: str) -> Element | None:
     found = _find_all(elem, name)
     return found[0] if found else None
 
@@ -139,7 +160,7 @@ def create_pull_point_subscription(
     raw = _post(url, _soap_envelope(body, username, password), timeout)
     try:
         root = ET.fromstring(raw)
-    except ET.ParseError as e:
+    except (ET.ParseError, DefusedXmlException) as e:
         raise OnvifError(f"невалидный XML в ответе CreatePullPointSubscription: {e}") from e
     addr_elem = _find_one(root, "Address")
     if addr_elem is None or not (addr_elem.text or "").strip():
@@ -168,7 +189,7 @@ def pull_messages(
     raw = _post(subscription_url, _soap_envelope(body, username, password), http_timeout)
     try:
         root = ET.fromstring(raw)
-    except ET.ParseError as e:
+    except (ET.ParseError, DefusedXmlException) as e:
         raise OnvifError(f"невалидный XML в ответе PullMessages: {e}") from e
 
     events = []
@@ -209,7 +230,7 @@ def get_profiles(
     raw = _post(url, _soap_envelope(body, username, password), timeout)
     try:
         root = ET.fromstring(raw)
-    except ET.ParseError as e:
+    except (ET.ParseError, DefusedXmlException) as e:
         raise OnvifError(f"невалидный XML в ответе GetProfiles: {e}") from e
     profiles = []
     for p in _find_all(root, "Profiles"):
@@ -246,7 +267,7 @@ def get_stream_uri(
     raw = _post(url, _soap_envelope(body, username, password), timeout)
     try:
         root = ET.fromstring(raw)
-    except ET.ParseError as e:
+    except (ET.ParseError, DefusedXmlException) as e:
         raise OnvifError(f"невалидный XML в ответе GetStreamUri: {e}") from e
     uri_elem = _find_one(root, "Uri")
     if uri_elem is None or not (uri_elem.text or "").strip():
@@ -296,7 +317,7 @@ def _parse_probe_matches(raw: bytes) -> list[dict]:
     и один битый/чужой пакет не должен ронять весь discover_devices()."""
     try:
         root = ET.fromstring(raw)
-    except ET.ParseError:
+    except (ET.ParseError, DefusedXmlException):
         return []
     devices = []
     for match in _find_all(root, "ProbeMatch"):
