@@ -14,6 +14,7 @@ COPY --from=build /app/dist /usr/share/nginx/html
 # location недопустима; снипет должен подключаться только явно, изнутри
 # server{}.
 COPY nginx-locations.conf /etc/nginx/snippets/nginx-locations.conf
+COPY nginx-security-headers.conf /etc/nginx/snippets/nginx-security-headers.conf
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
