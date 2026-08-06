@@ -39,20 +39,15 @@ import sqlalchemy  # noqa: E402
 
 
 @pytest.fixture()
-def live_db():
-    """Пропуск, если Postgres недоступен (локальный прогон без
-    docker-compose), — иначе здоровое дерево давало бы ложное «failed»
-    (урок цикла 18)."""
-    try:
-        with upscaler.Session() as s:
-            s.execute(sqlalchemy.text("SELECT 1"))
-    except Exception as e:
-        pytest.skip(f"нет живого Postgres: {e}")
-    # На пустой БД (CI-джоба поднимает чистый Postgres) таблиц ещё нет:
-    # их создаёт бэкенд при старте, а эта джоба его не поднимает. На
-    # развёрнутой БД вызов ничего не делает — create_all не трогает
-    # существующие таблицы и не добавляет недостающие колонки.
-    upscaler.Base.metadata.create_all(upscaler.engine)
+def live_db(dedicated_db):
+    """Живое соединение к отдельной БД тестов апскейла.
+
+    Саму БД поднимает и сносит session-фикстура `dedicated_db` в
+    `conftest.py`; там же объяснено, почему тесты апскейла не должны
+    создавать таблицы в общей БД (урезанная модель ломала схему бэкенда).
+    """
+    with upscaler.Session() as s:
+        s.execute(sqlalchemy.text("SELECT 1"))
 
 
 @pytest.fixture()
