@@ -27,6 +27,8 @@ def _camera_out(c: Camera) -> CameraOut:
         has_substream=bool(c.sub_rtsp_url_enc), motion_sensitivity=c.motion_sensitivity,
         onvif_enabled=bool(c.onvif_enabled), has_onvif=bool(c.onvif_host),
         retention_days=c.retention_days,
+        onvif_host=c.onvif_host, onvif_port=c.onvif_port,
+        onvif_username=c.onvif_username,
     )
 
 

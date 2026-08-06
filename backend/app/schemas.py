@@ -146,6 +146,14 @@ class CameraOut(BaseModel):
     onvif_enabled: bool = False
     has_onvif: bool = False
     retention_days: int | None = None
+    # Адрес, порт и логин ONVIF отдаются, чтобы форма редактирования могла
+    # вернуть их обратно без изменений. Без этого «Изм.» открывала пустые
+    # поля, и сохранение затирало ONVIF-настройки камеры: PUT трактует
+    # пустой `onvif_host` как «убрать». Пароль остаётся write-only —
+    # пустое значение при PUT означает «оставить прежний».
+    onvif_host: str | None = None
+    onvif_port: int | None = None
+    onvif_username: str | None = None
 
     class Config:
         from_attributes = True

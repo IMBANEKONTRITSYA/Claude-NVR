@@ -151,6 +151,10 @@ export const api = {
   camAdd: (b: any) => req("/api/cameras", { method: "POST", body: JSON.stringify(b) }),
   camUpdate: (id: number, b: any) => req(`/api/cameras/${id}`, { method: "PUT", body: JSON.stringify(b) }),
   camDelete: (id: number) => req(`/api/cameras/${id}`, { method: "DELETE" }),
+  // Основной RTSP-адрес в открытом виде: в БД он зашифрован, и CameraOut
+  // его не отдаёт. Нужен форме редактирования — без него «Изм.» открывала
+  // форму с пустым полем адреса, и сохранение падало валидацией.
+  camRtsp: (id: number) => req(`/api/cameras/${id}/rtsp`),
   camToggle: (id: number, enabled: boolean) =>
     req(`/api/cameras/${id}/enabled?enabled=${enabled}`, { method: "PATCH" }),
   camRoiGet: (id: number) => req(`/api/cameras/${id}/roi`),
