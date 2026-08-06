@@ -106,12 +106,19 @@ class RtspTest(BaseModel):
     _check_rtsp_url = field_validator("rtsp_url")(_validate_rtsp_url_required)
 
 
+# SPEC §2: камера имеет режим `record_only` (по умолчанию) или `analytics`.
+CAMERA_MODES = ("record_only", "analytics")
+
+
 class CameraIn(BaseModel):
     name: str
     rtsp_url: str                      # основной поток: запись и просмотр
-    sub_rtsp_url: str | None = None    # субпоток: детекция (ТЗ 18.1)
+    sub_rtsp_url: str | None = None    # субпоток: детекция (SPEC §6)
     location: str = ""
     enabled: bool = True
+    # Режим по умолчанию — только запись: аналитика включается явно на
+    # выбранных камерах (SPEC §1, §24).
+    mode: str = Field(default="record_only", pattern="^(record_only|analytics)$")
     motion_sensitivity: int | None = None
     # ТЗ 18.7: события движения/присутствия людей напрямую от ONVIF-камеры
     onvif_enabled: bool = False
@@ -129,6 +136,7 @@ class CameraOut(BaseModel):
     name: str
     location: str
     enabled: bool
+    mode: str = "record_only"
     status: str
     has_substream: bool = False
     motion_sensitivity: int | None = None

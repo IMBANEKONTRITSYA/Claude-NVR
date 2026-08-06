@@ -101,6 +101,39 @@ def pg_conn():
         conn.close()
 
 
+@pytest.fixture(autouse=True)
+def _clear_rate_limit_counters():
+    """Снимает счётчики brute-force перед каждым тестом.
+
+    Счётчики живут в Redis по ключу, привязанному к **id пользователя**
+    (`changepw_fail:{id}`) или к паре IP+логин (`login_fail:{ip}:{name}`), и
+    переживают тест: TTL — 5 минут (routers/auth.py). Postgres между
+    прогонами пересоздаётся, поэтому id начинают выдаваться заново, и
+    пользователь нового прогона получает счётчик пользователя предыдущего —
+    тест на блокировку падает с 429 там, где ожидал 400, причём только в
+    полном прогоне и только если предыдущий был меньше пяти минут назад.
+
+    Это carryover-пункт цикла 23 («кросс-сервисное загрязнение Redis
+    тестами»), воспроизведённый в цикле 24 на другом ключе. Чистятся
+    именно два префикса, а не `FLUSHDB`: `REDIS_URL` в песочнице может
+    указывать на ту же базу, где лежит очередь апскейла и данные разработки.
+    """
+    import redis as sync_redis
+
+    try:
+        r = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
+        for prefix in ("login_fail:*", "changepw_fail:*"):
+            keys = list(r.scan_iter(match=prefix, count=500))
+            if keys:
+                r.delete(*keys)
+        r.close()
+    except Exception:
+        # Redis недоступен — интеграционные тесты и так пропустятся,
+        # а юнит-тесты счётчиков не касаются.
+        pass
+    yield
+
+
 TEST_USER_PASSWORD = "Str0ngPass!23"
 
 
@@ -147,6 +180,42 @@ def make_user(client, admin_headers):
 
     for user_id in created:
         client.delete(f"/api/users/{user_id}", headers=admin_headers)
+
+
+@pytest.fixture()
+def make_camera(client, admin_headers):
+    """Заводит камеру через API и **удаляет её после теста**.
+
+    Возвращает функцию `(name, **поля CameraIn) -> dict` (тело ответа
+    `CameraOut`). Парная к `make_user` и по той же причине: до цикла 24
+    камеры заводились прямо в теле тестов и не убирались за собой, поэтому
+    повторный локальный прогон по той же БД копил их десятками. В CI это
+    не видно — там свежий сервис-контейнер на каждый прогон.
+
+    До появления режима камеры (SPEC §2) протёкшие камеры ничего не ломали,
+    поэтому пробел и жил. С цикла 24 ломают: число камер в режиме
+    `analytics` ограничено настройкой, и накопленные чужие камеры съедают
+    предел, из-за чего падает не тот тест, который протёк.
+    """
+    created = []
+
+    def _make(name: str, **fields):
+        payload = {"name": name, "rtsp_url": f"rtsp://cam/{name}", **fields}
+        r = client.post("/api/cameras", json=payload, headers=admin_headers)
+        assert r.status_code == 200, r.text
+        cam = r.json()
+        created.append(cam["id"])
+        return cam
+
+    # Для камер, созданных в обход фикстуры (например, POST, от которого
+    # ожидался отказ, а он неожиданно прошёл): взять на уборку постфактум,
+    # чтобы упавший тест ронял себя, а не следующий.
+    _make.adopt = created.append
+
+    yield _make
+
+    for cam_id in created:
+        client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
 
 
 @pytest.fixture()

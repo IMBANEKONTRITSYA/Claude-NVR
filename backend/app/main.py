@@ -4,7 +4,7 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from .db import engine, Base, SessionLocal
 from .models import User
 from .auth import hash_password, get_user_from_query_token
@@ -64,6 +64,15 @@ async def apply_schema_migrations(conn):
         "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_username varchar(120)",
         "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_password_enc text",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at timestamp DEFAULT now()",
+        # SPEC §2/§3: режим камеры. Для уже развёрнутых БД колонка добавляется
+        # со значением 'analytics' — до этой миграции аналитика шла по всем
+        # включённым камерам, и молча выключить её на обновлении значило бы
+        # потерять распознавание без единого сообщения. Дефолт для НОВЫХ строк
+        # переключается следующим оператором на 'record_only', как требует ТЗ.
+        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS mode varchar(20) DEFAULT 'analytics'",
+        "UPDATE cameras SET mode = 'analytics' WHERE mode IS NULL",
+        "ALTER TABLE cameras ALTER COLUMN mode SET DEFAULT 'record_only'",
+        "ALTER TABLE cameras ALTER COLUMN mode SET NOT NULL",
     ):
         await conn.execute(text(stmt))
     # HNSW-индексы pgvector для быстрого поиска по эмбеддингам (≤5с на 100k лиц).
@@ -128,6 +137,20 @@ async def lifespan(app: FastAPI):
         }
         rows = (await db.execute(select(Setting))).scalars().all()
         existing = {s.key for s in rows}
+        # SPEC §1: аналитика — «только на N выбранных камерах (по умолчанию 2)».
+        # На свежей БД камер нет и предел равен двум. На БД, обновлённой с
+        # предыдущей редакции ТЗ, аналитика шла по всем камерам, и миграция
+        # выше сохранила им режим analytics — выставить предел в 2 значило бы
+        # оставить систему заведомо «сверх предела»: работать она продолжит,
+        # но любая правка камеры упиралась бы в отказ, которого администратор
+        # ничем не вызывал. Поэтому начальное значение — фактическое число
+        # таких камер, не меньше двух; уменьшить его можно в настройках.
+        if "analytics_cameras_max" not in existing:
+            from .models import Camera
+            analytics_now = (await db.execute(
+                select(func.count()).select_from(Camera).where(Camera.mode == "analytics")
+            )).scalar() or 0
+            defaults["analytics_cameras_max"] = str(max(2, analytics_now))
         for k, v in defaults.items():
             if k not in existing:
                 db.add(Setting(key=k, value=v))

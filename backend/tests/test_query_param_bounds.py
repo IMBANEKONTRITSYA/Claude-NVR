@@ -98,7 +98,7 @@ def test_search_limit_above_ceiling_is_rejected(client, admin_headers):
     assert r.status_code == 422, f"limit=1e8 → {r.status_code}; ожидался 422"
 
 
-def test_enhance_cannot_flood_the_upscale_queue(client, admin_headers, pg_conn):
+def test_enhance_cannot_flood_the_upscale_queue(client, admin_headers, pg_conn, make_camera):
     """`POST /api/persons/{id}/enhance?limit=<много>` не может переполнить
     очередь апскейла.
 
@@ -115,6 +115,11 @@ def test_enhance_cannot_flood_the_upscale_queue(client, admin_headers, pg_conn):
     from app.config import settings
     import redis as sync_redis
 
+    # Камера заводится своя, а не берётся camera_id=1: id=1 существовал
+    # только потому, что соседние тесты оставляли камеры в БД. С фикстурой
+    # make_camera (цикл 24) они за собой убирают, и внешний ключ
+    # face_events -> cameras на жёстко зашитой единице падал бы.
+    cam_id = make_camera("bounds-test-cam")["id"]
     with pg_conn.cursor() as cur:
         cur.execute(
             "INSERT INTO persons (name, status, created_at) "
@@ -124,7 +129,7 @@ def test_enhance_cannot_flood_the_upscale_queue(client, admin_headers, pg_conn):
         for _ in range(5):
             cur.execute(
                 "INSERT INTO face_events (camera_id, person_id, ts, snapshot_path, is_known) "
-                "VALUES (1, %s, NOW(), 'snapshots/bounds.jpg', false)", (pid,)
+                "VALUES (%s, %s, NOW(), 'snapshots/bounds.jpg', false)", (cam_id, pid)
             )
 
     r_client = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)

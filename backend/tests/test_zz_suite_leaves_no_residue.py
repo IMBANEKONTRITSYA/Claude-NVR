@@ -36,3 +36,24 @@ def test_suite_leaves_no_test_users_behind(client, admin_headers):
         "«пользователь уже существует», причём в другом тесте. "
         "Используйте фикстуру make_user из conftest.py — она убирает за собой."
     )
+
+
+def test_suite_leaves_no_test_cameras_behind(client, admin_headers):
+    """Камер после прогона в БД быть не должно.
+
+    Парная проверка к пользовательской и добавлена по той же логике, но с
+    поводом из цикла 24: с появлением режима камеры (SPEC §2) число камер в
+    режиме `analytics` ограничено настройкой, и протёкшая камера съедает
+    предел — падает не тот тест, который её оставил, а следующий, который
+    попытается включить аналитику.
+
+    Заводить камеры следует фикстурой `make_camera` из `conftest.py`: она
+    удаляет их в финализаторе.
+    """
+    r = client.get("/api/cameras", headers=admin_headers)
+    assert r.status_code == 200, r.text
+    leftovers = sorted(c["name"] for c in r.json())
+    assert leftovers == [], (
+        f"после прогона в БД остались камеры, заведённые тестами: {leftovers}. "
+        "Используйте фикстуру make_camera из conftest.py — она убирает за собой."
+    )

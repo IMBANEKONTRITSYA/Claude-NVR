@@ -39,6 +39,10 @@ SCHEMA: dict[str, tuple] = {
     # больше не настраиваются: запись идёт remux'ом основного потока как
     # есть, SPEC §24 явно запрещает перекодирование архива.
     "record_segment_min": (int, 5, 10),
+    # SPEC §1: аналитика — «только на N выбранных камерах (по умолчанию 2)».
+    # Верхняя граница 16 — предел, при котором §23 (2-3 ядра на аналитику)
+    # ещё выполним на целевом сервере без GPU.
+    "analytics_cameras_max": (int, 1, 16),
 }
 
 ENUMS = {
@@ -72,6 +76,7 @@ class SettingsUpdate(BaseModel):
     cluster_interval_min: int | None = None
     detect_width: int | None = None
     record_segment_min: int | None = None
+    analytics_cameras_max: int | None = None
 
 
 def _visible(rows) -> dict[str, str]:
