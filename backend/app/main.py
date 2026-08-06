@@ -23,6 +23,69 @@ from .logging_utils import configure_logging
 logger = configure_logging("facewatch.backend")
 
 
+async def apply_schema_migrations(conn):
+    """Создание таблиц и лёгкие миграции существующих БД.
+
+    Вынесено из `lifespan` отдельной функцией, чтобы блок можно было
+    прогнать в тесте на настоящем Postgres, а не только через полный старт
+    приложения (см. `tests/test_startup_migrations.py`).
+
+    Вызывается внутри `engine.begin()`, то есть **одной транзакцией**: либо
+    применяется всё, либо ничего. Из этого следует правило для всего, что
+    добавляется сюда с `try/except`: в Postgres любой упавший оператор
+    переводит транзакцию в состояние aborted, и перехват исключения его не
+    отменяет — до конца блока не выполнится ни один следующий оператор, а
+    на выходе откатится всё, включая `create_all` и миграции выше. Поэтому
+    операторы, отказ которых допустим, обязаны выполняться через
+    `conn.begin_nested()` (SAVEPOINT): откат идёт до точки сохранения, и
+    транзакция остаётся рабочей (см. docs/reviews/REVIEW_LOG.md, цикл 23).
+    """
+    await conn.run_sync(Base.metadata.create_all)
+    # Лёгкие миграции для существующих БД (create_all не добавляет колонки)
+    for stmt in (
+        "ALTER TABLE face_events ADD COLUMN IF NOT EXISTS orig_snapshot_path varchar(500)",
+        "ALTER TABLE face_events ADD COLUMN IF NOT EXISTS enhanced boolean DEFAULT false",
+        "ALTER TABLE face_events ALTER COLUMN enhanced SET DEFAULT false",
+        "ALTER TABLE persons ADD COLUMN IF NOT EXISTS notes text",
+        "ALTER TABLE persons ADD COLUMN IF NOT EXISTS alert_on_detection boolean DEFAULT false",
+        # ADD COLUMN IF NOT EXISTS выше — no-op на БД, где колонка уже была добавлена
+        # раньше без DEFAULT (до этого фикса): raw SQL INSERT в routers/persons.py,
+        # который не указывает эту колонку явно, падал NotNullViolationError на
+        # каждый вызов. SET DEFAULT применяется безусловно, чтобы починить и такие
+        # уже развёрнутые БД, не только свежие (см. docs/reviews/REVIEW_LOG.md, цикл 5).
+        "ALTER TABLE persons ALTER COLUMN alert_on_detection SET DEFAULT false",
+        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS sub_rtsp_url_enc text",
+        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS motion_sensitivity integer",
+        # ТЗ 18.7: ONVIF-события движения/присутствия людей вместо MOG2-префильтра.
+        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_enabled boolean DEFAULT false",
+        "ALTER TABLE cameras ALTER COLUMN onvif_enabled SET DEFAULT false",
+        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_host varchar(255)",
+        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_port integer",
+        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_username varchar(120)",
+        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_password_enc text",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at timestamp DEFAULT now()",
+    ):
+        await conn.execute(text(stmt))
+    # HNSW-индексы pgvector для быстрого поиска по эмбеддингам (≤5с на 100k лиц).
+    # Единственные операторы блока, отказ которых не должен ронять старт:
+    # индекс — ускорение, без него приложение работает. Каждый идёт в своём
+    # SAVEPOINT — см. docstring выше: без него отказ (например,
+    # `access method "hnsw" does not exist` на pgvector < 0.5.0 — ровно тот
+    # случай, ради которого здесь стоит `except`) откатывал весь блок, а в
+    # логе оставалось одно предупреждение про индекс.
+    for stmt in (
+        "CREATE INDEX IF NOT EXISTS idx_face_events_embedding ON face_events "
+        "USING hnsw (embedding vector_cosine_ops)",
+        "CREATE INDEX IF NOT EXISTS idx_persons_centroid ON persons "
+        "USING hnsw (centroid vector_cosine_ops)",
+    ):
+        try:
+            async with conn.begin_nested():
+                await conn.execute(text(stmt))
+        except Exception:
+            logger.warning("не удалось создать HNSW-индекс", exc_info=True, extra={"statement": stmt})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not settings.ALLOW_INSECURE_DEFAULT_SECRETS:
@@ -42,70 +105,7 @@ async def lifespan(app: FastAPI):
     os.makedirs(os.path.join(settings.MEDIA_PATH, "avatars"), exist_ok=True)
     os.makedirs(os.path.join(settings.MEDIA_PATH, "uploads"), exist_ok=True)
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # Лёгкие миграции для существующих БД (create_all не добавляет колонки)
-        await conn.execute(text(
-            "ALTER TABLE face_events ADD COLUMN IF NOT EXISTS orig_snapshot_path varchar(500)"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE face_events ADD COLUMN IF NOT EXISTS enhanced boolean DEFAULT false"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE face_events ALTER COLUMN enhanced SET DEFAULT false"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE persons ADD COLUMN IF NOT EXISTS notes text"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE persons ADD COLUMN IF NOT EXISTS alert_on_detection boolean DEFAULT false"
-        ))
-        # ADD COLUMN IF NOT EXISTS выше — no-op на БД, где колонка уже была добавлена
-        # раньше без DEFAULT (до этого фикса): raw SQL INSERT в routers/persons.py,
-        # который не указывает эту колонку явно, падал NotNullViolationError на
-        # каждый вызов. SET DEFAULT применяется безусловно, чтобы починить и такие
-        # уже развёрнутые БД, не только свежие (см. docs/reviews/REVIEW_LOG.md, цикл 5).
-        await conn.execute(text(
-            "ALTER TABLE persons ALTER COLUMN alert_on_detection SET DEFAULT false"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS sub_rtsp_url_enc text"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS motion_sensitivity integer"
-        ))
-        # ТЗ 18.7: ONVIF-события движения/присутствия людей вместо MOG2-префильтра.
-        await conn.execute(text(
-            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_enabled boolean DEFAULT false"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE cameras ALTER COLUMN onvif_enabled SET DEFAULT false"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_host varchar(255)"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_port integer"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_username varchar(120)"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_password_enc text"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at timestamp DEFAULT now()"
-        ))
-        # HNSW-индексы pgvector для быстрого поиска по эмбеддингам (≤5с на 100k лиц)
-        for stmt in (
-            "CREATE INDEX IF NOT EXISTS idx_face_events_embedding ON face_events "
-            "USING hnsw (embedding vector_cosine_ops)",
-            "CREATE INDEX IF NOT EXISTS idx_persons_centroid ON persons "
-            "USING hnsw (centroid vector_cosine_ops)",
-        ):
-            try:
-                await conn.execute(text(stmt))
-            except Exception:
-                logger.warning("не удалось создать HNSW-индекс", exc_info=True, extra={"statement": stmt})
+        await apply_schema_migrations(conn)
     async with SessionLocal() as db:
         r = await db.execute(select(User).where(User.username == "admin"))
         if not r.scalar_one_or_none():

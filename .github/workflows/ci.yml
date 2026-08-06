@@ -70,7 +70,9 @@ jobs:
         # поднят до 74, чтобы разрыв с фактическим покрытием снова не рос.
         # Цикл 21: test_query_param_bounds.py (границы числовых параметров на
         # 12 эндпоинтах) поднял покрытие до 78% — порог поднят до 76.
-        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=76 -q
+        # Цикл 23: test_startup_migrations.py (блок стартовых миграций на
+        # временной БД) поднял покрытие до 79% — порог поднят до 77.
+        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=77 -q
 
   worker:
     runs-on: ubuntu-latest
