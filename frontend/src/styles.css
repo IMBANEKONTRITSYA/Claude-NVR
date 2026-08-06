@@ -87,3 +87,58 @@ th { color: var(--muted); font-weight: 500; }
 
 .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
 .empty { color: var(--muted); padding: 24px; text-align: center; }
+
+/* --- Навигация: разделы вместо плоского списка из 13 ссылок ------------- */
+/* Сгруппированный список читается взглядом за один проход: пункт ищут
+   внутри раздела, а не перебором всего меню. */
+.sidebar { display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; }
+.sidebar .nav-scroll { flex: 1; overflow-y: auto; margin: 0 -16px; padding: 0 16px; }
+.nav-group { margin-bottom: 14px; }
+.nav-group > .nav-group-title {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--muted); padding: 0 10px; margin-bottom: 4px; font-weight: 600;
+}
+.nav a { font-size: 13px; padding: 7px 10px; margin-bottom: 2px; border-left: 2px solid transparent; }
+.nav a.active {
+  background: var(--panel); border-left-color: var(--accent); color: #fff; font-weight: 500;
+}
+
+/* --- Секции формы ------------------------------------------------------- */
+/* Длинная форма одним столбцом заставляет скроллить, чтобы понять, какие
+   поля вообще есть. Секция с заголовком делает состав видимым сразу. */
+.section { border-top: 1px solid var(--border); padding-top: 14px; margin-top: 14px; }
+.section:first-child { border-top: none; padding-top: 0; margin-top: 0; }
+.section > h4 {
+  margin: 0 0 10px; font-size: 12px; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--muted); font-weight: 600;
+}
+.field { margin-bottom: 10px; }
+.field > label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+.field > .hint { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.4; }
+.field input, .field select, .field textarea { margin: 0; }
+
+/* --- Вкладки ------------------------------------------------------------ */
+/* Ручное добавление и поиск в сети — независимые задачи; на одной странице
+   подряд они дают бесконечный скролл, в котором теряется список камер. */
+.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+.tabs button {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--muted); padding: 8px 14px; cursor: pointer; font-size: 13px;
+  font-family: inherit; border-radius: 0;
+}
+.tabs button:hover { color: var(--text); }
+.tabs button.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 500; }
+
+/* --- Таблицы ------------------------------------------------------------ */
+/* Плотнее и с липкой шапкой: на 120 камерах прокрутка уводила заголовки, и
+   колонку приходилось угадывать. */
+table th {
+  position: sticky; top: 0; z-index: 1; background: var(--bg2);
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--muted); font-weight: 600; text-align: left;
+}
+table td, table th { padding: 7px 10px; }
+table tbody tr { border-top: 1px solid var(--border); }
+table tbody tr:hover { background: var(--bg2); }
+.table-scroll { max-height: 60vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+.btn.sm { padding: 3px 9px; font-size: 12px; }
