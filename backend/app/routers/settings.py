@@ -43,6 +43,13 @@ SCHEMA: dict[str, tuple] = {
     # Верхняя граница 16 — предел, при котором §23 (2-3 ядра на аналитику)
     # ещё выполним на целевом сервере без GPU.
     "analytics_cameras_max": (int, 1, 16),
+    # SPEC §5, §21: циклическая перезапись и алерты по заполнению диска.
+    # Верхняя граница 50% у порога перезаписи — выше него «свободное место»
+    # перестаёт быть аварийным запасом и превращается в способ выбросить
+    # половину архива настройкой в одно поле.
+    "disk_min_free_pct": (int, 1, 50),
+    "disk_warn_pct": (int, 50, 99),
+    "disk_crit_pct": (int, 50, 99),
 }
 
 ENUMS = {
@@ -77,6 +84,9 @@ class SettingsUpdate(BaseModel):
     detect_width: int | None = None
     record_segment_min: int | None = None
     analytics_cameras_max: int | None = None
+    disk_min_free_pct: int | None = None
+    disk_warn_pct: int | None = None
+    disk_crit_pct: int | None = None
 
 
 def _visible(rows) -> dict[str, str]:

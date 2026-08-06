@@ -189,6 +189,10 @@ export const api = {
   listProfiles: () => req("/api/settings/profiles"),
   applyProfile: (name: string) => req(`/api/settings/profile/${name}`, { method: "POST" }),
   sysMetrics: () => req("/api/system/metrics"),
+  // SPEC §5, §21: заполнение диска, фактический расход, прогноз хранения
+  storage: () => req("/api/system/storage"),
+  storageCalc: (bitrate_kbps: number, cameras: number, days: number) =>
+    req(`/api/system/storage/calculator?bitrate_kbps=${bitrate_kbps}&cameras=${cameras}&days=${days}`),
   health: async () => {
     const r = await fetch("/api/health");
     try { return await r.json(); } catch { return { ok: false, db: "?", redis: "?" }; }

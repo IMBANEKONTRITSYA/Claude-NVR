@@ -22,6 +22,7 @@ import time
 import json
 import uuid
 import shlex
+import shutil
 import signal
 import threading
 import subprocess
@@ -36,7 +37,8 @@ from cryptography.fernet import Fernet
 from sklearn.cluster import DBSCAN
 from sqlalchemy import create_engine, select, text, delete, update
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, JSON, Text
+from sqlalchemy import (Column, Integer, BigInteger, String, DateTime, Boolean,
+                        ForeignKey, JSON, Text)
 from pgvector.sqlalchemy import Vector
 
 from backoff import reconnect_delay
@@ -45,6 +47,8 @@ from fileage import prune_media
 from record_layer import MediaMTXClient, path_conf, path_name, sync_paths
 from segment_index import index_new_segments
 from snapshot_http import fetch_snapshot_bytes
+from storage import (BYTES_PER_GB, bytes_to_free, disk_alert_level,
+                     expired_segments, oldest_segments_to_free)
 from shutdown import shutdown_event, handle_shutdown_signal
 from logging_utils import configure_logging
 from hwaccel import hw_decode_requested, detect_hw_accelerator_name
@@ -89,6 +93,15 @@ CONFIG = {
     # больше не настраиваются: запись идёт remux'ом как есть, §24 явно
     # запрещает перекодирование архива.
     "record_segment_min": 5,
+    # SPEC §5, §21: циклическая перезапись. Ниже этого процента свободного
+    # места сносятся старейшие сегменты независимо от их retention.
+    # 5% — запас, которого хватает записи пережить час до следующего
+    # прохода уборки на 120 камерах (~30 MB/s → ~108 ГБ/час, то есть 5% от
+    # тома в 2 ТБ и выше).
+    "disk_min_free_pct": 5,
+    # SPEC §14: пороги алертов по заполнению диска.
+    "disk_warn_pct": 80,
+    "disk_crit_pct": 90,
 }
 
 # Типы значений настроек: как приводить строку из БД
@@ -99,6 +112,7 @@ _CONFIG_TYPES = {
     "frame_skip": int, "motion_prefilter": int, "idle_fps": int,
     "face_model": str, "upscale_mode": str, "cluster_interval_min": int,
     "detect_width": int, "record_segment_min": int,
+    "disk_min_free_pct": int, "disk_warn_pct": int, "disk_crit_pct": int,
 }
 
 # Секунд без движения, после которых камера уходит в «спящий» режим детекции
@@ -215,6 +229,9 @@ class Camera(Base):
     onvif_port = Column(Integer)
     onvif_username = Column(String)
     onvif_password_enc = Column(Text)
+    # SPEC §5: собственная глубина хранения камеры; NULL — следовать за
+    # глобальной настройкой (см. models.py бэкенда).
+    retention_days = Column(Integer)
 
 
 class Person(Base):
@@ -251,6 +268,8 @@ class VideoSegment(Base):
     file_path = Column(String)
     event_type = Column(String)
     duration_sec = Column(Integer)
+    # SPEC §21: фактический расход и выбор жертв циклической перезаписи.
+    size_bytes = Column(BigInteger, default=0)
 
 
 def detect_providers() -> list[str]:
@@ -1134,27 +1153,146 @@ def recluster_unknowns():
             logger.info("рекластеризация: объединено персон", extra={"merged_count": merged})
 
 
+def _drop_segments(s, segments) -> int:
+    """Удаляет файлы сегментов и их строки. Возвращает число удалённых.
+
+    Файл удаляется до строки: обратный порядок оставлял бы при падении
+    процесса файл без строки — он не виден архиву, не попадает ни под
+    retention, ни под циклическую перезапись, и место держит навсегда.
+    Строка без файла, наоборот, самоисправляется — следующий проход её
+    снесёт, а до того архив отдаст на неё честный 404.
+    """
+    dropped = 0
+    for seg in segments:
+        try:
+            if seg.file_path and os.path.exists(seg.file_path):
+                os.remove(seg.file_path)
+        except Exception:
+            pass
+        s.delete(seg)
+        dropped += 1
+    return dropped
+
+
 def cleanup_old():
-    cutoff = datetime.utcnow() - timedelta(days=CONFIG["retention_days"])
+    """Ротация архива по сроку хранения (SPEC §5: глобально и по камерам)."""
+    now = datetime.utcnow()
+    global_days = CONFIG["retention_days"]
     with Session() as s:
-        old = s.execute(select(VideoSegment).where(VideoSegment.started_at < cutoff)).scalars().all()
-        for seg in old:
-            try:
-                if seg.file_path and os.path.exists(seg.file_path):
-                    os.remove(seg.file_path)
-            except Exception:
-                pass
-            s.delete(seg)
-        s.execute(delete(FaceEvent).where(FaceEvent.ts < cutoff))
+        # Собственные сроки камер. Читаются на каждом проходе, а не
+        # кэшируются: срок правится в админке и должен применяться со
+        # следующей уборки, без перезапуска воркера (SPEC §2).
+        per_camera = dict(
+            s.execute(select(Camera.id, Camera.retention_days)).all()
+        )
+        # Отбор с запасом: по самому длинному сроку из действующих. Камера
+        # со сроком меньше глобального иначе не чистилась бы вовсе, а
+        # выбирать все строки архива (сотни тысяч на 120 камерах) ради
+        # фильтрации в Python нельзя.
+        horizon = max([global_days] + [d for d in per_camera.values() if d])
+        candidates = s.execute(
+            select(VideoSegment).where(
+                VideoSegment.started_at < now - timedelta(days=min(
+                    [global_days] + [d for d in per_camera.values() if d]))
+            ).order_by(VideoSegment.started_at)
+        ).scalars().all()
+        expired = expired_segments(candidates, now, global_days, per_camera)
+        dropped = _drop_segments(s, expired)
+        # События лиц идут по глобальному сроку: они привязаны к камере
+        # analytics, но карточка персоны собирается из событий всех камер, и
+        # разная глубина по камерам рвала бы её непредсказуемо.
+        s.execute(delete(FaceEvent).where(FaceEvent.ts < now - timedelta(days=global_days)))
         s.commit()
+    if dropped:
+        logger.info("ротация архива по сроку хранения",
+                    extra={"segments_removed": dropped, "horizon_days": horizon})
 
     # Возраст файлов считается в naive-UTC (fileage.mtime_utc), тем же видом
     # времени, что и cutoff от utcnow(). Раньше здесь стоял
     # datetime.fromtimestamp() без tz, то есть локальное время хоста, и
     # сравнение уезжало на смещение часового пояса — см. fileage.py.
-    removed = prune_media(MEDIA_PATH, cutoff, datetime.utcnow() - timedelta(hours=1))
+    removed = prune_media(MEDIA_PATH, now - timedelta(days=global_days),
+                          now - timedelta(hours=1))
     if any(removed.values()):
         logger.info("уборка медиа-файлов", extra={"removed": removed})
+
+
+def enforce_disk_quota() -> int:
+    """Циклическая перезапись: сносит старейшие сегменты при переполнении.
+
+    SPEC §5 («циклическая перезапись») и §21 («автоудаление старейших
+    сегментов при переполнении»). Механизм аварийный и намеренно
+    независимый от retention: он срабатывает ровно тогда, когда расчёт
+    хранения не сошёлся с фактическим битрейтом — VBR и smart-кодек дают
+    разброс, из-за которого 14 дней по номиналу могут не влезть. Без него
+    запись встала бы целиком, что хуже, чем потеря самых старых суток.
+
+    Идёт по всему архиву по времени, а не по камерам: решение «чьей
+    записью жертвовать» администратор уже выразил через retention, и
+    принимать его второй раз здесь было бы дублированием с другим ответом.
+    """
+    try:
+        du = shutil.disk_usage(MEDIA_PATH)
+    except OSError:
+        logger.error("не удалось прочитать заполнение диска архива", exc_info=True)
+        return 0
+
+    target_free_pct = float(CONFIG["disk_min_free_pct"])
+    need = bytes_to_free(du.total, du.free, target_free_pct)
+    if not need:
+        return 0
+
+    with Session() as s:
+        # LIMIT, а не весь архив: на переполненном диске кандидатов —
+        # сотни тысяч строк, а освободить нужно проценты от объёма.
+        # Не хватит одного прохода — добьёт следующий через час.
+        oldest = s.execute(
+            select(VideoSegment).order_by(VideoSegment.started_at).limit(5000)
+        ).scalars().all()
+        victims = oldest_segments_to_free(oldest, need)
+        dropped = _drop_segments(s, victims)
+        s.commit()
+
+    if dropped:
+        logger.warning(
+            "циклическая перезапись: диск заполнен, удалены старейшие сегменты",
+            extra={"segments_removed": dropped, "need_bytes": need,
+                   "free_pct": round(du.free * 100.0 / max(1, du.total), 1)},
+        )
+    return dropped
+
+
+def check_disk_alerts() -> str | None:
+    """Алерт по заполнению диска архива (SPEC §14: «диск > 80%/90%»).
+
+    Возвращает уровень, чтобы вызывающий (и тест) видел решение, а не
+    только побочный эффект в логе.
+    """
+    try:
+        du = shutil.disk_usage(MEDIA_PATH)
+    except OSError:
+        return None
+    if du.total <= 0:
+        return None
+    used_pct = du.used * 100.0 / du.total
+    level = disk_alert_level(used_pct, float(CONFIG["disk_warn_pct"]),
+                             float(CONFIG["disk_crit_pct"]))
+    if not level:
+        return None
+    # Кулдаун: диск заполняется медленно, и без него сообщение уходило бы
+    # каждый проход менеджера. Отдельный ключ на уровень — переход
+    # warning → critical не должен ждать конца кулдауна предупреждения.
+    try:
+        if r.set(f"alert:disk:{level}", "1",
+                 ex=CONFIG["alert_cooldown_sec"], nx=True) is None:
+            return level
+    except Exception:
+        pass
+    log = logger.error if level == "critical" else logger.warning
+    log("заполнение диска архива",
+        extra={"level": level, "used_pct": round(used_pct, 1),
+               "free_gb": round(du.free / BYTES_PER_GB, 1)})
+    return level
 
 
 def record_layer_sync(cams) -> None:
@@ -1291,6 +1429,26 @@ def manager():
                     cleanup_old()
                 except Exception:
                     logger.error("ошибка очистки (cleanup)", exc_info=True)
+
+            # Заполнение диска проверяется на каждом проходе (~10 с), а не
+            # раз в час вместе с retention: между часовыми проходами 120
+            # камер успевают дописать ~108 ГБ, и на переполненном томе
+            # запись встала бы задолго до следующей уборки. На здоровом
+            # диске оба вызова — это два statvfs и ни одного запроса к БД.
+            #
+            # Порог перезаписи (`disk_min_free_pct`) и пороги алертов
+            # (`disk_warn_pct`/`disk_crit_pct`) независимы намеренно: они
+            # настраиваются раздельно и могут стоять в любом порядке.
+            # Связать их (например, «сносить только при critical») значило
+            # бы, что понижение порога алерта молча отключает перезапись.
+            try:
+                check_disk_alerts()
+            except Exception:
+                logger.error("ошибка проверки заполнения диска", exc_info=True)
+            try:
+                enforce_disk_quota()
+            except Exception:
+                logger.error("ошибка циклической перезаписи", exc_info=True)
 
             # Пакетная кластеризация (ТЗ 18.6): интервал задаётся профилем,
             # выполняется в фоновой нити с пониженным приоритетом.

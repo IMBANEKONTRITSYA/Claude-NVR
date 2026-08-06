@@ -126,6 +126,9 @@ class CameraIn(BaseModel):
     onvif_port: int | None = None
     onvif_username: str | None = None
     onvif_password: str | None = None  # пусто при PUT — оставить прежний пароль без изменений
+    # SPEC §5: глубина хранения по камере. None — следовать за глобальной
+    # настройкой (а не «ноль дней»), см. models.Camera.retention_days.
+    retention_days: int | None = Field(default=None, ge=1, le=3650)
 
     _check_rtsp_url = field_validator("rtsp_url")(_validate_rtsp_url_required)
     _check_sub_rtsp_url = field_validator("sub_rtsp_url")(_validate_rtsp_url_optional)
@@ -142,6 +145,7 @@ class CameraOut(BaseModel):
     motion_sensitivity: int | None = None
     onvif_enabled: bool = False
     has_onvif: bool = False
+    retention_days: int | None = None
 
     class Config:
         from_attributes = True

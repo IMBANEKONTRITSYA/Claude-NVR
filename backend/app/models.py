@@ -1,5 +1,6 @@
 from datetime import datetime
-from sqlalchemy import String, Integer, DateTime, ForeignKey, Boolean, JSON, Text, func, text
+from sqlalchemy import (String, Integer, BigInteger, DateTime, ForeignKey, Boolean, JSON,
+                        Text, func, text)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 from .db import Base
@@ -62,6 +63,11 @@ class Camera(Base):
     onvif_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     onvif_username: Mapped[str | None] = mapped_column(String(120), nullable=True)
     onvif_password_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # SPEC §5, §21: «настраиваемая глубина хранения (глобально и по камерам)».
+    # NULL — не «ноль дней», а «следовать за глобальной настройкой»: камера
+    # без собственного срока продолжает следовать за ней и после её
+    # изменения, чего копия значения в момент создания камеры не дала бы.
+    retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class Person(Base):
@@ -97,8 +103,18 @@ class VideoSegment(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     ended_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     file_path: Mapped[str] = mapped_column(String(500))
-    event_type: Mapped[str] = mapped_column(String(20))  # motion|face
+    event_type: Mapped[str] = mapped_column(String(20))  # continuous|motion|face
     duration_sec: Mapped[int] = mapped_column(Integer, default=0)
+    # SPEC §21: размер нужен для двух вещей, которые иначе пришлось бы
+    # считать обходом файловой системы на каждый запрос, — фактического
+    # расхода за сутки (калибровка прогноза против номинала `Mbps × 10.8`)
+    # и выбора старейших сегментов под циклическую перезапись.
+    # BigInteger: сутки записи одной камеры — ~21.6 ГБ, но колонка держит
+    # размер одного сегмента, и 4 байта хватило бы; тип взят с запасом,
+    # потому что суммирование по колонке идёт в БД и переполнение SUM на
+    # 120 камерах × 14 дней (~36 ТБ) на int4 было бы реальным.
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0,
+                                            server_default=text("0"))
 
 
 class Setting(Base):
