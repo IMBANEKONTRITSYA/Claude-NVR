@@ -26,7 +26,7 @@ import shutil
 import signal
 import threading
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import cv2
 import base64
@@ -35,7 +35,7 @@ import numpy as np
 import redis
 from cryptography.fernet import Fernet
 from sklearn.cluster import DBSCAN
-from sqlalchemy import create_engine, select, text, delete, update
+from sqlalchemy import create_engine, select, text, delete, update, func
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import (Column, Integer, BigInteger, String, DateTime, Boolean,
                         ForeignKey, JSON, Text)
@@ -45,6 +45,8 @@ from backoff import reconnect_delay
 from face_select import pick_matching_face
 from fileage import prune_media
 from record_layer import MediaMTXClient, path_conf, path_name, sync_paths
+from record_status import (newly_lost, newly_restored, segment_gaps,
+                           stream_states, summarize)
 from segment_index import index_new_segments
 from snapshot_http import fetch_snapshot_bytes
 from storage import (BYTES_PER_GB, bytes_to_free, disk_alert_level,
@@ -117,6 +119,11 @@ _CONFIG_TYPES = {
 
 # Секунд без движения, после которых камера уходит в «спящий» режим детекции
 IDLE_AFTER_SEC = 20
+
+# Статусы потоков слоя записи с предыдущего прохода менеджера: по ним
+# считается ПЕРЕХОД online → offline (SPEC §14 требует алерт на потерю
+# потока, а не на факт «сейчас offline» — см. record_status.newly_lost).
+_record_prev_status: dict[int, str] | None = None
 
 # pool_size подобран под целевую нагрузку ТЗ: каждая из до 16 камер держит
 # свой поток с короткоживущими сессиями (load_cam_state, запись событий),
@@ -1318,6 +1325,104 @@ def record_layer_sync(cams) -> None:
         logger.info("синхронизация слоя записи", extra=stats)
 
 
+def publish_record_layer_status(cam_names) -> dict:
+    """Статус каждого потока слоя записи → Redis (SPEC §14, §9).
+
+    SPEC §14 требует «статус каждого RTSP-потока слоя записи (120 шт.)» на
+    дашборде администратора, §9 — сводку «активные потоки (из 120)».
+    Источник — Control API MediaMTX; бэкенд к нему не ходит сам намеренно:
+    Control API даёт доступ к RTSP-адресам всех камер с учётными данными и
+    наружу не публикуется (решение цикла 24), поэтому наружу состояние
+    выносит воркер через Redis — тем же способом, что и `worker:fps`.
+
+    Возвращает состояния, чтобы вызывающий (и тест) видел решение, а не
+    только запись в Redis.
+    """
+    global _record_prev_status
+
+    try:
+        runtime = MediaMTXClient(MEDIAMTX_API_URL).runtime_paths()
+    except Exception:
+        # Control API недоступен — это `unknown`, а не «120 камер offline»:
+        # см. пояснение в record_status.py. Ошибка логируется на debug, а не
+        # error: при рестарте MediaMTX она штатная и повторяется каждые 10 с.
+        logger.debug("Control API MediaMTX недоступен", exc_info=True)
+        runtime = None
+
+    states = stream_states(cam_names, runtime)
+
+    # Потеря и восстановление потока — в аудит и алертинг (SPEC §14).
+    # Считается переход, а не текущее состояние: иначе физически
+    # выключенная камера слала бы алерт каждые десять секунд.
+    for cam_id in newly_lost(_record_prev_status, states):
+        logger.error("потерян поток слоя записи",
+                     extra={"camera_id": cam_id, "event": "record_stream_lost"})
+    for cam_id in newly_restored(_record_prev_status, states):
+        logger.info("поток слоя записи восстановлен",
+                    extra={"camera_id": cam_id, "event": "record_stream_restored"})
+
+    # Пропуск записи сегмента (SPEC §14) — отдельный алерт: поток может быть
+    # online, а файлы не расти (нет места, права, сбой записи в MediaMTX).
+    try:
+        # Время везде в naive-UTC — том же виде, в котором лежат метки в БД
+        # (соглашение `fileage.py`). `ended_at.timestamp()` здесь был бы
+        # ошибкой: на naive-datetime он трактует значение как локальное
+        # время хоста, и на непустой `TZ` проверка «сегмент не пишется
+        # дольше N минут» уехала бы ровно на смещение пояса — в одну
+        # сторону молчала бы всегда, в другую алертила бы всегда.
+        gaps = segment_gaps(_last_segment_ts(states.keys()), states,
+                            _utc_seconds(datetime.utcnow()),
+                            CONFIG["record_segment_min"])
+        for cam_id in gaps:
+            logger.error("пропуск записи сегмента",
+                         extra={"camera_id": cam_id, "event": "record_segment_missing"})
+    except Exception:
+        logger.error("не удалось проверить пропуски сегментов", exc_info=True)
+        gaps = []
+
+    _record_prev_status = {cid: st["status"] for cid, st in states.items()}
+
+    payload = {"streams": list(states.values()), "summary": summarize(states),
+               "segment_gaps": gaps, "updated_at": time.time()}
+    try:
+        r.set("record:layer", json.dumps(payload), ex=120)
+    except Exception:
+        # Redis лежит — состояние просто не доедет до интерфейса; ронять из-за
+        # этого проход менеджера (а с ним синхронизацию записи) нельзя.
+        logger.debug("не удалось опубликовать статус слоя записи", exc_info=True)
+    return payload
+
+
+def _utc_seconds(dt: datetime) -> float:
+    """naive-UTC → секунды, сравнимые между собой.
+
+    Не `dt.timestamp()`: тот интерпретирует naive-значение как локальное
+    время хоста (см. `fileage.py`). Здесь обе стороны сравнения проходят
+    через одно и то же преобразование, поэтому разность корректна при
+    любом часовом поясе контейнера.
+    """
+    return dt.replace(tzinfo=timezone.utc).timestamp()
+
+
+def _last_segment_ts(camera_ids) -> dict[int, float]:
+    """Время последнего дописанного сегмента по каждой камере (naive-UTC).
+
+    Читается из архива, а не с диска: строка появляется там только после
+    того, как файл дописан и проиндексирован, — это и есть признак «запись
+    идёт», который проверяет SPEC §14.
+    """
+    ids = list(camera_ids)
+    if not ids:
+        return {}
+    with Session() as s:
+        rows = s.execute(
+            select(VideoSegment.camera_id, func.max(VideoSegment.ended_at))
+            .where(VideoSegment.camera_id.in_(ids))
+            .group_by(VideoSegment.camera_id)
+        ).all()
+    return {cam_id: _utc_seconds(ended) for cam_id, ended in rows if ended}
+
+
 def index_record_segments() -> None:
     """Заносит дописанные сегменты слоя записи в архив (`video_segments`).
 
@@ -1369,6 +1474,7 @@ def manager():
                 except Exception:
                     logger.error("не удалось сменить модель", exc_info=True)
             record_cams: list[tuple[int, str]] = []
+            record_cam_names: list[tuple[int, str]] = []
             with Session() as s:
                 cams = s.execute(select(Camera).where(Camera.enabled == True)).scalars().all()
                 for cam in cams:
@@ -1383,6 +1489,7 @@ def manager():
                     # аналитики: камера попадает в него сразу после расшифровки
                     # адреса (SPEC §2).
                     record_cams.append((cam.id, rtsp))
+                    record_cam_names.append((cam.id, cam.name or f"Камера {cam.id}"))
                     # SPEC §6: детекция и распознавание — только на камерах в
                     # режиме analytics. На камерах record_only нить не
                     # поднимается вовсе: на целевых 120 камерах это ровно то,
@@ -1421,6 +1528,14 @@ def manager():
             except Exception:
                 logger.error("не удалось синхронизировать слой записи", exc_info=True)
             index_record_segments()
+
+            # Статус потоков записи — после индексации: проверка пропуска
+            # сегмента смотрит на последнюю занесённую строку, и порядок
+            # наоборот давал бы ложный пропуск ровно на один проход.
+            try:
+                publish_record_layer_status(record_cam_names)
+            except Exception:
+                logger.error("не удалось собрать статус слоя записи", exc_info=True)
 
             now = time.time()
             if now - last_cleanup > 3600:

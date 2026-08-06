@@ -191,6 +191,8 @@ export const api = {
   sysMetrics: () => req("/api/system/metrics"),
   // SPEC §5, §21: заполнение диска, фактический расход, прогноз хранения
   storage: () => req("/api/system/storage"),
+  // SPEC §14, §9: статус каждого из 120 потоков слоя записи
+  recordLayer: () => req("/api/system/record-layer"),
   storageCalc: (bitrate_kbps: number, cameras: number, days: number) =>
     req(`/api/system/storage/calculator?bitrate_kbps=${bitrate_kbps}&cameras=${cameras}&days=${days}`),
   health: async () => {

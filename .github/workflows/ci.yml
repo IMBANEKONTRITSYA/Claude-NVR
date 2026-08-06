@@ -144,6 +144,39 @@ jobs:
         working-directory: upscaler
         run: pytest tests/ -q
 
+  perf:
+    runs-on: ubuntu-latest
+    # Бенчмарки горячих путей (SPEC §19, §23, §26): decode FPS, стоимость
+    # префильтра движения, ms/лицо на CPU. Джоба НЕ гейтит мердж по
+    # абсолютным числам и не может: раннер GitHub мощнее целевого сервера
+    # (2× Xeon E5-2670, без AVX2), и любой порог, взятый с него, на
+    # целевом железе не значил бы ничего.
+    #
+    # Смысл в другом: числа печатаются в лог и складываются в артефакт,
+    # чтобы отчёт цикла сравнивал их с прошлым циклом на одинаковом
+    # раннере. Деградация больше 15% — carryover P2, решение принимает
+    # цикл, а не CI.
+    #
+    # continue-on-error: бенчмарк не должен ронять мердж функциональной
+    # правки, если ffmpeg на раннере повёл себя иначе.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Install bench deps
+        run: pip install opencv-python-headless numpy onnxruntime onnx
+      - name: Run benchmarks
+        run: python perf/bench.py --json | tee perf-results.json
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results
+          path: perf-results.json
+
   frontend:
     runs-on: ubuntu-latest
     steps:

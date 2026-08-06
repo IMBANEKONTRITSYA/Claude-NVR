@@ -1,5 +1,6 @@
 """Системный мониторинг (SPEC §14): метрики хоста, состояние сервисов,
 хранилище архива (§21), Prometheus."""
+import json
 import shutil
 from datetime import datetime, timedelta
 
@@ -138,6 +139,66 @@ async def prometheus_metrics(_=Depends(require_role_query("admin"))):
     for cam_id, value in m["camera_fps"].items():
         lines.append(f'facewatch_camera_fps{{camera="{cam_id}"}} {value}')
     return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+
+
+@router.get("/record-layer")
+async def record_layer_status(_=Depends(require_role("admin", "operator")),
+                              db: AsyncSession = Depends(get_db)):
+    """Состояние слоя записи: статус каждого потока (SPEC §14, §9).
+
+    Данные собирает воркер и кладёт в Redis (`record:layer`). Бэкенд к
+    Control API MediaMTX не ходит намеренно: доступ к нему равен доступу к
+    RTSP-адресам всех камер с учётными данными, и наружу он не
+    публикуется (решение цикла 24). Ключ живёт 120 секунд — при
+    остановленном воркере интерфейс покажет «данных нет», а не молча
+    застывшую картину недельной давности.
+
+    Сегменты за сутки считаются здесь, а не в воркере: это запрос к
+    архиву, и держать его в цикле менеджера (раз в 10 секунд на 120
+    камерах) незачем — интерфейс обновляется куда реже.
+    """
+    payload = None
+    try:
+        raw = await get_redis().get("record:layer")
+        if raw:
+            payload = json.loads(raw)
+    except Exception:
+        payload = None
+
+    day_ago = datetime.utcnow() - timedelta(days=1)
+    segments_day = (await db.execute(
+        select(func.count(VideoSegment.id)).where(VideoSegment.started_at >= day_ago)
+    )).scalar() or 0
+    bytes_day = int((await db.execute(
+        select(func.coalesce(func.sum(VideoSegment.size_bytes), 0))
+        .where(VideoSegment.started_at >= day_ago)
+    )).scalar() or 0)
+    enabled = (await db.execute(
+        select(func.count(Camera.id)).where(Camera.enabled.is_(True))
+    )).scalar() or 0
+
+    if payload is None:
+        # Воркер молчит: честное «нет данных» вместо нулей, которые
+        # выглядели бы как «все 120 потоков потеряны».
+        return {
+            "available": False,
+            "reason": "воркер не публиковал состояние слоя записи",
+            "cameras_enabled": enabled,
+            "segments_last_day": segments_day,
+            "gb_last_day": round(bytes_day / BYTES_PER_GB, 2),
+            "streams": [], "summary": None, "segment_gaps": [],
+        }
+
+    return {
+        "available": True,
+        "updated_at": payload.get("updated_at"),
+        "cameras_enabled": enabled,
+        "segments_last_day": segments_day,
+        "gb_last_day": round(bytes_day / BYTES_PER_GB, 2),
+        "streams": payload.get("streams") or [],
+        "summary": payload.get("summary"),
+        "segment_gaps": payload.get("segment_gaps") or [],
+    }
 
 
 async def _setting_int(db: AsyncSession, key: str, default: int) -> int:
