@@ -45,7 +45,7 @@ from backoff import reconnect_delay
 from face_select import pick_matching_face
 from fileage import prune_media
 from record_layer import MediaMTXClient, path_conf, path_name, sync_paths
-from record_status import (newly_lost, newly_restored, segment_gaps,
+from record_status import (UNKNOWN, newly_lost, newly_restored, segment_gaps,
                            stream_states, summarize)
 from segment_index import index_new_segments
 from snapshot_http import fetch_snapshot_bytes
@@ -320,8 +320,28 @@ def load_face_app(model_name: str | None = None):
 
 _last_status: dict[int, str] = {}
 
+# Камеры, чей статус в этот момент известен слою записи. Для них слой
+# записи — источник истины, а нить аналитики свой вердикт не навязывает.
+#
+# Зачем разделение владения. `Camera.status` решает, покажет ли интерфейс
+# live-картинку, а картинка идёт по HLS из MediaMTX — значит статус обязан
+# отражать состояние потока ИМЕННО в слое записи. Слой записи к тому же
+# тянет все 120 камер (SPEC §2), а слой аналитики знает лишь про свои 2.
+#
+# Без разделения два писателя дерутся: нить аналитики зовёт
+# `update_status("online")` на каждом кадре, слой записи раз в ~10 с
+# ставил бы `offline`, и статус мигал бы с записью в БД и публикацией в
+# Redis на каждом обороте.
+#
+# Когда Control API молчит, камера попадает в `unknown`, из этого набора
+# выбывает — и вердикт нити аналитики снова в силе. То есть слой аналитики
+# остаётся резервным источником ровно на случай недоступного MediaMTX.
+_record_layer_owned: set[int] = set()
 
-def update_status(cam_id: int, status: str):
+
+def update_status(cam_id: int, status: str, *, source: str = "analytics"):
+    if source == "analytics" and cam_id in _record_layer_owned:
+        return
     # Пишем в БД/паблишим только при фактической смене статуса,
     # иначе офлайн-камера спамит запись каждые 2 секунды.
     if _last_status.get(cam_id) == status:
@@ -1381,6 +1401,27 @@ def publish_record_layer_status(cam_names) -> dict:
         gaps = []
 
     _record_prev_status = {cid: st["status"] for cid, st in states.items()}
+
+    # Статус камеры в БД — из слоя записи (SPEC §2, §4).
+    #
+    # До этого его выставляла только нить аналитики, а цикл 24 перестал
+    # поднимать её для камер в режиме `record_only`. В результате камера,
+    # которая исправно пишется, навсегда оставалась `offline`, и
+    # live-просмотр (SPEC §4) не работал ни на одной из них — то есть на
+    # 118 камерах из 120 при штатной конфигурации.
+    #
+    # `unknown` не пишется: недоступный Control API означает «не знаем», а
+    # не «камера пропала», и затирать им последний известный статус
+    # значило бы гасить всю стену камер на каждый рестарт MediaMTX.
+    for cam_id, st in states.items():
+        if st["status"] == UNKNOWN:
+            _record_layer_owned.discard(cam_id)
+            continue
+        _record_layer_owned.add(cam_id)
+        update_status(cam_id, st["status"], source="record_layer")
+    # Камеры, выбывшие из слоя записи (выключены, удалены), владения за
+    # собой не оставляют — иначе их статус замёрз бы навсегда.
+    _record_layer_owned.intersection_update(states)
 
     payload = {"streams": list(states.values()), "summary": summarize(states),
                "segment_gaps": gaps, "updated_at": time.time()}

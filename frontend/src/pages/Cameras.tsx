@@ -28,8 +28,45 @@ export function Cameras() {
   const [loadingProfiles, setLoadingProfiles] = useState(false);
   const [profiles, setProfiles] = useState<any[] | null>(null);
 
-  const load = () => api.cameras().then(setCams).catch(() => {});
+  const load = () => api.cameras().then((list: any[]) => {
+    setCams(list);
+    // Камера, которую правили, исчезла (удалена здесь или в другой вкладке)
+    // — выходим из режима редактирования. Иначе форма продолжала бы слать
+    // PUT на несуществующий id и отвечать «Камера не найдена» на каждое
+    // сохранение, а список при этом стоял бы пустой.
+    setEditing(prev => {
+      if (prev !== null && !list.some(c => c.id === prev)) {
+        setForm(EMPTY_FORM);
+        return null;
+      }
+      return prev;
+    });
+  }).catch(() => {});
   useEffect(() => { load(); }, []);
+
+  /** Открывает камеру в форме, подтянув её RTSP-адрес (он не приходит в списке). */
+  const startEdit = async (c: any) => {
+    setEditing(c.id);
+    setTestResult("");
+    const base = {
+      name: c.name, rtsp_url: "", sub_rtsp_url: "", location: c.location, enabled: c.enabled,
+      mode: c.mode || "record_only",
+      retention_days: c.retention_days == null ? "" : String(c.retention_days),
+      onvif_enabled: !!c.onvif_enabled, onvif_host: c.onvif_host || "",
+      onvif_port: c.onvif_port || 80, onvif_username: c.onvif_username || "",
+      onvif_password: "",
+    };
+    setForm(base);
+    try {
+      const { rtsp_url } = await api.camRtsp(c.id);
+      setForm(f => ({ ...f, rtsp_url }));
+    } catch (e: any) {
+      // Адрес не отдался — честно говорим об этом, а не оставляем пустое
+      // поле молча: сохранение с пустым адресом отвергнет валидатор, и
+      // причина была бы неочевидна.
+      toast(`Не удалось получить RTSP-адрес камеры: ${e.message}`, "err");
+    }
+  };
 
   const submit = async () => {
     try {
@@ -46,7 +83,18 @@ export function Cameras() {
       setEditing(null);
       load();
       toast(editing ? "Камера обновлена" : "Камера добавлена", "ok");
-    } catch (e: any) { toast(e.message, "err"); }
+    } catch (e: any) {
+      toast(e.message, "err");
+      // «Камера не найдена» на PUT значит, что правившаяся камера исчезла.
+      // Форма обязана выйти из режима редактирования, иначе каждое
+      // следующее сохранение упирается в тот же 404 без единой подсказки,
+      // что делать.
+      if (editing && /не найдена/i.test(e.message || "")) {
+        setEditing(null);
+        setForm(EMPTY_FORM);
+        load();
+      }
+    }
   };
 
   const discoverOnvif = async () => {
@@ -233,7 +281,7 @@ export function Cameras() {
                       не даёт списку вытеснить кнопку добавления за экран. */}
                   <div style={{
                     display: "grid",
-                    gridTemplateColumns: "repeat(auto-fill, minmax(230px, 1fr))",
+                    gridTemplateColumns: "repeat(auto-fill, minmax(310px, 1fr))",
                     gap: 6,
                     maxHeight: 320,
                     overflowY: "auto",
@@ -256,10 +304,21 @@ export function Cameras() {
                             onChange={e => setSelected(e.target.checked
                               ? [...selected, d.host]
                               : selected.filter(h => h !== d.host))} />
-                          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
-                            <span style={{ fontFamily: "monospace", fontSize: 12 }}>{d.host}</span>
-                            {label && <span className="muted" style={{ fontSize: 11 }}> · {label}</span>}
+                          {/* Адрес и имя — разные элементы, а не один
+                              обрезаемый: пока они лежали в общем span с
+                              ellipsis, длинное имя камеры съедало сам IP, и
+                              в списке оставалось «192.1…». Адрес не
+                              сжимается (flexShrink: 0), обрезается только
+                              имя — оно и так продублировано в title. */}
+                          <span style={{ fontFamily: "monospace", fontSize: 12, flexShrink: 0 }}>
+                            {d.host}
                           </span>
+                          {label && (
+                            <span className="muted" style={{
+                              fontSize: 11, minWidth: 0,
+                              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                            }}>{label}</span>
+                          )}
                           <button type="button" className="btn secondary"
                             style={{ marginLeft: "auto", padding: "1px 7px", fontSize: 11, flexShrink: 0 }}
                             onClick={ev => {
@@ -345,15 +404,7 @@ export function Cameras() {
                   </label>
                 </td>
                 <td>
-                  <button className="btn secondary" onClick={() => {
-                    setEditing(c.id);
-                    setForm({
-                      name: c.name, rtsp_url: "", sub_rtsp_url: "", location: c.location, enabled: c.enabled,
-                      mode: c.mode || "record_only",
-                      retention_days: c.retention_days == null ? "" : String(c.retention_days),
-                      onvif_enabled: !!c.onvif_enabled, onvif_host: "", onvif_port: 80, onvif_username: "", onvif_password: "",
-                    });
-                  }}>Изм.</button>
+                  <button className="btn secondary" onClick={() => startEdit(c)}>Изм.</button>
                   <button className="btn danger" onClick={() => remove(c.id)} style={{ marginLeft: 4 }}>Удалить</button>
                 </td>
               </tr>
