@@ -517,6 +517,43 @@ def load_cam_state(cam_id: int) -> tuple[dict | None, bool, int | None]:
         return cam.roi, True, getattr(cam, "motion_sensitivity", None)
 
 
+# Нити финализации сегментов. Каждая короткоживущая, но на остановке их
+# нужно дождаться: пока она не отработала, записанный кусок существует
+# только как осиротевший `*_tmp.mp4` без строки в `video_segments`, то есть
+# в архиве его нет. Список с блокировкой, а не Thread.join() по одной
+# ссылке: сегменты закрываются со всех нитей камер одновременно.
+_FINALIZE_THREADS: list[threading.Thread] = []
+_FINALIZE_LOCK = threading.Lock()
+
+
+def spawn_finalize(cam_id: int, tmp_path: str, final_path: str, started, ended, event_type: str):
+    """Запускает финализацию сегмента в фоне и берёт нить на учёт."""
+    t = threading.Thread(
+        target=finalize_segment,
+        args=(cam_id, tmp_path, final_path, started, ended, event_type),
+        daemon=True,
+    )
+    with _FINALIZE_LOCK:
+        # Заодно чистим отработавшие — иначе список рос бы весь срок жизни
+        # процесса (сегмент раз в минуту на камеру, 16 камер, 24/7).
+        _FINALIZE_THREADS[:] = [x for x in _FINALIZE_THREADS if x.is_alive()]
+        _FINALIZE_THREADS.append(t)
+    t.start()
+    return t
+
+
+def join_finalize_threads(deadline: float):
+    """Ждёт финализации незавершённых сегментов до общего дедлайна."""
+    with _FINALIZE_LOCK:
+        pending = [t for t in _FINALIZE_THREADS if t.is_alive()]
+    for t in pending:
+        t.join(timeout=max(0.0, deadline - time.time()))
+    left = [t for t in pending if t.is_alive()]
+    if left:
+        logger.warning("сегменты не успели финализироваться в срок",
+                       extra={"threads": len(left)})
+
+
 def finalize_segment(cam_id: int, tmp_path: str, final_path: str,
                      started, ended, event_type: str):
     """Транскод mp4v → H.264 (браузеры не играют mp4v в <video>) + запись в БД.
@@ -530,22 +567,37 @@ def finalize_segment(cam_id: int, tmp_path: str, final_path: str,
         bitrate_kbps=int(CONFIG.get("record_bitrate") or 0),
         iframe_only=bool(int(CONFIG.get("record_iframe_only") or 0)),
     )
-    try:
-        _lower_priority()
-        subprocess.run(
-            ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", tmp_path,
-             *encode_args, "-movflags", "+faststart", "-an", final_path],
-            timeout=300, check=True,
-        )
-        os.remove(tmp_path)
-        ok = True
-    except Exception:
-        logger.warning("транскод не удался, оставляю исходник", exc_info=True, extra={"camera_id": cam_id})
+    if shutdown_event.is_set():
+        # На остановке транскод не запускаем: ffmpeg на минутный сегмент
+        # идёт секунды-минуты (таймаут здесь — 300 с), а grace period у
+        # `docker compose stop` по умолчанию 10 с. Нить всё равно не успела
+        # бы, и SIGKILL оставил бы кусок записи осиротевшим `*_tmp.mp4` без
+        # строки в архиве. Переименование — миллисекунды, и запись
+        # сохраняется: ровно тот же режим деградации, что уже применяется
+        # ниже, когда транскод не удался (mp4v вместо H.264).
         try:
             os.replace(tmp_path, final_path)
             ok = True
         except Exception:
-            pass
+            logger.error("не удалось сохранить сегмент на остановке", exc_info=True,
+                         extra={"camera_id": cam_id})
+    else:
+        try:
+            _lower_priority()
+            subprocess.run(
+                ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", tmp_path,
+                 *encode_args, "-movflags", "+faststart", "-an", final_path],
+                timeout=300, check=True,
+            )
+            os.remove(tmp_path)
+            ok = True
+        except Exception:
+            logger.warning("транскод не удался, оставляю исходник", exc_info=True, extra={"camera_id": cam_id})
+            try:
+                os.replace(tmp_path, final_path)
+                ok = True
+            except Exception:
+                pass
     if not ok:
         return
     try:
@@ -750,11 +802,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
             nonlocal writer, seg_path, seg_tmp, seg_started, seg_had_face
             writer.release()
             etype = "face" if seg_had_face else "motion"
-            threading.Thread(
-                target=finalize_segment,
-                args=(cam_id, seg_tmp, seg_path, seg_started, reason_ended, etype),
-                daemon=True,
-            ).start()
+            spawn_finalize(cam_id, seg_tmp, seg_path, seg_started, reason_ended, etype)
             writer = None
             seg_path = None
             seg_tmp = None
@@ -1373,6 +1421,14 @@ def manager():
         t.join(timeout=max(0.0, deadline - time.time()))
         if t.is_alive():
             logger.warning("нить камеры не успела остановиться в срок", extra={"camera_id": cam_id})
+    # Нити камер, закрываясь, отдают недописанные сегменты в финализацию.
+    # Без этого ожидания процесс выходил сразу: финализация — daemon-нить,
+    # интерпретатор её просто убивает, и последний сегмент каждой пишущей
+    # камеры пропадал при каждом штатном рестарте (до минуты записи на
+    # камеру), оставаясь осиротевшим `*_tmp.mp4` без строки в архиве.
+    # На остановке финализация не транскодирует (см. finalize_segment),
+    # поэтому укладывается в остаток общего бюджета.
+    join_finalize_threads(deadline)
     logger.info("воркер остановлен")
 
 
