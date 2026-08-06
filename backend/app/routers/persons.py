@@ -11,6 +11,7 @@ from ..models import Person, FaceEvent
 from ..auth import require_role
 from ..schemas import PersonOut, PersonUpdate
 from ..pagination import PageParams
+from ..params import limit_param
 from ..services.pubsub import get_redis
 
 router = APIRouter(prefix="/api/persons", tags=["persons"])
@@ -145,7 +146,7 @@ async def merge_persons(src_id: int, dst_id: int, _=Depends(require_role("admin"
 
 
 @router.get("/{pid}/gallery", response_model=list[dict])
-async def gallery(pid: int, limit: int = 50, _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
+async def gallery(pid: int, limit: int = limit_param(50), _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
     r = await db.execute(
         select(FaceEvent.id, FaceEvent.ts, FaceEvent.snapshot_path, FaceEvent.camera_id, FaceEvent.enhanced)
         .where(FaceEvent.person_id == pid)
@@ -156,7 +157,7 @@ async def gallery(pid: int, limit: int = 50, _=Depends(require_role("admin", "op
 
 
 @router.post("/{pid}/enhance")
-async def enhance_person(pid: int, limit: int = 20, _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
+async def enhance_person(pid: int, limit: int = limit_param(20), _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
     """Принудительный нейросетевой апскейл снимков персоны (ставит в очередь)."""
     person = await db.get(Person, pid)
     if not person:

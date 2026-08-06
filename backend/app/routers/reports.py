@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from ..auth import require_role_query
 from ..db import get_db
+from ..params import days_param
 from ..models import FaceEvent, Person, Camera
 
 # Выгрузки открываются браузером по прямой ссылке, поэтому токен идёт в
@@ -32,7 +33,7 @@ async def _appearances(db: AsyncSession, days: int):
 
 
 @router.get("/appearances.csv")
-async def appearances_csv(days: int = 7, db: AsyncSession = Depends(get_db), _=Depends(_require_report_access)):
+async def appearances_csv(days: int = days_param(7), db: AsyncSession = Depends(get_db), _=Depends(_require_report_access)):
     rows = await _appearances(db, days)
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -45,7 +46,7 @@ async def appearances_csv(days: int = 7, db: AsyncSession = Depends(get_db), _=D
 
 
 @router.get("/appearances.xlsx")
-async def appearances_xlsx(days: int = 7, db: AsyncSession = Depends(get_db), _=Depends(_require_report_access)):
+async def appearances_xlsx(days: int = days_param(7), db: AsyncSession = Depends(get_db), _=Depends(_require_report_access)):
     rows = await _appearances(db, days)
     wb = Workbook()
     ws = wb.active
@@ -104,7 +105,7 @@ def _stream_xlsx(filename: str, title: str, header: list[str], rows):
 
 
 @router.get("/persons.csv")
-async def persons_csv(days: int = 30, db: AsyncSession = Depends(get_db), _=Depends(_require_report_access)):
+async def persons_csv(days: int = days_param(30), db: AsyncSession = Depends(get_db), _=Depends(_require_report_access)):
     rows = await _persons_summary(db, days)
     data = [[x[0], x[1] or "Неизвестный", x[2] or "", x[3],
              x[4].isoformat() if x[4] else "", x[5].isoformat() if x[5] else ""] for x in rows]
@@ -112,7 +113,7 @@ async def persons_csv(days: int = 30, db: AsyncSession = Depends(get_db), _=Depe
 
 
 @router.get("/persons.xlsx")
-async def persons_xlsx(days: int = 30, db: AsyncSession = Depends(get_db), _=Depends(_require_report_access)):
+async def persons_xlsx(days: int = days_param(30), db: AsyncSession = Depends(get_db), _=Depends(_require_report_access)):
     rows = await _persons_summary(db, days)
     data = [[x[0], x[1] or "Неизвестный", x[2] or "", x[3],
              x[4].isoformat() if x[4] else "", x[5].isoformat() if x[5] else ""] for x in rows]
@@ -137,14 +138,14 @@ async def _cameras_activity(db: AsyncSession, days: int):
 
 
 @router.get("/cameras.csv")
-async def cameras_csv(days: int = 30, db: AsyncSession = Depends(get_db), _=Depends(_require_report_access)):
+async def cameras_csv(days: int = days_param(30), db: AsyncSession = Depends(get_db), _=Depends(_require_report_access)):
     rows = await _cameras_activity(db, days)
     data = [[x[0], x[1], x[2] or "", x[3], x[4]] for x in rows]
     return _stream_csv("cameras.csv", ["ID", "Камера", "Локация", "Обнаружений", "Уникальных персон"], data)
 
 
 @router.get("/cameras.xlsx")
-async def cameras_xlsx(days: int = 30, db: AsyncSession = Depends(get_db), _=Depends(_require_report_access)):
+async def cameras_xlsx(days: int = days_param(30), db: AsyncSession = Depends(get_db), _=Depends(_require_report_access)):
     rows = await _cameras_activity(db, days)
     data = [[x[0], x[1], x[2] or "", x[3], x[4]] for x in rows]
     return _stream_xlsx("cameras.xlsx", "Камеры", ["ID", "Камера", "Локация", "Обнаружений", "Уникальных персон"], data)

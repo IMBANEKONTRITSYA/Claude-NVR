@@ -7,6 +7,7 @@ from sqlalchemy import select
 from ..db import get_db
 from ..models import VideoSegment, FaceEvent
 from ..auth import require_role, require_role_query
+from ..params import limit_param
 from ..schemas import SegmentOut
 
 router = APIRouter(prefix="/api/archive", tags=["archive"])
@@ -19,7 +20,7 @@ async def list_segments(
     date_to: datetime | None = None,
     event_type: str | None = None,
     person_id: int | None = None,
-    limit: int = 200,
+    limit: int = limit_param(200),
     _=Depends(require_role("admin", "operator")),
     db: AsyncSession = Depends(get_db),
 ):
