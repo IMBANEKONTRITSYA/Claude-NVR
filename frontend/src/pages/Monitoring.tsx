@@ -1,8 +1,13 @@
 import { useEffect, useState } from "react";
 import { api, getToken, getRole } from "../api";
 
-function Bar({ percent, warn = 75, crit = 90 }: { percent: number; warn?: number; crit?: number }) {
-  const color = percent >= crit ? "var(--red)" : percent >= warn ? "var(--orange)" : "var(--green)";
+function Bar({ percent, warn, crit }: { percent: number; warn?: number; crit?: number }) {
+  // Умолчания через ?? , а не в сигнатуре: вызывающие передают warn/crit
+  // из настроек, и явный undefined (настройка ещё не загрузилась) должен
+  // падать на умолчание, а не красить полосу по NaN.
+  const w = warn ?? 75;
+  const c = crit ?? 90;
+  const color = percent >= c ? "var(--red)" : percent >= w ? "var(--orange)" : "var(--green)";
   return (
     <div style={{ background: "var(--bg)", borderRadius: 4, height: 8, overflow: "hidden", marginTop: 4 }}>
       <div style={{ width: `${Math.min(100, percent)}%`, height: "100%", background: color, transition: "width .3s" }} />
@@ -10,13 +15,129 @@ function Bar({ percent, warn = 75, crit = 90 }: { percent: number; warn?: number
   );
 }
 
-function Metric({ label, value, percent, hint }: any) {
+function Metric({ label, value, percent, hint, warn, crit }: any) {
   return (
     <div className="card" style={{ flex: 1, minWidth: 200 }}>
       <div className="muted">{label}</div>
       <div className="kpi" style={{ fontSize: 24 }}>{value}</div>
-      {percent !== undefined && <Bar percent={percent} />}
+      {/* Пороги пробрасываются в полосу: у диска архива они настраиваемые
+          (SPEC §14), и полоса обязана краснеть на том же значении, на
+          котором приходит алерт, а не на умолчании компонента. */}
+      {percent !== undefined && <Bar percent={percent} warn={warn} crit={crit} />}
       {hint && <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>{hint}</div>}
+    </div>
+  );
+}
+
+/** Слой записи: статус каждого из 120 потоков (SPEC §14, §9). */
+function RecordLayerPanel() {
+  const [d, setD] = useState<any>(null);
+  const [err, setErr] = useState("");
+  // На 120 камерах таблица целиком нечитаема, а интересны почти всегда
+  // проблемные потоки — поэтому фильтр, и по умолчанию он на них.
+  const [filter, setFilter] = useState<"problems" | "all">("problems");
+
+  useEffect(() => {
+    const tick = () => api.recordLayer().then(r => { setD(r); setErr(""); }).catch(e => setErr(e.message));
+    tick();
+    const t = setInterval(tick, 10000);
+    return () => clearInterval(t);
+  }, []);
+
+  if (err) return <div className="card" style={{ marginBottom: 16 }}><h3 style={{ marginTop: 0 }}>Слой записи</h3><div className="empty">{err}</div></div>;
+  if (!d) return null;
+
+  const s = d.summary;
+  const gaps: number[] = d.segment_gaps || [];
+  const streams: any[] = d.streams || [];
+  const problems = streams.filter(x => x.status !== "online" || gaps.includes(x.camera_id));
+  const shown = filter === "problems" ? problems : streams;
+
+  const color = (st: string) =>
+    st === "online" ? "var(--green)" : st === "offline" ? "var(--red)" : "var(--orange)";
+  const label = (st: string) =>
+    st === "online" ? "пишется" : st === "offline" ? "потерян" : "неизвестно";
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <h3 style={{ marginTop: 0 }}>Слой записи</h3>
+
+      {!d.available ? (
+        <div className="empty">
+          {d.reason || "Нет данных"} — за сутки записано {d.segments_last_day} сегментов
+          ({d.gb_last_day} ГБ), камер включено {d.cameras_enabled}.
+        </div>
+      ) : (
+        <>
+          <div className="row">
+            <Metric label="Потоков пишется" value={`${s.streams_online} / ${s.streams_total}`}
+              percent={s.streams_total ? (s.streams_online * 100) / s.streams_total : 0}
+              warn={101} crit={102}
+              hint={s.streams_unknown
+                ? `${s.streams_unknown} — состояние неизвестно (нет связи с медиасервером)`
+                : `потеряно ${s.streams_offline}`} />
+            <Metric label="Сегментов за сутки" value={d.segments_last_day}
+              hint={`${d.gb_last_day} ГБ записано`} />
+            <Metric label="Пропусков записи" value={gaps.length}
+              hint={gaps.length ? `камеры: ${gaps.join(", ")}` : "нет"} />
+            <Metric label="Кадров с ошибками" value={s.frames_in_error}
+              hint="суммарно по всем потокам" />
+          </div>
+
+          {gaps.length > 0 && (
+            <div style={{
+              padding: "8px 12px", borderRadius: 4, marginTop: 12,
+              background: "var(--red)", color: "#fff", fontWeight: 600,
+            }}>
+              Пропуск записи сегментов на камерах: {gaps.join(", ")} — поток есть,
+              но файлы не пишутся. Проверьте место на диске и права на каталог архива.
+            </div>
+          )}
+
+          <div style={{ marginTop: 12, marginBottom: 8 }}>
+            <button className={filter === "problems" ? "btn" : "btn secondary"}
+              onClick={() => setFilter("problems")}>
+              Проблемные ({problems.length})
+            </button>
+            <button className={filter === "all" ? "btn" : "btn secondary"}
+              style={{ marginLeft: 8 }} onClick={() => setFilter("all")}>
+              Все потоки ({streams.length})
+            </button>
+          </div>
+
+          {shown.length === 0 ? (
+            <div className="empty">
+              {filter === "problems" ? "Все потоки пишутся нормально" : "Потоков нет"}
+            </div>
+          ) : (
+            <div style={{ maxHeight: 320, overflowY: "auto" }}>
+              <table>
+                <thead>
+                  <tr><th>Камера</th><th>Статус</th><th>Принято</th><th>Ошибки кадров</th><th>В сети с</th></tr>
+                </thead>
+                <tbody>
+                  {shown.map(x => (
+                    <tr key={x.camera_id}>
+                      <td>#{x.camera_id} {x.name}</td>
+                      <td style={{ color: color(x.status), fontWeight: 600 }}>
+                        {label(x.status)}
+                        {gaps.includes(x.camera_id) && " · пропуск сегмента"}
+                      </td>
+                      <td>{(x.inbound_bytes / 1048576).toFixed(1)} МБ</td>
+                      <td style={{ color: x.frames_in_error ? "var(--orange)" : undefined }}>
+                        {x.frames_in_error}
+                      </td>
+                      <td className="muted">
+                        {x.online_since ? new Date(x.online_since).toLocaleString("ru-RU") : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -173,6 +294,7 @@ export function Monitoring() {
         {m.temperature_c != null && <Metric label="Температура" value={`${m.temperature_c}°C`} />}
       </div>
 
+      <RecordLayerPanel />
       <StoragePanel isAdmin={isAdmin} />
       {isAdmin && <StorageCalculator />}
 
