@@ -1,0 +1,107 @@
+Осиротевшие ветки на origin — 67 шт.
+Составлено циклом 23 аудита, 2026-08-06T02:11:08Z.
+
+ЗАЧЕМ ЭТОТ ФАЙЛ
+Ветки ниже полностью влиты в claude/pensive-brown-28588t. Squash-merge,
+поэтому `git branch -r --merged` их не показывает: содержимое в ветке есть,
+но коммит ветки не предок. Автоматика удалить их не может — `git push
+--delete` из песочницы получает HTTP 403 от прокси 17 циклов подряд,
+отдельного delete_branch среди доступных GitHub MCP-инструментов нет.
+
+ВАЖНО ПРО ПРОВЕРКУ
+По выводу `git push --delete` судить нельзя: при отказе он печатает
+"Everything up-to-date", хотя ветка жива. Проверять надо
+`git ls-remote --heads origin <branch>` — уточнение цикла 18,
+перепроверено циклом 23: отказ воспроизводится, ветка остаётся.
+
+КАК УДАЛИТЬ (вручную, с машины с правами на репозиторий)
+
+    # все разом из этого файла
+    sed -n '/^СПИСОК/,$p' docs/reviews/ORPHANED_BRANCHES.txt \
+      | grep -E '^(fix|feat|test|perf|docs|chore|review)/' \
+      | xargs -n 20 git push origin --delete
+
+    # либо по одной:  git push origin --delete <branch>
+    # либо через веб-интерфейс: Branches -> All branches -> корзина
+
+После удаления файл можно очистить — следующий цикл соберёт список заново,
+если ветки снова накопятся.
+
+СПИСОК
+
+# docs/ — 2 шт.
+docs/changelog-cycle6
+docs/tier1-documentation-suite
+
+# feat/ — 5 шт.
+feat/onvif-bulk-add-cameras
+feat/onvif-diagnostic-dump
+feat/onvif-discovery
+feat/onvif-get-profiles-stream-uri
+feat/onvif-integration
+
+# fix/ — 55 шт.
+fix/ci-coverage-threshold
+fix/db-startup-migration-rollback-20260806T021108Z
+fix/hires-face-snapshots
+fix/infra-configurable-host-ports
+fix/onvif-rtsp-credentials-and-subnet-scan
+fix/perf-bcrypt-event-loop-blocking
+fix/perf-hwaccel-decode
+fix/perf-record-bitrate-iframe
+fix/quality-integration-tests-ci
+fix/quality-pytest-coverage-ci
+fix/security-audit-role-db-20260805T232816Z
+fix/security-audit-route-map-20260805T174032Z
+fix/security-change-password-lockout
+fix/security-cors-lockdown
+fix/security-csp-header
+fix/security-dependency-audit-ci
+fix/security-encrypt-telegram-token
+fix/security-hls-headers-20260805T232816Z
+fix/security-insecure-default-secrets
+fix/security-jwt-refresh-token-rotation
+fix/security-last-admin-protection
+fix/security-login-lockout-race
+fix/security-media-archive-rbac
+fix/security-nginx-headers-rate-limit
+fix/security-onvif-xml-entity-expansion
+fix/security-onvif-xml-escape-username
+fix/security-password-policy
+fix/security-query-token-db-identity-20260805T143131Z
+fix/security-redact-token-access-logs
+fix/security-restrict-internal-service-ports
+fix/security-rtsp-url-validation
+fix/security-session-lifecycle
+fix/security-tls-default
+fix/security-unauthenticated-hls
+fix/security-unbounded-query-params-20260805T232816Z
+fix/security-ws-session-revalidation
+fix/stability-json-logging
+fix/stability-loadtest-ci-workflow-dispatch
+fix/stability-log-rotation
+fix/stability-onvif-thread-leak
+fix/stability-person-dedup-race
+fix/stability-postgres-automated-backup
+fix/stability-republish-backoff
+fix/stability-rtsp-hang-detection
+fix/stability-rtsp-reconnect-backoff
+fix/stability-worker-backup-container-crash
+fix/stability-worker-graceful-shutdown
+fix/upscaler-db-session-across-inference-20260805T181442Z
+fix/upscaler-observability-shutdown-20260805T232816Z
+fix/video-snapshot-http-auth-20260805T143131Z
+fix/windows-first-run-env-generation
+fix/worker-camera-thread-resource-leak-20260806T021108Z
+fix/worker-db-session-across-network-20260805T181442Z
+fix/worker-media-retention-utc-20260805T174032Z
+fix/worker-segment-lost-on-shutdown-20260806T021108Z
+
+# perf/ — 1 шт.
+perf/video-snapshot-once-per-frame-20260805T143131Z
+
+# test/ — 4 шт.
+test/quality-persons-search-reports-ws-coverage
+test/quality-race-control-skip-without-redis
+test/quality-suite-isolation-20260805T232816Z
+test/quality-upscaler-db-isolation-20260806T021108Z
