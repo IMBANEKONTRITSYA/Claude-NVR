@@ -99,3 +99,61 @@ def pg_conn():
         yield conn
     finally:
         conn.close()
+
+
+TEST_USER_PASSWORD = "Str0ngPass!23"
+
+
+@pytest.fixture()
+def make_user(client, admin_headers):
+    """Заводит пользователя с нужной ролью и **удаляет его после теста**.
+
+    Возвращает функцию `(username, role) -> (user_id, access_token)`.
+    Пользователи создаются и удаляются через настоящий API, поэтому в БД
+    оказывается ровно то, что оказалось бы в проде, — а не строка,
+    вставленная в обход валидации и хеширования пароля.
+
+    Фикстура вынесена сюда в цикле 21, чтобы закрыть известный пробел
+    «изоляция тестов бэкенда» (carryover циклов 19-20). До этого она
+    существовала в двух копиях (`test_media_rbac.py`,
+    `test_query_token_identity.py`), а ещё семь тестов в пяти файлах
+    заводили пользователей прямо в теле и **не убирали их за собой**.
+    В CI это не видно — там каждый прогон получает свежие
+    сервис-контейнеры, — но повторный локальный прогон по той же БД падал:
+    `POST /api/users` на существующем имени отвечает 400, и падал не тот
+    тест, который «протёк», а следующий за ним. Замерено в цикле 21: на
+    не сброшенной между прогонами БД 8 падений в `test_integration_*` на
+    полностью здоровом дереве.
+
+    Имя пользователя стоит делать уникальным на тест (`request.node.name`),
+    даже с уборкой: тест, упавший до финализатора, иначе отравит соседей.
+    """
+    created = []
+
+    def _make(username: str, role: str, password: str = TEST_USER_PASSWORD):
+        r = client.post(
+            "/api/users",
+            json={"username": username, "password": password, "role": role},
+            headers=admin_headers,
+        )
+        assert r.status_code == 200, r.text
+        user_id = r.json()["id"]
+        created.append(user_id)
+        lr = client.post("/api/auth/login", data={"username": username, "password": password})
+        assert lr.status_code == 200, lr.text
+        return user_id, lr.json()["access_token"]
+
+    yield _make
+
+    for user_id in created:
+        client.delete(f"/api/users/{user_id}", headers=admin_headers)
+
+
+@pytest.fixture()
+def make_user_headers(make_user):
+    """`(username, role) -> {"Authorization": "Bearer ..."}` — самый частый
+    способ использования `make_user` в тестах матрицы прав."""
+    def _make(username: str, role: str):
+        _, token = make_user(username, role)
+        return {"Authorization": f"Bearer {token}"}
+    return _make

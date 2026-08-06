@@ -28,7 +28,6 @@ from app.main import MEDIA_KIND_ROLES
 pytestmark = pytest.mark.usefixtures("client")
 
 # Пароль сложный: create_user валидирует его политикой (schemas.py).
-_PW = "Passw0rd!media"
 
 
 @pytest.fixture()
@@ -49,33 +48,6 @@ def media_files(tmp_path, monkeypatch):
         names[kind] = name
     return names
 
-
-@pytest.fixture()
-def make_user(client, admin_headers):
-    """Заводит пользователя с нужной ролью и возвращает (id, access-токен).
-
-    Пользователи создаются и удаляются через настоящий API, поэтому в БД
-    оказывается ровно то, что там оказалось бы в проде.
-    """
-    created = []
-
-    def _make(username: str, role: str):
-        r = client.post(
-            "/api/users",
-            json={"username": username, "password": _PW, "role": role},
-            headers=admin_headers,
-        )
-        assert r.status_code == 200, r.text
-        user_id = r.json()["id"]
-        created.append(user_id)
-        lr = client.post("/api/auth/login", data={"username": username, "password": _PW})
-        assert lr.status_code == 200, lr.text
-        return user_id, lr.json()["access_token"]
-
-    yield _make
-
-    for user_id in created:
-        client.delete(f"/api/users/{user_id}", headers=admin_headers)
 
 
 def test_viewer_cannot_read_archive_segments(client, media_files, make_user):

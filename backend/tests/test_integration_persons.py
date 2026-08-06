@@ -8,30 +8,60 @@ raw SQL INSERT с CAST(... AS vector)); недоступность worker'а п�
 httpx.AsyncClient.post (подменяет только сетевой вызов к воркеру, вся
 остальная логика — реальная БД)."""
 import httpx
+import pytest
 
 
 def _vec(seed: float = 0.01) -> str:
     return "[" + ",".join(f"{seed:.4f}" for _ in range(512)) + "]"
 
 
-def _insert_person(pg_conn, name: str, status: str = "known") -> int:
+# Строки, засеянные тестом напрямую в БД, — с уборкой после него.
+# До цикла 21 сидинг был безвозвратным, и это ломало повторный локальный
+# прогон по той же БД: `test_persons_list_filters_by_status_and_query`
+# проверяет `ids == [pid_known]` на фильтре `?q=`, а имена детерминированы
+# (`request.node.name`) — со второго прогона под фильтр попадали ещё и
+# персоны предыдущего, и совпадение списка рвалось. В CI не видно
+# (свежий сервис-контейнер на каждый прогон), локально — ложное «failed»
+# на здоровом дереве.
+@pytest.fixture(autouse=True)
+def _seeded(pg_conn):
+    seeded = {"persons": [], "face_events": []}
+    yield seeded
+    with pg_conn.cursor() as cur:
+        if seeded["face_events"]:
+            cur.execute("DELETE FROM face_events WHERE id = ANY(%s)", (seeded["face_events"],))
+        if seeded["persons"]:
+            # События персоны могли быть созданы и не через _insert_face_event
+            # (например, самим обработчиком) — снимаем их по person_id, иначе
+            # DELETE упрётся в внешний ключ.
+            cur.execute("DELETE FROM face_events WHERE person_id = ANY(%s)", (seeded["persons"],))
+            cur.execute("DELETE FROM persons WHERE id = ANY(%s)", (seeded["persons"],))
+
+
+def _insert_person(pg_conn, name: str, status: str = "known", _seeded=None) -> int:
     with pg_conn.cursor() as cur:
         cur.execute(
             "INSERT INTO persons (name, status, centroid, alert_on_detection, created_at) "
             "VALUES (%s, %s, CAST(%s AS vector), false, NOW()) RETURNING id",
             (name, status, _vec()),
         )
-        return cur.fetchone()[0]
+        pid = cur.fetchone()[0]
+    if _seeded is not None:
+        _seeded["persons"].append(pid)
+    return pid
 
 
-def _insert_face_event(pg_conn, camera_id: int, person_id: int | None) -> int:
+def _insert_face_event(pg_conn, camera_id: int, person_id: int | None, _seeded=None) -> int:
     with pg_conn.cursor() as cur:
         cur.execute(
             "INSERT INTO face_events (camera_id, person_id, ts, embedding, is_known, enhanced) "
             "VALUES (%s, %s, NOW(), CAST(%s AS vector), %s, false) RETURNING id",
             (camera_id, person_id, _vec(), person_id is not None),
         )
-        return cur.fetchone()[0]
+        eid = cur.fetchone()[0]
+    if _seeded is not None:
+        _seeded["face_events"].append(eid)
+    return eid
 
 
 def _make_camera(client, admin_headers, request) -> int:
@@ -50,8 +80,8 @@ def test_persons_list_requires_auth(client):
     assert r.status_code == 401
 
 
-def test_persons_crud_update_and_delete(client, admin_headers, pg_conn, request):
-    pid = _insert_person(pg_conn, f"person_{request.node.name}"[:60])
+def test_persons_crud_update_and_delete(client, admin_headers, pg_conn, request, _seeded):
+    pid = _insert_person(pg_conn, f"person_{request.node.name}"[:60], _seeded=_seeded)
 
     r = client.get("/api/persons", headers=admin_headers)
     assert r.status_code == 200
@@ -77,10 +107,10 @@ def test_persons_get_missing_returns_404(client, admin_headers):
     assert r.status_code == 404
 
 
-def test_persons_list_filters_by_status_and_query(client, admin_headers, pg_conn, request):
+def test_persons_list_filters_by_status_and_query(client, admin_headers, pg_conn, request, _seeded):
     unique_name = f"findme_{request.node.name}"[:60]
-    pid_known = _insert_person(pg_conn, unique_name, status="known")
-    pid_unknown = _insert_person(pg_conn, f"other_{request.node.name}"[:60], status="unknown")
+    pid_known = _insert_person(pg_conn, unique_name, status="known", _seeded=_seeded)
+    pid_unknown = _insert_person(pg_conn, f"other_{request.node.name}"[:60], status="unknown", _seeded=_seeded)
 
     r = client.get("/api/persons", params={"status": "known"}, headers=admin_headers)
     assert r.status_code == 200
@@ -94,8 +124,8 @@ def test_persons_list_filters_by_status_and_query(client, admin_headers, pg_conn
     assert ids == [pid_known]
 
 
-def test_persons_update_status_and_alert_flag(client, admin_headers, pg_conn, request):
-    pid = _insert_person(pg_conn, f"upd_{request.node.name}"[:60], status="unknown")
+def test_persons_update_status_and_alert_flag(client, admin_headers, pg_conn, request, _seeded):
+    pid = _insert_person(pg_conn, f"upd_{request.node.name}"[:60], status="unknown", _seeded=_seeded)
 
     r = client.patch(
         f"/api/persons/{pid}",
@@ -114,18 +144,10 @@ def test_persons_update_missing_returns_404(client, admin_headers):
     assert r.status_code == 404
 
 
-def test_persons_delete_requires_admin_not_operator(client, admin_headers, pg_conn, request):
-    username = f"op_{request.node.name}"[:60]
-    r = client.post(
-        "/api/users",
-        json={"username": username, "password": "Str0ngPass!23", "role": "operator"},
-        headers=admin_headers,
-    )
-    assert r.status_code == 200, r.text
-    r = client.post("/api/auth/login", data={"username": username, "password": "Str0ngPass!23"})
-    op_headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+def test_persons_delete_requires_admin_not_operator(client, admin_headers, make_user_headers, pg_conn, request, _seeded):
+    op_headers = make_user_headers(f"op_{request.node.name}"[:60], "operator")
 
-    pid = _insert_person(pg_conn, f"person_{request.node.name}"[:60])
+    pid = _insert_person(pg_conn, f"person_{request.node.name}"[:60], _seeded=_seeded)
     r = client.delete(f"/api/persons/{pid}", headers=op_headers)
     assert r.status_code == 403
 
@@ -133,11 +155,11 @@ def test_persons_delete_requires_admin_not_operator(client, admin_headers, pg_co
     assert r.status_code == 200
 
 
-def test_persons_merge_reassigns_events_and_deletes_source(client, admin_headers, pg_conn, request):
+def test_persons_merge_reassigns_events_and_deletes_source(client, admin_headers, pg_conn, request, _seeded):
     cam_id = _make_camera(client, admin_headers, request)
-    src_id = _insert_person(pg_conn, f"src_{request.node.name}"[:60])
-    dst_id = _insert_person(pg_conn, f"dst_{request.node.name}"[:60])
-    ev_id = _insert_face_event(pg_conn, cam_id, src_id)
+    src_id = _insert_person(pg_conn, f"src_{request.node.name}"[:60], _seeded=_seeded)
+    dst_id = _insert_person(pg_conn, f"dst_{request.node.name}"[:60], _seeded=_seeded)
+    ev_id = _insert_face_event(pg_conn, cam_id, src_id, _seeded=_seeded)
 
     r = client.post(f"/api/persons/{src_id}/merge/{dst_id}", headers=admin_headers)
     assert r.status_code == 200
@@ -150,8 +172,8 @@ def test_persons_merge_reassigns_events_and_deletes_source(client, admin_headers
     assert any(item["id"] == ev_id for item in r.json())
 
 
-def test_persons_merge_with_self_rejected(client, admin_headers, pg_conn, request):
-    pid = _insert_person(pg_conn, f"self_{request.node.name}"[:60])
+def test_persons_merge_with_self_rejected(client, admin_headers, pg_conn, request, _seeded):
+    pid = _insert_person(pg_conn, f"self_{request.node.name}"[:60], _seeded=_seeded)
     r = client.post(f"/api/persons/{pid}/merge/{pid}", headers=admin_headers)
     assert r.status_code == 400
 
@@ -162,11 +184,11 @@ def test_persons_gallery_empty_for_unknown_person(client, admin_headers):
     assert r.json() == []
 
 
-def test_persons_enhance_queues_upscale_jobs(client, admin_headers, pg_conn, request):
+def test_persons_enhance_queues_upscale_jobs(client, admin_headers, pg_conn, request, _seeded):
     cam_id = _make_camera(client, admin_headers, request)
-    pid = _insert_person(pg_conn, f"enh_{request.node.name}"[:60])
-    _insert_face_event(pg_conn, cam_id, pid)
-    _insert_face_event(pg_conn, cam_id, pid)
+    pid = _insert_person(pg_conn, f"enh_{request.node.name}"[:60], _seeded=_seeded)
+    _insert_face_event(pg_conn, cam_id, pid, _seeded=_seeded)
+    _insert_face_event(pg_conn, cam_id, pid, _seeded=_seeded)
 
     r = client.post(f"/api/persons/{pid}/enhance", headers=admin_headers)
     assert r.status_code == 200
