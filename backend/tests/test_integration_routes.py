@@ -3,6 +3,7 @@
 только чистую логику (auth/шифрование/валидация), без БД в CI. Здесь —
 полный цикл: RBAC на реальных эндпоинтах, шифрование RTSP-учёток при
 записи/чтении из настоящей БД, аудит-лог, системные настройки."""
+from tests.conftest import TEST_USER_PASSWORD
 
 
 def _unique(prefix: str, request) -> str:
@@ -139,15 +140,8 @@ def test_camera_onvif_config_roundtrip(client, admin_headers, request):
     client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
 
 
-def test_onvif_discover_requires_admin(client, admin_headers, request):
-    username = _unique("op-onvif-discover", request)
-    client.post(
-        "/api/users",
-        json={"username": username, "password": "Op3rator!Pass1", "role": "operator"},
-        headers=admin_headers,
-    )
-    r = client.post("/api/auth/login", data={"username": username, "password": "Op3rator!Pass1"})
-    operator_headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+def test_onvif_discover_requires_admin(client, make_user_headers, request):
+    operator_headers = make_user_headers(_unique("op-onvif-discover", request), "operator")
 
     r = client.get("/api/cameras/onvif/discover", headers=operator_headers)
     assert r.status_code == 403
@@ -244,15 +238,8 @@ def test_onvif_discover_returns_503_when_worker_unreachable(client, admin_header
     assert r.status_code == 503
 
 
-def test_onvif_profiles_requires_admin(client, admin_headers, request):
-    username = _unique("op-onvif-profiles", request)
-    client.post(
-        "/api/users",
-        json={"username": username, "password": "Op3rator!Pass1", "role": "operator"},
-        headers=admin_headers,
-    )
-    r = client.post("/api/auth/login", data={"username": username, "password": "Op3rator!Pass1"})
-    operator_headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+def test_onvif_profiles_requires_admin(client, make_user_headers, request):
+    operator_headers = make_user_headers(_unique("op-onvif-profiles", request), "operator")
 
     r = client.post("/api/cameras/onvif/profiles", json={"host": "192.168.1.64"}, headers=operator_headers)
     assert r.status_code == 403
@@ -329,15 +316,8 @@ def test_onvif_stream_uri_proxies_worker_response(client, admin_headers, monkeyp
     assert r.json() == {"uri": "rtsp://192.168.1.64:554/profile1"}
 
 
-def test_onvif_stream_uri_requires_admin(client, admin_headers, request):
-    username = _unique("op-onvif-streamuri", request)
-    client.post(
-        "/api/users",
-        json={"username": username, "password": "Op3rator!Pass1", "role": "operator"},
-        headers=admin_headers,
-    )
-    r = client.post("/api/auth/login", data={"username": username, "password": "Op3rator!Pass1"})
-    operator_headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+def test_onvif_stream_uri_requires_admin(client, make_user_headers, request):
+    operator_headers = make_user_headers(_unique("op-onvif-streamuri", request), "operator")
 
     r = client.post(
         "/api/cameras/onvif/stream-uri",
@@ -347,18 +327,8 @@ def test_onvif_stream_uri_requires_admin(client, admin_headers, request):
     assert r.status_code == 403
 
 
-def test_operator_cannot_manage_cameras_but_can_view(client, admin_headers, request):
-    username = _unique("operator", request)
-    r = client.post(
-        "/api/users",
-        json={"username": username, "password": "Str0ngPass!23", "role": "operator"},
-        headers=admin_headers,
-    )
-    assert r.status_code == 200, r.text
-
-    r = client.post("/api/auth/login", data={"username": username, "password": "Str0ngPass!23"})
-    assert r.status_code == 200
-    op_headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+def test_operator_cannot_manage_cameras_but_can_view(client, admin_headers, make_user_headers, request):
+    op_headers = make_user_headers(_unique("operator", request), "operator")
 
     # Оператор видит список камер (не admin-only)...
     r = client.get("/api/cameras", headers=op_headers)
@@ -576,23 +546,20 @@ def test_apply_performance_profile_rewrites_tunables(client, admin_headers):
     assert r.status_code == 400
 
 
-def _register_and_login(client, admin_headers, username: str, password: str = "Str0ngPass!23"):
-    r = client.post(
-        "/api/users",
-        json={"username": username, "password": password, "role": "viewer"},
-        headers=admin_headers,
-    )
-    assert r.status_code == 200, r.text
-    r = client.post("/api/auth/login", data={"username": username, "password": password})
-    assert r.status_code == 200, r.text
-    return {"Authorization": f"Bearer {r.json()['access_token']}"}, password
+def _register_and_login(make_user, username: str, password: str = TEST_USER_PASSWORD):
+    """Учётка заводится через общую фикстуру `make_user` (conftest.py) —
+    она же удалит её после теста. До цикла 21 helper заводил пользователя
+    сам и не убирал: повторный локальный прогон по той же БД падал на
+    `POST /api/users` → 400 «уже существует»."""
+    _, token = make_user(username, "viewer", password=password)
+    return {"Authorization": f"Bearer {token}"}, password
 
 
-def test_change_password_locks_out_after_repeated_wrong_old_password(client, admin_headers, request):
+def test_change_password_locks_out_after_repeated_wrong_old_password(client, make_user, request):
     from app.routers.auth import CHANGE_PW_MAX_ATTEMPTS
 
     username = _unique("changepw-lockout", request)
-    headers, _ = _register_and_login(client, admin_headers, username)
+    headers, _ = _register_and_login(make_user, username)
 
     for _ in range(CHANGE_PW_MAX_ATTEMPTS):
         r = client.post(
@@ -612,9 +579,9 @@ def test_change_password_locks_out_after_repeated_wrong_old_password(client, adm
     assert r.status_code == 429, r.text
 
 
-def test_change_password_succeeds_and_resets_counter_below_limit(client, admin_headers, request):
+def test_change_password_succeeds_and_resets_counter_below_limit(client, make_user, request):
     username = _unique("changepw-ok", request)
-    headers, password = _register_and_login(client, admin_headers, username)
+    headers, password = _register_and_login(make_user, username)
 
     r = client.post(
         "/api/auth/change-password",

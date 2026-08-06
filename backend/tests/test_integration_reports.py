@@ -34,16 +34,8 @@ def test_reports_invalid_token_rejected(client):
     assert r.status_code == 401
 
 
-def test_reports_viewer_role_forbidden(client, admin_headers, admin_token, request):
-    username = f"viewer_{request.node.name}"[:60]
-    r = client.post(
-        "/api/users",
-        json={"username": username, "password": "Str0ngPass!23", "role": "viewer"},
-        headers=admin_headers,
-    )
-    assert r.status_code == 200, r.text
-    r = client.post("/api/auth/login", data={"username": username, "password": "Str0ngPass!23"})
-    viewer_token = r.json()["access_token"]
+def test_reports_viewer_role_forbidden(client, make_user, admin_token, request):
+    _, viewer_token = make_user(f"viewer_{request.node.name}"[:60], "viewer")
 
     r = client.get("/api/reports/appearances.csv", params={"token": viewer_token})
     assert r.status_code == 403

@@ -8,21 +8,13 @@ conftest.py:client, admin_headers). Покрывает защиту от self-lo
 фактическому количеству админов)."""
 
 
-def _create_user(client, admin_headers, request, role: str = "operator") -> dict:
+def _create_user(make_user, request, role: str = "operator") -> dict:
+    """Учётка заводится общей фикстурой (conftest.py:make_user), которая
+    удалит её после теста. Повторное удаление тем же id в финализаторе
+    безвредно: `DELETE /api/users/{id}` на несуществующем отвечает 404."""
     username = f"u_{request.node.name}"[:60]
-    r = client.post(
-        "/api/users",
-        json={"username": username, "password": "Str0ngPass!23", "role": role},
-        headers=admin_headers,
-    )
-    assert r.status_code == 200, r.text
-    return r.json()
-
-
-def _login(client, username: str) -> dict:
-    r = client.post("/api/auth/login", data={"username": username, "password": "Str0ngPass!23"})
-    assert r.status_code == 200, r.text
-    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+    user_id, token = make_user(username, role)
+    return {"id": user_id, "username": username, "token": token}
 
 
 def test_admin_cannot_delete_own_account(client, admin_headers):
@@ -36,23 +28,23 @@ def test_admin_cannot_delete_own_account(client, admin_headers):
     assert client.get("/api/auth/me", headers=admin_headers).status_code == 200
 
 
-def test_admin_can_delete_other_admin_while_not_last(client, admin_headers, request):
+def test_admin_can_delete_other_admin_while_not_last(client, admin_headers, make_user, request):
     """Проверка не должна ложно срабатывать: пока в системе двое админов,
     один может удалить другого (это не «последний администратор»)."""
-    second_admin = _create_user(client, admin_headers, request, role="admin")
+    second_admin = _create_user(make_user, request, role="admin")
     r = client.delete(f"/api/users/{second_admin['id']}", headers=admin_headers)
     assert r.status_code == 200, r.text
 
 
-def test_operator_cannot_delete_users(client, admin_headers, request):
-    op = _create_user(client, admin_headers, request, role="operator")
-    op_headers = _login(client, op["username"])
+def test_operator_cannot_delete_users(client, make_user, request):
+    op = _create_user(make_user, request, role="operator")
+    op_headers = {"Authorization": f"Bearer {op['token']}"}
     r = client.delete(f"/api/users/{op['id']}", headers=op_headers)
     assert r.status_code == 403
 
 
-def test_admin_can_delete_other_non_admin_user(client, admin_headers, request):
-    op = _create_user(client, admin_headers, request, role="operator")
+def test_admin_can_delete_other_non_admin_user(client, admin_headers, make_user, request):
+    op = _create_user(make_user, request, role="operator")
     r = client.delete(f"/api/users/{op['id']}", headers=admin_headers)
     assert r.status_code == 200, r.text
 

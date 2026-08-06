@@ -34,7 +34,6 @@ from app.auth import create_token
 
 pytestmark = pytest.mark.usefixtures("client")
 
-_PW = "Passw0rd!ident"
 
 # (описание, метод построения URL по токену, ожидаемый код для роли ниже
 # требуемой). 403 — «роль не подходит», 401 — «такого пользователя нет».
@@ -49,29 +48,6 @@ QUERY_TOKEN_ENDPOINTS = [
     ("метрики Prometheus", lambda t: f"/api/system/prometheus?token={t}", 403),
 ]
 
-
-@pytest.fixture()
-def make_user(client, admin_headers):
-    """Заводит пользователя через настоящий API и возвращает (id, токен)."""
-    created = []
-
-    def _make(username: str, role: str):
-        r = client.post(
-            "/api/users",
-            json={"username": username, "password": _PW, "role": role},
-            headers=admin_headers,
-        )
-        assert r.status_code == 200, r.text
-        user_id = r.json()["id"]
-        created.append(user_id)
-        lr = client.post("/api/auth/login", data={"username": username, "password": _PW})
-        assert lr.status_code == 200, lr.text
-        return user_id, lr.json()["access_token"]
-
-    yield _make
-
-    for user_id in created:
-        client.delete(f"/api/users/{user_id}", headers=admin_headers)
 
 
 @pytest.mark.parametrize("label,url_for,expected", QUERY_TOKEN_ENDPOINTS,

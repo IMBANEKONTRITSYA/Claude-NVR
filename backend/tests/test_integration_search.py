@@ -61,19 +61,11 @@ def test_search_face_degrades_gracefully_without_worker(client, admin_headers):
     assert r.status_code == 503
 
 
-def test_search_face_forbidden_for_operator_role_that_lacks_grant(client, admin_headers, request):
+def test_search_face_forbidden_for_operator_role_that_lacks_grant(client, make_user_headers, request):
     """search допускает admin и operator — только явное отсутствие токена
     должно отказывать; проверяем, что валидный operator-токен допускается
     до бизнес-логики (а не отсекается RBAC раньше срока)."""
-    username = f"op_{request.node.name}"[:60]
-    r = client.post(
-        "/api/users",
-        json={"username": username, "password": "Str0ngPass!23", "role": "operator"},
-        headers=admin_headers,
-    )
-    assert r.status_code == 200, r.text
-    r = client.post("/api/auth/login", data={"username": username, "password": "Str0ngPass!23"})
-    op_headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+    op_headers = make_user_headers(f"op_{request.node.name}"[:60], "operator")
 
     r = client.post(
         "/api/search/face",
