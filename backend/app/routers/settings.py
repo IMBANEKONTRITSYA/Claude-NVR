@@ -35,20 +35,27 @@ SCHEMA: dict[str, tuple] = {
     "upscale_mode": (str,),           # manual | avatar | all
     "cluster_interval_min": (int, 1, 1440),
     "detect_width": (int, 320, 1920),
-    "record_codec": (str,),           # h264 | h265
-    "record_bitrate": (int, 0, 50_000),   # kbps; 0 — CRF (авто-качество)
-    "record_iframe_only": (int, 0, 1),    # 1 — только ключевые кадры
+    # Слой записи (SPEC §20: «Сегменты 5–10 минут»). Кодек, битрейт и GOP
+    # больше не настраиваются: запись идёт remux'ом основного потока как
+    # есть, SPEC §24 явно запрещает перекодирование архива.
+    "record_segment_min": (int, 5, 10),
 }
 
 ENUMS = {
     "performance_profile": set(PROFILES),
     "face_model": {"buffalo_s", "buffalo_l"},
     "upscale_mode": {"manual", "avatar", "all"},
-    "record_codec": {"h264", "h265"},
 }
 
 
 class SettingsUpdate(BaseModel):
+    # extra="forbid": по умолчанию pydantic молча выбрасывает неизвестные
+    # поля, и PUT с опечаткой в ключе (или с настройкой, убранной из ТЗ, —
+    # record_codec/record_bitrate/record_iframe_only после цикла 24)
+    # отвечал 200 «сохранено», не сохранив ничего. Явный отказ 422 не даёт
+    # администратору решить, что настройка применилась.
+    model_config = {"extra": "forbid"}
+
     retention_days: int | None = None
     motion_threshold: int | None = None
     similarity_threshold: float | None = None
@@ -64,9 +71,7 @@ class SettingsUpdate(BaseModel):
     upscale_mode: str | None = None
     cluster_interval_min: int | None = None
     detect_width: int | None = None
-    record_codec: str | None = None
-    record_bitrate: int | None = None
-    record_iframe_only: int | None = None
+    record_segment_min: int | None = None
 
 
 def _visible(rows) -> dict[str, str]:

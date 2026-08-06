@@ -515,24 +515,32 @@ def test_settings_update_persists_and_validates_range(client, admin_headers):
     assert r.status_code == 400
 
 
-def test_record_bitrate_and_iframe_only_persist_and_validate(client, admin_headers):
-    r = client.put("/api/settings", json={"record_bitrate": 4000, "record_iframe_only": 1}, headers=admin_headers)
+def test_record_segment_min_persists_and_validates(client, admin_headers):
+    """SPEC §20: «Сегменты 5-10 минут». Кодек/битрейт/GOP записи убраны из
+    настроек в цикле 24 — архив пишется remux'ом как есть, перекодирование
+    запрещено §24, — а вместо них появилась единственная настройка слоя
+    записи: длительность сегмента, которую воркер передаёт MediaMTX."""
+    r = client.put("/api/settings", json={"record_segment_min": 10}, headers=admin_headers)
     assert r.status_code == 200
-    assert r.json()["record_bitrate"] == "4000"
-    assert r.json()["record_iframe_only"] == "1"
+    assert r.json()["record_segment_min"] == "10"
 
     r = client.get("/api/settings", headers=admin_headers)
-    assert r.json()["record_bitrate"] == "4000"
+    assert r.json()["record_segment_min"] == "10"
 
-    r = client.put("/api/settings", json={"record_bitrate": -1}, headers=admin_headers)
-    assert r.status_code == 400
+    # Границы диапазона ТЗ: за ними значение не должно приниматься.
+    for bad in (4, 11):
+        r = client.put("/api/settings", json={"record_segment_min": bad}, headers=admin_headers)
+        assert r.status_code == 400, bad
 
-    r = client.put("/api/settings", json={"record_iframe_only": 2}, headers=admin_headers)
-    assert r.status_code == 400
+    # Настройки прежнего слоя записи должны быть именно отвергнуты, а не
+    # молча приняты в БД: иначе в settings копились бы ключи, которых уже
+    # никто не читает.
+    r = client.put("/api/settings", json={"record_bitrate": 4000}, headers=admin_headers)
+    assert r.status_code == 422
 
-    r = client.put("/api/settings", json={"record_bitrate": 0}, headers=admin_headers)
+    r = client.put("/api/settings", json={"record_segment_min": 5}, headers=admin_headers)
     assert r.status_code == 200
-    assert r.json()["record_bitrate"] == "0"
+    assert r.json()["record_segment_min"] == "5"
 
 
 def test_apply_performance_profile_rewrites_tunables(client, admin_headers):

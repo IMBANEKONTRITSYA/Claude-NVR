@@ -56,9 +56,7 @@ export function Settings() {
         upscale_mode: s.upscale_mode,
         cluster_interval_min: parseInt(s.cluster_interval_min),
         detect_width: parseInt(s.detect_width),
-        record_codec: s.record_codec,
-        record_bitrate: parseInt(s.record_bitrate) || 0,
-        record_iframe_only: parseInt(s.record_iframe_only) || 0,
+        record_segment_min: parseInt(s.record_segment_min) || 5,
       };
       const r = await api.putSettings(payload);
       setS(r);
@@ -125,21 +123,7 @@ export function Settings() {
           </select>
         </div>
         <Field label="Интервал кластеризации (мин)" value={s.cluster_interval_min} onChange={upd("cluster_interval_min")} hint="Пакетное объединение дублей неизвестных персон" />
-        <div style={{ marginBottom: 14 }}>
-          <label>Кодек записи архива</label>
-          <select value={s.record_codec ?? "h264"} onChange={upd("record_codec")}>
-            <option value="h264">H.264 — совместим со всеми браузерами</option>
-            <option value="h265">H.265 — до 50% экономии места, воспроизведение не везде</option>
-          </select>
-        </div>
-        <Field label="Битрейт записи (кбит/с)" value={s.record_bitrate} onChange={upd("record_bitrate")} hint="0 — автоматическое качество (CRF); больше 0 — фиксированный потолок, предсказуемый размер архива" />
-        <div style={{ marginBottom: 14 }}>
-          <label>Только ключевые кадры (I-frame only)</label>
-          <select value={s.record_iframe_only ?? "0"} onChange={upd("record_iframe_only")}>
-            <option value="0">Выключено — обычное сжатие</option>
-            <option value="1">Включено — максимальная экономия места, файлы крупнее при равном качестве</option>
-          </select>
-        </div>
+        <Field label="Длительность сегмента записи (мин)" value={s.record_segment_min} onChange={upd("record_segment_min")} hint="5–10 минут. Архив пишется как есть, без перекодирования, поэтому кодек и битрейт задаются на самой камере" />
       </div>
 
       <div className="card" style={{ maxWidth: 520, marginBottom: 16 }}>

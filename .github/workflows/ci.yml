@@ -90,9 +90,14 @@ jobs:
         # от onvif_api.py, который сознательно вынесен из embed_api.py, чтобы не
         # тащить за собой cv2/insightface (см. onvif_api.py); fastapi/httpx лёгкие,
         # cv2/insightface/onnxruntime по-прежнему не ставятся в CI.
+        # Цикл 24: sqlalchemy добавлена ради tests/test_segment_index.py —
+        # индексация сегментов слоя записи ходит в БД, и без неё тест
+        # graceful-скипался бы, то есть production path слоя записи не
+        # проверялся бы в CI вообще (тест сам поднимает SQLite-файл, сервис
+        # Postgres джобе не нужен).
         run: |
           python -m pip install --upgrade pip
-          pip install pytest fastapi httpx defusedxml
+          pip install pytest fastapi httpx defusedxml sqlalchemy
           pytest tests/ -q
 
   upscaler:

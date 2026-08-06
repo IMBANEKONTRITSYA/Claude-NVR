@@ -12,7 +12,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 # Явный список исторически терял модули при каждом выделении нового файла
-# из worker.py (record_encode.py, hwaccel.py, onvif_client.py, onvif_api.py,
+# из worker.py (hwaccel.py, onvif_client.py, onvif_api.py, record_layer.py,
 # logging_utils.py все по очереди не попадали сюда — контейнер падал в
 # CrashLoop с ModuleNotFoundError при первом же реальном docker-сборке,
 # незамеченным 17+ циклов аудита, потому что песочница без Docker-демона

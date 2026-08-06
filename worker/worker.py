@@ -1,11 +1,20 @@
 """
-FaceWatch worker: для каждой включённой камеры —
-- репабликация RTSP в MediaMTX (ffmpeg, copy) → доступно по HLS;
+FaceWatch worker — слой аналитики (SPEC §2) плюс управление слоем записи.
+
+Слой записи (SPEC §20) воркер **не выполняет сам**: основные потоки всех
+камер тянет и пишет remux'ом MediaMTX, воркер только сверяет конфигурацию
+его путей через Control API и заносит дописанные сегменты в архив
+(record_layer.py, segment_index.py). До цикла 24 запись жила прямо в нити
+камеры — по процессу ffmpeg на камеру ради републикации и cv2.VideoWriter с
+последующим перекодированием mp4v→H.264, — что противоречило §20 и §24 и
+связывало запись с живостью аналитики вопреки §2.
+
+Аналитика по каждой камере:
 - детекция движения (MOG2) с применением ROI-маски;
 - InsightFace эмбеддинги, кластеризация через ближайший центроид (pgvector);
-- запись видеосегментов при движении/лице, ротация по RETENTION_DAYS;
 - сохранение последнего кадра камеры (snapshots/cam{id}_latest.jpg);
-- периодическая DBSCAN-перекластеризация (раз в час) для слияния дублирующихся неизвестных.
+- периодическая DBSCAN-перекластеризация для слияния дублирующихся неизвестных;
+- ротация архива и медиа по retention_days.
 """
 import os
 import sys
@@ -33,7 +42,8 @@ from pgvector.sqlalchemy import Vector
 from backoff import reconnect_delay
 from face_select import pick_matching_face
 from fileage import prune_media
-from record_encode import build_encode_args
+from record_layer import MediaMTXClient, path_conf, path_name, sync_paths
+from segment_index import index_new_segments
 from snapshot_http import fetch_snapshot_bytes
 from shutdown import shutdown_event, handle_shutdown_signal
 from logging_utils import configure_logging
@@ -49,11 +59,13 @@ RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 FERNET_KEY = os.environ.get("RTSP_ENCRYPTION_KEY", "ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ=")
 MEDIAMTX_HOST = os.environ.get("MEDIAMTX_HOST", "mediamtx")
 MEDIAMTX_PORT = int(os.environ.get("MEDIAMTX_PORT", "8554"))
+# Control API MediaMTX — им синхронизируются пути слоя записи (SPEC §20).
+MEDIAMTX_API_URL = os.environ.get(
+    "MEDIAMTX_API_URL", f"http://{MEDIAMTX_HOST}:9997"
+)
 
 DBSCAN_EPS = 0.35
 DBSCAN_MIN_SAMPLES = 3
-SEGMENT_MAX_SEC = 60
-REPUBLISH_STABLE_SEC = 30  # ffmpeg-репабликация жива дольше этого — бэкофф сброшен
 
 # Рантайм-конфиг, обновляется из таблицы settings (см. refresh_config)
 CONFIG = {
@@ -73,9 +85,10 @@ CONFIG = {
     "upscale_mode": "avatar",  # manual | avatar | all
     "cluster_interval_min": 15,
     "detect_width": 640,
-    "record_codec": "h264",
-    "record_bitrate": 0,       # kbps; 0 — CRF-режим (авто-качество), >0 — фиксированный битрейт (ТЗ 18.8)
-    "record_iframe_only": 0,   # 1 — только ключевые кадры (максимальная экономия места, ТЗ 18.8)
+    # Слой записи (SPEC §20: «Сегменты 5–10 минут»). Кодек/битрейт/GOP
+    # больше не настраиваются: запись идёт remux'ом как есть, §24 явно
+    # запрещает перекодирование архива.
+    "record_segment_min": 5,
 }
 
 # Типы значений настроек: как приводить строку из БД
@@ -85,8 +98,7 @@ _CONFIG_TYPES = {
     "telegram_bot_token": str, "telegram_chat_id": str,
     "frame_skip": int, "motion_prefilter": int, "idle_fps": int,
     "face_model": str, "upscale_mode": str, "cluster_interval_min": int,
-    "detect_width": int, "record_codec": str,
-    "record_bitrate": int, "record_iframe_only": int,
+    "detect_width": int, "record_segment_min": int,
 }
 
 # Секунд без движения, после которых камера уходит в «спящий» режим детекции
@@ -297,23 +309,6 @@ def update_status(cam_id: int, status: str):
         pass
 
 
-def start_republish(cam_id: int, rtsp_url: str) -> subprocess.Popen | None:
-    """ffmpeg: TCP-копирование RTSP → MediaMTX (без перекодирования)."""
-    out = f"rtsp://{MEDIAMTX_HOST}:{MEDIAMTX_PORT}/cam{cam_id}"
-    cmd = [
-        "ffmpeg", "-nostdin", "-loglevel", "error",
-        "-rtsp_transport", "tcp",
-        "-i", rtsp_url,
-        "-c", "copy", "-an",
-        "-f", "rtsp", "-rtsp_transport", "tcp", out,
-    ]
-    try:
-        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except FileNotFoundError:
-        logger.warning("ffmpeg не найден, репабликация пропущена", extra={"camera_id": cam_id})
-        return None
-
-
 _DECODE_ACCEL_LOGGED = False
 
 # ТЗ 12: "детект зависших потоков". Без этих свойств ни cap.open(), ни
@@ -517,104 +512,6 @@ def load_cam_state(cam_id: int) -> tuple[dict | None, bool, int | None]:
         return cam.roi, True, getattr(cam, "motion_sensitivity", None)
 
 
-# Нити финализации сегментов. Каждая короткоживущая, но на остановке их
-# нужно дождаться: пока она не отработала, записанный кусок существует
-# только как осиротевший `*_tmp.mp4` без строки в `video_segments`, то есть
-# в архиве его нет. Список с блокировкой, а не Thread.join() по одной
-# ссылке: сегменты закрываются со всех нитей камер одновременно.
-_FINALIZE_THREADS: list[threading.Thread] = []
-_FINALIZE_LOCK = threading.Lock()
-
-
-def spawn_finalize(cam_id: int, tmp_path: str, final_path: str, started, ended, event_type: str):
-    """Запускает финализацию сегмента в фоне и берёт нить на учёт."""
-    t = threading.Thread(
-        target=finalize_segment,
-        args=(cam_id, tmp_path, final_path, started, ended, event_type),
-        daemon=True,
-    )
-    with _FINALIZE_LOCK:
-        # Заодно чистим отработавшие — иначе список рос бы весь срок жизни
-        # процесса (сегмент раз в минуту на камеру, 16 камер, 24/7).
-        _FINALIZE_THREADS[:] = [x for x in _FINALIZE_THREADS if x.is_alive()]
-        _FINALIZE_THREADS.append(t)
-    t.start()
-    return t
-
-
-def join_finalize_threads(deadline: float):
-    """Ждёт финализации незавершённых сегментов до общего дедлайна."""
-    with _FINALIZE_LOCK:
-        pending = [t for t in _FINALIZE_THREADS if t.is_alive()]
-    for t in pending:
-        t.join(timeout=max(0.0, deadline - time.time()))
-    left = [t for t in pending if t.is_alive()]
-    if left:
-        logger.warning("сегменты не успели финализироваться в срок",
-                       extra={"threads": len(left)})
-
-
-def finalize_segment(cam_id: int, tmp_path: str, final_path: str,
-                     started, ended, event_type: str):
-    """Транскод mp4v → H.264 (браузеры не играют mp4v в <video>) + запись в БД.
-    Выполняется в отдельной короткоживущей нити, чтобы не блокировать цикл камеры."""
-    ok = False
-    # H.265 экономит до 50% места, но не играется в части браузеров —
-    # выбор за администратором (ТЗ 18.8).
-    codec = "libx265" if CONFIG["record_codec"] == "h265" else "libx264"
-    encode_args = build_encode_args(
-        codec,
-        bitrate_kbps=int(CONFIG.get("record_bitrate") or 0),
-        iframe_only=bool(int(CONFIG.get("record_iframe_only") or 0)),
-    )
-    if shutdown_event.is_set():
-        # На остановке транскод не запускаем: ffmpeg на минутный сегмент
-        # идёт секунды-минуты (таймаут здесь — 300 с), а grace period у
-        # `docker compose stop` по умолчанию 10 с. Нить всё равно не успела
-        # бы, и SIGKILL оставил бы кусок записи осиротевшим `*_tmp.mp4` без
-        # строки в архиве. Переименование — миллисекунды, и запись
-        # сохраняется: ровно тот же режим деградации, что уже применяется
-        # ниже, когда транскод не удался (mp4v вместо H.264).
-        try:
-            os.replace(tmp_path, final_path)
-            ok = True
-        except Exception:
-            logger.error("не удалось сохранить сегмент на остановке", exc_info=True,
-                         extra={"camera_id": cam_id})
-    else:
-        try:
-            _lower_priority()
-            subprocess.run(
-                ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", tmp_path,
-                 *encode_args, "-movflags", "+faststart", "-an", final_path],
-                timeout=300, check=True,
-            )
-            os.remove(tmp_path)
-            ok = True
-        except Exception:
-            logger.warning("транскод не удался, оставляю исходник", exc_info=True, extra={"camera_id": cam_id})
-            try:
-                os.replace(tmp_path, final_path)
-                ok = True
-            except Exception:
-                pass
-    if not ok:
-        return
-    try:
-        with Session() as s:
-            s.add(VideoSegment(
-                camera_id=cam_id,
-                started_at=started,
-                ended_at=ended,
-                file_path=final_path,
-                event_type=event_type,
-                duration_sec=int((ended - started).total_seconds()),
-            ))
-            s.commit()
-    except Exception:
-        logger.error("не удалось сохранить сегмент", exc_info=True, extra={"camera_id": cam_id})
-
-
 # ТЗ 18.7: события движения/присутствия от ONVIF-камеры вместо постоянного
 # MOG2-префильтра на CPU. cam_id -> время последнего события/последнего
 # успешного pull'а — camera_worker считает ONVIF "здоровым" (и пропускает
@@ -705,8 +602,15 @@ def onvif_poll_worker(cam_id: int, host: str, port: int, username: str | None, p
 
 def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None = None,
                    onvif_config: dict | None = None):
-    """Двухпоточная схема (ТЗ 18.1): основной поток идёт в архив и HLS,
-    аналитика выполняется на субпотоке низкого разрешения, если он задан."""
+    """Аналитика по одной камере (SPEC §6).
+
+    Основной поток эта функция больше не трогает вообще: его тянет и пишет
+    MediaMTX (слой записи, см. record_layer.py). Здесь открывается только
+    поток аналитики — субпоток, если он задан, иначе основной, — и нить
+    занимается исключительно детекцией и распознаванием. Так выполняется
+    §2: «Отказ аналитики НЕ влияет на запись» — падение или перезапуск этой
+    нити ничего не делает с архивом.
+    """
     analyze_url = sub_rtsp_url or rtsp_url
     # Снимки лиц режутся из полноразмерного кадра, который камера отдаёт по
     # HTTP (ONVIF GetSnapshotUri), а не из кадра аналитики: на субпотоке
@@ -718,28 +622,10 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         "analytics_stream": "sub" if sub_rtsp_url else "main",
         "hires_snapshots": bool(snapshot_url),
     })
-    republish = start_republish(cam_id, rtsp_url)
-    # Цикл 16 (было известным пробелом с цикла 15, см. REVIEW_LOG.md): счётчик
-    # и таймер бэкоффа авто-рестарта ffmpeg-репабликации — без них недоступный
-    # основной RTSP-поток (неверный пароль/URL, отключённая камера) означал
-    # попытку заново поднять ffmpeg на каждой итерации цикла кадров, т.е. до
-    # нескольких раз в секунду — fork/connect-storm без всякой пользы, пока
-    # RTSP не восстановится сам. Используем тот же экспоненциальный бэкофф,
-    # что и для RTSP-реконнекта (backoff.reconnect_delay).
-    republish_attempt = 0
-    republish_started_at = time.time()
-    # Даже если ffmpeg падает мгновенно после самого первого запуска выше,
-    # первый перезапуск внутри цикла кадров всё равно ждёт базовую задержку
-    # бэкоффа — иначе первая проверка (сразу следующая итерация цикла)
-    # рестартовала бы ffmpeg без задержки вообще, до применения бэкоффа.
-    republish_retry_at = republish_started_at + reconnect_delay(0)
-
     cap = open_capture(analyze_url)
     if not cap.isOpened():
         logger.error("не удалось открыть RTSP", extra={"camera_id": cam_id})
         update_status(cam_id, "offline")
-        if republish:
-            republish.terminate()
         return
     update_status(cam_id, "online")
 
@@ -770,9 +656,6 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
             daemon=True,
         ).start()
 
-    # `writer` объявлен до try: на него смотрит finally, а исключение может
-    # прилететь и из инициализации ниже (тот же load_cam_state()).
-    writer = None
     try:
         bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=False)
         last_proc = 0.0
@@ -785,29 +668,8 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         fps_window_start = time.time()
         fps_frames = 0
 
-        seg_path = None
-        seg_tmp = None
-        seg_started = None
-        seg_had_face = False   # было ли лицо хоть в одном кадре сегмента
         last_event_at: dict[int, float] = {}  # person_id -> время последнего события (тротлинг)
         last_motion = 0.0
-        # В сегмент пишутся ВСЕ кадры потока, поэтому fps контейнера должен
-        # совпадать с fps камеры — иначе видео играет с неверной скоростью
-        # (с жёстким fps=10 запись с 25-fps камеры шла в 2.5 раза медленнее).
-        cam_fps = cap.get(cv2.CAP_PROP_FPS)
-        fps_out = cam_fps if (cam_fps and 1.0 <= cam_fps <= 60.0) else 25.0
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-
-        def close_segment(reason_ended):
-            nonlocal writer, seg_path, seg_tmp, seg_started, seg_had_face
-            writer.release()
-            etype = "face" if seg_had_face else "motion"
-            spawn_finalize(cam_id, seg_tmp, seg_path, seg_started, reason_ended, etype)
-            writer = None
-            seg_path = None
-            seg_tmp = None
-            seg_started = None
-            seg_had_face = False
 
         reconnect_attempt = 0
         # Освобождение ресурсов вынесено в finally ниже. Раньше оно стояло в
@@ -852,35 +714,12 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
                 reconnect_attempt = 0
 
             now = time.time()
-            # Авто-перезапуск ffmpeg-репабликации, если он умер — с тем же
-            # экспоненциальным бэкоффом, что и у RTSP-реконнекта, иначе
-            # недоступный основной поток означает попытку перезапуска ffmpeg на
-            # каждой итерации цикла кадров (fork/connect-storm, см. докстринг
-            # инициализации republish_attempt выше).
-            if republish and republish.poll() is not None:
-                if now >= republish_retry_at:
-                    delay = reconnect_delay(republish_attempt)
-                    logger.warning(
-                        "ffmpeg-репабликация упала, перезапускаю",
-                        extra={"camera_id": cam_id, "retry_in_sec": round(delay, 1), "attempt": republish_attempt + 1},
-                    )
-                    republish = start_republish(cam_id, rtsp_url)
-                    republish_started_at = now
-                    republish_attempt += 1
-                    republish_retry_at = now + delay
-            elif republish and republish_attempt and (now - republish_started_at) > REPUBLISH_STABLE_SEC:
-                # Продержался достаточно долго живым — считаем восстановленным,
-                # следующий сбой снова начнёт бэкофф с базовой задержки.
-                republish_attempt = 0
-
             # Адаптивная частота (ТЗ 18.3): при длительном покое опускаемся до idle_fps,
             # при первом же движении мгновенно возвращаемся к полной частоте.
             idle = (now - last_motion) > IDLE_AFTER_SEC
             target_fps = CONFIG["idle_fps"] if idle else CONFIG["detection_fps"]
             interval = 1.0 / max(1, target_fps)
             if now - last_proc < interval:
-                if writer:
-                    writer.write(frame)
                 continue
             last_proc = now
 
@@ -888,8 +727,6 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
             frame_counter += 1
             skip = int(CONFIG["frame_skip"])
             if skip and (frame_counter % (skip + 1)) != 0:
-                if writer:
-                    writer.write(frame)
                 continue
 
             # Фактический FPS детекции по камере → в Redis для мониторинга
@@ -957,25 +794,12 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
                 logger.error("ошибка распознавания", exc_info=True, extra={"camera_id": cam_id})
                 faces = []
 
+            # Движение больше не открывает сегмент: запись непрерывная и идёт
+            # в MediaMTX (SPEC §5, §20). Здесь оно нужно только для
+            # адаптивной частоты детекции — «мгновенный возврат к полной
+            # частоте при появлении движения» (SPEC §19).
             if motion or faces:
                 last_motion = now
-                if writer is None:
-                    seg_started = datetime.utcnow()
-                    fname = f"cam{cam_id}_{int(time.time())}.mp4"
-                    seg_path = os.path.join(MEDIA_PATH, "segments", fname)
-                    seg_tmp = seg_path.replace(".mp4", "_tmp.mp4")
-                    seg_had_face = False
-                    h, w = frame.shape[:2]
-                    writer = cv2.VideoWriter(seg_tmp, fourcc, fps_out, (w, h))
-                if faces:
-                    seg_had_face = True
-                writer.write(frame)
-
-            if writer and (
-                (now - last_motion > 5)
-                or (seg_started and (datetime.utcnow() - seg_started).total_seconds() > SEGMENT_MAX_SEC)
-            ):
-                close_segment(datetime.utcnow())
 
             if not faces:
                 continue
@@ -995,19 +819,13 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
                      extra={"camera_id": cam_id})
         update_status(cam_id, "offline")
     finally:
-        # Порядок важен: сначала снимаем ONVIF-нить (она держит сокет и
-        # подписку на камере), затем закрываем незавершённый сегмент, чтобы
-        # запись не пропала, и только потом отпускаем захват и ffmpeg.
+        # Единый finally на все пути выхода — штатный, по отключению камеры и
+        # по необработанному исключению (цикл 23). Сначала снимаем ONVIF-нить
+        # (она держит сокет и подписку на камере), затем отпускаем захват.
+        # Сегмента и ffmpeg-репабликации здесь больше нет: с цикла 24 запись
+        # ведёт MediaMTX, и остановка аналитики её не касается (SPEC §2).
         onvif_stop.set()
-        if writer:
-            try:
-                close_segment(datetime.utcnow())
-            except Exception:
-                logger.error("не удалось закрыть сегмент при остановке", exc_info=True,
-                             extra={"camera_id": cam_id})
         cap.release()
-        if republish:
-            republish.terminate()
 
 
 
@@ -1326,6 +1144,45 @@ def cleanup_old():
         logger.info("уборка медиа-файлов", extra={"removed": removed})
 
 
+def record_layer_sync(cams) -> None:
+    """Приводит пути MediaMTX к списку включённых камер (SPEC §2, §20).
+
+    Идемпотентна и дёшева на неизменившемся списке: sync_paths() сравнивает
+    только те поля, которыми управляет слой записи, и на совпадении не
+    делает ни одного пишущего запроса. Поэтому вызов стоит прямо в цикле
+    менеджера — добавление или отключение камеры в админке подхватывается
+    за ~10 с без перезапуска слоёв, чего и требует SPEC §2.
+
+    Пишется ВСЕГДА основной поток (SPEC §20: «Запись ТОЛЬКО основного
+    потока. Субпоток в архив не пишется») — независимо от того, какой поток
+    использует аналитика.
+    """
+    desired = {}
+    for cam_id, rtsp_url in cams:
+        desired[path_name(cam_id)] = path_conf(
+            rtsp_url, segment_duration_min=CONFIG["record_segment_min"]
+        )
+    stats = sync_paths(MediaMTXClient(MEDIAMTX_API_URL), desired)
+    if any(stats.values()):
+        logger.info("синхронизация слоя записи", extra=stats)
+
+
+def index_record_segments() -> None:
+    """Заносит дописанные сегменты слоя записи в архив (`video_segments`).
+
+    Идёт в цикле менеджера, а не в нити камеры: файлы пишет чужой процесс,
+    и привязывать индексацию к живости аналитики значило бы снова связать
+    слои вопреки SPEC §2.
+    """
+    try:
+        index_new_segments(
+            Session, VideoSegment, os.path.join(MEDIA_PATH, "segments"),
+            now=time.time(), from_timestamp=datetime.utcfromtimestamp,
+        )
+    except Exception:
+        logger.error("не удалось занести сегменты записи в архив", exc_info=True)
+
+
 def manager():
     # Настройки читаем ДО загрузки модели: профиль задаёт face_model и
     # detect_width, иначе выбор в админке не применялся бы до перезапуска.
@@ -1360,17 +1217,22 @@ def manager():
                     loaded_model = (CONFIG["face_model"], CONFIG["detect_width"])
                 except Exception:
                     logger.error("не удалось сменить модель", exc_info=True)
+            record_cams: list[tuple[int, str]] = []
             with Session() as s:
                 cams = s.execute(select(Camera).where(Camera.enabled == True)).scalars().all()
                 for cam in cams:
-                    if cam.id in threads and threads[cam.id].is_alive():
-                        continue
                     try:
                         rtsp = fernet.decrypt(cam.rtsp_url_enc.encode()).decode()
                         sub_enc = getattr(cam, "sub_rtsp_url_enc", None)
                         sub = fernet.decrypt(sub_enc.encode()).decode() if sub_enc else None
                     except Exception:
                         logger.error("не удалось расшифровать RTSP", exc_info=True, extra={"camera_id": cam.id})
+                        continue
+                    # Слой записи не зависит от того, поднялась ли нить
+                    # аналитики: камера попадает в него сразу после расшифровки
+                    # адреса (SPEC §2).
+                    record_cams.append((cam.id, rtsp))
+                    if cam.id in threads and threads[cam.id].is_alive():
                         continue
                     onvif_config = None
                     if getattr(cam, "onvif_enabled", False) and getattr(cam, "onvif_host", None):
@@ -1392,6 +1254,15 @@ def manager():
                     )
                     t.start()
                     threads[cam.id] = t
+
+            # Слой записи (SPEC §20) — вне сессии БД: sync_paths() ходит по
+            # сети в MediaMTX, и держать на это время открытое соединение с
+            # Postgres незачем (правило из цикла 20).
+            try:
+                record_layer_sync(record_cams)
+            except Exception:
+                logger.error("не удалось синхронизировать слой записи", exc_info=True)
+            index_record_segments()
 
             now = time.time()
             if now - last_cleanup > 3600:
@@ -1421,14 +1292,13 @@ def manager():
         t.join(timeout=max(0.0, deadline - time.time()))
         if t.is_alive():
             logger.warning("нить камеры не успела остановиться в срок", extra={"camera_id": cam_id})
-    # Нити камер, закрываясь, отдают недописанные сегменты в финализацию.
-    # Без этого ожидания процесс выходил сразу: финализация — daemon-нить,
-    # интерпретатор её просто убивает, и последний сегмент каждой пишущей
-    # камеры пропадал при каждом штатном рестарте (до минуты записи на
-    # камеру), оставаясь осиротевшим `*_tmp.mp4` без строки в архиве.
-    # На остановке финализация не транскодирует (см. finalize_segment),
-    # поэтому укладывается в остаток общего бюджета.
-    join_finalize_threads(deadline)
+    # Последняя индексация перед выходом: запись продолжает идти в MediaMTX
+    # и после остановки воркера, но сегменты, дописанные к этому моменту,
+    # лучше занести сейчас — иначе они ждут следующего старта воркера.
+    # Ожидания нитей финализации здесь больше нет: воркер ничего не пишет и
+    # ничего не перекодирует, терять на остановке нечего (до цикла 24 здесь
+    # терялся последний сегмент каждой камеры, см. REVIEW_LOG.md цикл 23).
+    index_record_segments()
     logger.info("воркер остановлен")
 
 

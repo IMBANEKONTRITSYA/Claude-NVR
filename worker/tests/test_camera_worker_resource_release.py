@@ -5,21 +5,22 @@
 каждой точке выхода по отдельности. Из этого следовали две дыры:
 
 1. **Необработанное исключение в цикле кадров** уносило нить мимо всех этих
-   точек. `cv2.VideoCapture` оставался открытым, а процесс
-   ffmpeg-репабликации — осиротевшим: `subprocess.Popen` не убивается
-   сборщиком мусора, ffmpeg продолжает держать соединение с камерой и
-   писать в MediaMTX. `manager()` поднимает камеру заново через ~10 с,
-   поэтому утечка накапливалась по одному захвату и одному ffmpeg на
-   каждый сбой.
+   точек, и `cv2.VideoCapture` оставался открытым. `manager()` поднимает
+   камеру заново через ~10 с, поэтому утечка накапливалась по одному
+   захвату на каждый сбой.
+
+   Цикл 23 проверял здесь же и осиротевший процесс ffmpeg-репабликации;
+   с цикла 24 нить камеры его не запускает вовсе — основной поток тянет
+   MediaMTX (SPEC §20), — поэтому проверять стало нечего.
 
    Под try были только распознавание и `process_faces()` — то есть ровно
    то, что уже считали опасным. Незащищёнными оставались обращения к БД:
    `load_cam_state()` ходит в Postgres каждые 10 секунд с каждой нити.
    Обычная для 24/7 перезагрузка БД (обновление, отработка отказа,
    исчерпание пула) роняет все 16 нитей разом — и разом же оставляет 16
-   осиротевших ffmpeg.
+   открытых захватов.
 
-2. **Отключение камеры в админке** освобождало захват и ffmpeg, но не
+2. **Отключение камеры в админке** освобождало захват, но не
    ONVIF-нить: у неё не было своего условия остановки, только глобальный
    `shutdown_event`. Нить оставалась висеть с PullPoint-подпиской и
    сокетом, а повторное включение камеры добавляло рядом ещё одну. Тот же
@@ -70,44 +71,25 @@ class _WorkingCapture:
         self.released = True
 
 
-class _FakeFfmpeg:
-    """Заглушка `subprocess.Popen` ffmpeg-репабликации.
-
-    `poll()` возвращает None — «процесс жив», иначе цикл кадров ушёл бы в
-    ветку авто-рестарта репабликации и тест проверял бы не то.
-    """
-
-    def __init__(self):
-        self.terminated = False
-
-    def poll(self):
-        return None
-
-    def terminate(self):
-        self.terminated = True
-
-
 @pytest.fixture()
 def harness(monkeypatch):
-    """Подменяет только границы процесса: захват RTSP, ffmpeg, запись на
-    диск и статус в БД. Сам `camera_worker()` выполняется настоящий."""
+    """Подменяет только границы процесса: захват RTSP, запись на диск и
+    статус в БД. Сам `camera_worker()` выполняется настоящий."""
     cap = _WorkingCapture()
-    ffmpeg = _FakeFfmpeg()
     monkeypatch.setattr(worker, "open_capture", lambda url: cap)
-    monkeypatch.setattr(worker, "start_republish", lambda *a, **kw: ffmpeg)
     monkeypatch.setattr(worker, "update_status", lambda *a, **kw: None)
     monkeypatch.setattr(worker, "save_latest_frame", lambda *a, **kw: None)
     monkeypatch.setattr(worker, "resolve_snapshot_url", lambda *a, **kw: None)
-    return cap, ffmpeg
+    return cap
 
 
 def test_resources_released_when_frame_loop_raises(harness, monkeypatch):
-    """Сбой обращения к БД в цикле кадров не должен утекать захватом и ffmpeg.
+    """Сбой обращения к БД в цикле кадров не должен утекать захватом.
 
     Воспроизводит production path: `load_cam_state()` вызывается настоящим
     циклом кадров и падает так, как падал бы при недоступном Postgres.
     """
-    cap, ffmpeg = harness
+    cap = harness
 
     def boom(cam_id):
         raise RuntimeError("БД недоступна")
@@ -122,10 +104,6 @@ def test_resources_released_when_frame_loop_raises(harness, monkeypatch):
         "RTSP-захват OpenCV не освобождён при исключении в цикле кадров — "
         "каждый сбой оставляет открытый захват, manager() создаёт рядом новый"
     )
-    assert ffmpeg.terminated, (
-        "процесс ffmpeg-репабликации осиротел при исключении в цикле кадров — "
-        "Popen не убивается сборщиком мусора, ffmpeg продолжает держать камеру"
-    )
 
 
 def test_onvif_thread_stops_when_camera_disabled(harness, monkeypatch):
@@ -135,7 +113,7 @@ def test_onvif_thread_stops_when_camera_disabled(harness, monkeypatch):
     подменяется только сетевой вызов ONVIF — то есть проверяется реальное
     условие остановки нити, а не факт вызова.
     """
-    cap, ffmpeg = harness
+    cap = harness
     polling = threading.Event()
 
     def fake_subscribe(host, port, username, password):
@@ -178,4 +156,4 @@ def test_onvif_thread_stops_when_camera_disabled(harness, monkeypatch):
         "ONVIF-нить продолжает держать PullPoint-подписку и сокет; "
         "повторное включение камеры добавит рядом ещё одну"
     )
-    assert cap.released and ffmpeg.terminated
+    assert cap.released

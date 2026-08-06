@@ -120,7 +120,8 @@ docker compose up -d --build
 Дважды кликните `stop.bat` или выполните `docker compose down` в папке
 проекта. Контейнеры останавливаются с `stop_grace_period`, воркер
 завершает нити камер штатно (закрывает `VideoCapture`/`VideoWriter`,
-останавливает ffmpeg-репабликацию) — см. `docs/ARCHITECTURE.md`.
+освобождает захваты RTSP) — см. `docs/ARCHITECTURE.md`. Запись при этом не
+прерывается: её ведёт отдельный сервис `mediamtx`.
 
 ## 9. Устранение неполадок при установке
 

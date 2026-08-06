@@ -31,10 +31,15 @@ export function Archive() {
           </div>
           <div>
             <label>Тип</label>
+            {/* Запись непрерывная (SPEC §5): с цикла 24 все новые сегменты
+                идут с типом "continuous". "Движение"/"Лицо" оставлены для
+                записей, сделанных прежним событийным слоем записи, — архив
+                смешанный, пока они не выйдут за retention. */}
             <select value={f.event_type} onChange={e => setF({ ...f, event_type: e.target.value })}>
               <option value="">Все</option>
-              <option value="motion">Движение</option>
-              <option value="face">Лицо</option>
+              <option value="continuous">Непрерывная запись</option>
+              <option value="motion">Движение (архив до обновления)</option>
+              <option value="face">Лицо (архив до обновления)</option>
             </select>
           </div>
           <div><label>С</label><input type="datetime-local" value={f.date_from} onChange={e => setF({ ...f, date_from: e.target.value })} /></div>
