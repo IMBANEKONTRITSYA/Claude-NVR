@@ -15,12 +15,13 @@ RTSP-адреса с учётными данными) писались в жур
 import logging
 
 from jose import jwt, JWTError
+from sqlalchemy import select
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
 from .config import settings
 from .db import SessionLocal
-from .models import AuditLog
+from .models import AuditLog, User
 
 # Дочерний logger «facewatch.backend» (настраивается в main.py:
 # configure_logging) — пишет тем же JSON-форматтером через обработчик
@@ -118,7 +119,21 @@ def _action_for(method: str, route_path: str | None) -> str | None:
     return ACTIONS.get((method, route_path))
 
 
-def _extract_user(request: Request) -> tuple[str, str] | None:
+# Роль, записываемая, когда учётной записи в БД уже нет: токен ещё не
+# истёк, но пользователь удалён. Пустая строка или роль из claim'а тут
+# одинаково вводили бы в заблуждение — журнал должен говорить, что
+# субъекта этого действия в системе не существует. Формат тот же, что у
+# заглушки `role = "?"` на /login (роль там ещё неизвестна — вход не
+# состоялся), и укладывается в String(20) модели.
+DELETED_USER_ROLE = "(удалён)"
+
+
+def _subject_from_token(request: Request) -> str | None:
+    """Имя пользователя (`sub`) из подписанного токена — или None.
+
+    Возвращается **только** имя. Роль намеренно не берётся отсюда: см.
+    `_role_from_db()`.
+    """
     auth = request.headers.get("Authorization") or ""
     token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else request.query_params.get("token")
     if not token:
@@ -127,7 +142,29 @@ def _extract_user(request: Request) -> tuple[str, str] | None:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
     except JWTError:
         return None
-    return payload.get("sub") or "", payload.get("role") or ""
+    return payload.get("sub") or ""
+
+
+async def _role_from_db(db, username: str) -> str:
+    """Роль субъекта — из БД, а не из claim'а токена.
+
+    Цикл 19 (PR #53) перевёл на БД всю *авторизацию*, но журнал аудита
+    остался на claim'е: `payload.get("role")`. Access-токен живёт 30 минут
+    и роль в нём заморожена на момент выдачи, поэтому в промежутке между
+    разжалованием (или удалением) и истечением токена журнал писал роль,
+    которой у пользователя уже нет.
+
+    Последствие не в доступе — доступ с цикла 19 закрыт, — а в
+    достоверности самого журнала: ТЗ 13 требует аудит как контроль, а
+    контроль, приписывающий действие не той роли, хуже отсутствующего,
+    потому что выглядит достоверным. Разбор инцидента по такому журналу
+    приходит к неверному выводу о том, кто и с какими правами действовал.
+
+    Отдельного запроса это не стоит: сессия уже открыта для INSERT'а
+    записи, и `select` идёт в той же транзакции.
+    """
+    row = (await db.execute(select(User.role).where(User.username == username))).scalar_one_or_none()
+    return row or DELETED_USER_ROLE
 
 
 class AuditMiddleware(BaseHTTPMiddleware):
@@ -159,15 +196,18 @@ class AuditMiddleware(BaseHTTPMiddleware):
 
         if request.url.path == "/api/auth/login":
             username = login_user or "?"
-            role = "?"
         else:
-            user = _extract_user(request)
-            if not user:
+            username = _subject_from_token(request)
+            if username is None:
                 return response
-            username, role = user
 
         try:
             async with SessionLocal() as db:
+                # Роль резолвится здесь, внутри уже открытой сессии, а не
+                # берётся из токена — см. _role_from_db(). Для /login роль
+                # остаётся "?": вход ещё не состоялся, и на неудачной
+                # попытке субъекта может не существовать вовсе.
+                role = "?" if request.url.path == "/api/auth/login" else await _role_from_db(db, username)
                 db.add(AuditLog(
                     username=username, role=role, action=action,
                     method=request.method, path=request.url.path,
