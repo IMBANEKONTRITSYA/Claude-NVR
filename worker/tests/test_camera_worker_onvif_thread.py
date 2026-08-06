@@ -67,7 +67,6 @@ class _OpensThenStallsCapture:
 def test_camera_worker_does_not_start_onvif_thread_when_capture_never_opens(monkeypatch):
     started = []
     monkeypatch.setattr(worker, "open_capture", lambda url: _NeverOpensCapture())
-    monkeypatch.setattr(worker, "start_republish", lambda *a, **kw: None)
     monkeypatch.setattr(worker, "update_status", lambda *a, **kw: None)
     monkeypatch.setattr(worker, "onvif_poll_worker", lambda *a, **kw: started.append(a))
 
@@ -87,7 +86,6 @@ def test_camera_worker_does_not_start_onvif_thread_when_capture_never_opens(monk
 def test_camera_worker_starts_onvif_thread_after_capture_opens(monkeypatch):
     started = threading.Event()
     monkeypatch.setattr(worker, "open_capture", lambda url: _OpensThenStallsCapture())
-    monkeypatch.setattr(worker, "start_republish", lambda *a, **kw: None)
     monkeypatch.setattr(worker, "update_status", lambda *a, **kw: None)
     monkeypatch.setattr(worker, "load_cam_state", lambda cam_id: (None, True, None))
 
@@ -120,7 +118,6 @@ def test_camera_worker_skips_onvif_thread_without_onvif_config(monkeypatch):
     вообще — ни при провале, ни при успехе открытия."""
     started = []
     monkeypatch.setattr(worker, "open_capture", lambda url: _NeverOpensCapture())
-    monkeypatch.setattr(worker, "start_republish", lambda *a, **kw: None)
     monkeypatch.setattr(worker, "update_status", lambda *a, **kw: None)
     monkeypatch.setattr(worker, "onvif_poll_worker", lambda *a, **kw: started.append(a))
 

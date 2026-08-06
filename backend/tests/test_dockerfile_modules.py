@@ -1,6 +1,6 @@
 """Регрессия: worker/Dockerfile перечислял копируемые .py-модули поимённо
 (`COPY worker.py embed_api.py backoff.py shutdown.py ./`). Каждый раз, когда
-из worker.py выделяли новый модуль (record_encode.py, hwaccel.py,
+из worker.py выделяли новый модуль (hwaccel.py,
 onvif_client.py, onvif_api.py, logging_utils.py — все по очереди), про
 обновление этой строки забывали. Результат — образ воркера собирался
 успешно (pip install отрабатывал), но контейнер падал в CrashLoop с
@@ -41,7 +41,8 @@ SERVICES = [
 KNOWN_MODULES = {
     "worker": {
         "worker", "backoff", "shutdown", "logging_utils", "hwaccel",
-        "onvif_client", "onvif_api", "embed_api", "record_encode",
+        "onvif_client", "onvif_api", "embed_api", "record_layer",
+        "segment_index",
     },
     "upscaler": {"upscaler", "logging_utils"},
 }

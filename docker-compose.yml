@@ -64,18 +64,36 @@ services:
     container_name: facewatch-mediamtx
     logging: *default-logging
     ports:
-      # MediaMTX не требует аутентификации по умолчанию (ТЗ 13). Worker
-      # публикует камеры и nginx проксирует HLS через внутреннюю docker-сеть
-      # (хост "mediamtx") — публикация наружу никому не нужна и означала бы,
-      # что любой в локальной сети смотрит камеры без входа в систему.
-      # Оставлено на loopback только для локальной отладки через VLC/ffplay.
+      # MediaMTX не требует аутентификации по умолчанию (SPEC §15). Он тянет
+      # камеры сам и раздаёт HLS через внутреннюю docker-сеть (хост
+      # "mediamtx"), куда ходит nginx — публикация наружу никому не нужна и
+      # означала бы, что любой в локальной сети смотрит камеры без входа в
+      # систему. Оставлено на loopback только для локальной отладки через
+      # VLC/ffplay. Control API (9997) не публикуется вовсе: им управляется
+      # запись, доступ к нему равен доступу к конфигурации всех камер.
       # Хост-порты настраиваемые (см. комментарий у postgres про Windows).
       - "127.0.0.1:${MEDIAMTX_RTSP_HOST_PORT:-8554}:8554"     # RTSP
       - "127.0.0.1:${MEDIAMTX_HLS_HOST_PORT:-8888}:8888"      # HLS
       - "127.0.0.1:${MEDIAMTX_WEBRTC_HOST_PORT:-8889}:8889"   # WebRTC
     volumes:
       - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
+      # SPEC §20: MediaMTX — единственный процесс, пишущий все камеры.
+      # Сегменты идут в тот же том, что читает архив backend'а и чистит
+      # ротация воркера.
+      - media:/media
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:9997/v3/config/global/get >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          # SPEC §23: бюджет слоя записи — 2-4 ядра на 120 камер remux'ом.
+          cpus: '4.0'
+          memory: 2G
 
   backend:
     build: ./backend
@@ -121,12 +139,20 @@ services:
     depends_on:
       backend:
         condition: service_started
+      # Воркер заводит пути записи через Control API MediaMTX сразу в первом
+      # же цикле менеджера: без готового API первая синхронизация просто
+      # логировала бы ошибку и ждала следующего тика.
+      mediamtx:
+        condition: service_started
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-facewatch}:${POSTGRES_PASSWORD:-facewatch}@postgres:5432/${POSTGRES_DB:-facewatch}
       REDIS_URL: redis://redis:6379/0
       RTSP_ENCRYPTION_KEY: ${RTSP_ENCRYPTION_KEY:-ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ=}
       MEDIA_PATH: /media
-      RETENTION_DAYS: ${RETENTION_DAYS:-30}
+      RETENTION_DAYS: ${RETENTION_DAYS:-14}
+      # Control API MediaMTX: воркер синхронизирует по нему пути слоя записи
+      # (SPEC §20). Порт наружу не публикуется — только внутренняя сеть.
+      MEDIAMTX_API_URL: http://mediamtx:9997
     volumes:
       - media:/media
     healthcheck:
@@ -138,9 +164,10 @@ services:
       start_period: 300s
     restart: unless-stopped
     # По умолчанию Docker ждёт SIGTERM только 10с и досылает SIGKILL —
-    # graceful shutdown (закрытие VideoCapture/VideoWriter, остановка
-    # ffmpeg-репабликации по каждой камере) может не уложиться. Воркер сам
-    # ограничивает суммарное ожидание нитей 8с, здесь оставляем запас.
+    # graceful shutdown (закрытие VideoCapture по каждой камере) может не
+    # уложиться. Воркер сам ограничивает суммарное ожидание нитей 8с, здесь
+    # оставляем запас. Записи это больше не касается: её ведёт MediaMTX,
+    # рестарт воркера архива не прерывает (SPEC §2).
     stop_grace_period: 20s
     deploy:
       resources:
