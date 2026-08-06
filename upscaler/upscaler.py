@@ -54,7 +54,18 @@ def handle_shutdown_signal(signum, _frame):
 # что при каждом всплеске ошибок и переоткрытий пул мог держать до 15
 # бэкендов Postgres под сервис, которому хватает одного; на целевом железе
 # (N100, `max_connections` по умолчанию) это отнимало слоты у backend'а.
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=2, max_overflow=1)
+def make_engine(url: str):
+    """Движок с рабочими настройками пула.
+
+    Отдельной функцией, чтобы тесты поднимали соединение к своей БД ровно с
+    теми же параметрами пула, что и сервис в проде, — иначе проверка
+    компактности пула (`test_service_lifecycle.py`) измеряла бы не то, что
+    работает в бою.
+    """
+    return create_engine(url, pool_pre_ping=True, pool_size=2, max_overflow=1)
+
+
+engine = make_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
 Base = declarative_base()
 r = redis.from_url(REDIS_URL, decode_responses=True)
