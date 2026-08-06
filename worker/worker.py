@@ -585,20 +585,42 @@ def onvif_motion_recent(cam_id: int) -> bool:
     return (time.time() - last) < ONVIF_MOTION_FRESH_SEC
 
 
-def onvif_poll_worker(cam_id: int, host: str, port: int, username: str | None, password: str | None):
+def onvif_poll_worker(cam_id: int, host: str, port: int, username: str | None, password: str | None,
+                      stop_event: threading.Event | None = None):
     """Фоновая нить на камеру с onvif_enabled: держит PullPoint-подписку и
     складывает события движения в ONVIF_LAST_MOTION/ONVIF_LAST_HEALTHY.
-    Никогда не поднимает исключение наружу — рассчитана на постоянный
-    daemon-запуск на весь срок жизни камеры, ошибки только логируются и
+    Никогда не поднимает исключение наружу — ошибки только логируются и
     ведут к переподписке с экспоненциальной задержкой (тот же backoff, что
-    и у RTSP-реконнекта)."""
+    и у RTSP-реконнекта).
+
+    `stop_event` — персональный сигнал остановки от породившего
+    `camera_worker()`; нить живёт ровно столько же, сколько он. Глобального
+    `shutdown_event` для этого недостаточно: `camera_worker()` завершается и
+    поодиночке (камеру выключили/удалили в админке, необработанное
+    исключение в цикле кадров), и без личного сигнала такая нить оставалась
+    бы висеть с PullPoint-подпиской и сокетом до остановки всего процесса,
+    а manager() через ~10 с поднимал бы рядом ещё одну (цикл 23; тот же
+    класс утечки, что закрыт циклом 16 для случая «RTSP не открывается»).
+    """
     attempt = 0
-    while not shutdown_event.is_set():
+
+    def _stopping(timeout: float = 0.0) -> bool:
+        """Ждёт `timeout` и говорит, пора ли останавливаться.
+
+        Ждём именно на личном событии — оно ставится и при глобальном
+        shutdown (см. camera_worker), поэтому реакция на общую остановку не
+        замедляется.
+        """
+        if stop_event is not None:
+            return stop_event.wait(timeout) or shutdown_event.is_set()
+        return shutdown_event.wait(timeout)
+
+    while not _stopping():
         try:
             subscription_url = onvif_client.create_pull_point_subscription(host, port, username, password)
             logger.info("ONVIF-подписка создана", extra={"camera_id": cam_id, "onvif_host": host})
             attempt = 0
-            while not shutdown_event.is_set():
+            while not _stopping():
                 try:
                     events = onvif_client.pull_messages(subscription_url, username, password)
                 except onvif_client.OnvifError:
@@ -608,7 +630,7 @@ def onvif_poll_worker(cam_id: int, host: str, port: int, username: str | None, p
                 for ev in events:
                     if onvif_client.is_motion_event(ev.get("topic"), ev.get("state")):
                         ONVIF_LAST_MOTION[cam_id] = time.time()
-                if shutdown_event.wait(0.5):
+                if _stopping(0.5):
                     return
         except onvif_client.OnvifError:
             delay = reconnect_delay(attempt)
@@ -617,14 +639,14 @@ def onvif_poll_worker(cam_id: int, host: str, port: int, username: str | None, p
                 exc_info=True, extra={"camera_id": cam_id, "retry_in_sec": round(delay, 1)},
             )
             attempt += 1
-            if shutdown_event.wait(delay):
+            if _stopping(delay):
                 return
         except Exception:
             # Не даём непредвиденной ошибке ONVIF уронить всю нить — это
             # вспомогательный источник детекции, MOG2-фолбэк в camera_worker
             # продолжает работать независимо от состояния этой нити.
             logger.error("непредвиденная ошибка ONVIF-нити", exc_info=True, extra={"camera_id": cam_id})
-            if shutdown_event.wait(reconnect_delay(attempt)):
+            if _stopping(reconnect_delay(attempt)):
                 return
             attempt += 1
 
@@ -684,227 +706,261 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
     # равно потребляются только внутри цикла кадров ниже (onvif_healthy()/
     # onvif_motion_recent()), который не выполняется без открытого cap —
     # переносить старт нити раньше этой точки не давало никакой пользы.
+    # Персональный сигнал остановки ONVIF-нити: ставится в finally ниже, на
+    # любом выходе из camera_worker() — штатном, по отключению камеры и по
+    # необработанному исключению (цикл 23).
+    onvif_stop = threading.Event()
     if onvif_config and onvif_config.get("host"):
         threading.Thread(
             target=onvif_poll_worker,
             args=(cam_id, onvif_config["host"], onvif_config.get("port") or 80,
-                  onvif_config.get("username"), onvif_config.get("password")),
+                  onvif_config.get("username"), onvif_config.get("password"), onvif_stop),
             daemon=True,
         ).start()
 
-    bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=False)
-    last_proc = 0.0
-    last_latest_save = 0.0
-    last_state_reload = 0.0
-    roi, active, motion_sens = load_cam_state(cam_id)
-    roi_mask = None
-    roi_mask_shape = None
-    frame_counter = 0            # для пропуска кадров (ТЗ 18.3)
-    fps_window_start = time.time()
-    fps_frames = 0
-
+    # `writer` объявлен до try: на него смотрит finally, а исключение может
+    # прилететь и из инициализации ниже (тот же load_cam_state()).
     writer = None
-    seg_path = None
-    seg_tmp = None
-    seg_started = None
-    seg_had_face = False   # было ли лицо хоть в одном кадре сегмента
-    last_event_at: dict[int, float] = {}  # person_id -> время последнего события (тротлинг)
-    last_motion = 0.0
-    # В сегмент пишутся ВСЕ кадры потока, поэтому fps контейнера должен
-    # совпадать с fps камеры — иначе видео играет с неверной скоростью
-    # (с жёстким fps=10 запись с 25-fps камеры шла в 2.5 раза медленнее).
-    cam_fps = cap.get(cv2.CAP_PROP_FPS)
-    fps_out = cam_fps if (cam_fps and 1.0 <= cam_fps <= 60.0) else 25.0
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    try:
+        bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=False)
+        last_proc = 0.0
+        last_latest_save = 0.0
+        last_state_reload = 0.0
+        roi, active, motion_sens = load_cam_state(cam_id)
+        roi_mask = None
+        roi_mask_shape = None
+        frame_counter = 0            # для пропуска кадров (ТЗ 18.3)
+        fps_window_start = time.time()
+        fps_frames = 0
 
-    def close_segment(reason_ended):
-        nonlocal writer, seg_path, seg_tmp, seg_started, seg_had_face
-        writer.release()
-        etype = "face" if seg_had_face else "motion"
-        threading.Thread(
-            target=finalize_segment,
-            args=(cam_id, seg_tmp, seg_path, seg_started, reason_ended, etype),
-            daemon=True,
-        ).start()
-        writer = None
         seg_path = None
         seg_tmp = None
         seg_started = None
-        seg_had_face = False
+        seg_had_face = False   # было ли лицо хоть в одном кадре сегмента
+        last_event_at: dict[int, float] = {}  # person_id -> время последнего события (тротлинг)
+        last_motion = 0.0
+        # В сегмент пишутся ВСЕ кадры потока, поэтому fps контейнера должен
+        # совпадать с fps камеры — иначе видео играет с неверной скоростью
+        # (с жёстким fps=10 запись с 25-fps камеры шла в 2.5 раза медленнее).
+        cam_fps = cap.get(cv2.CAP_PROP_FPS)
+        fps_out = cam_fps if (cam_fps and 1.0 <= cam_fps <= 60.0) else 25.0
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
-    reconnect_attempt = 0
-    while True:
-        if shutdown_event.is_set():
-            logger.info("остановка (shutdown), освобождаю ресурсы", extra={"camera_id": cam_id})
-            if writer:
-                close_segment(datetime.utcnow())
-            cap.release()
-            if republish:
-                republish.terminate()
-            update_status(cam_id, "offline")
-            return
+        def close_segment(reason_ended):
+            nonlocal writer, seg_path, seg_tmp, seg_started, seg_had_face
+            writer.release()
+            etype = "face" if seg_had_face else "motion"
+            threading.Thread(
+                target=finalize_segment,
+                args=(cam_id, seg_tmp, seg_path, seg_started, reason_ended, etype),
+                daemon=True,
+            ).start()
+            writer = None
+            seg_path = None
+            seg_tmp = None
+            seg_started = None
+            seg_had_face = False
 
-        ok, frame = cap.read()
-        if not ok:
-            update_status(cam_id, "offline")
-            delay = reconnect_delay(reconnect_attempt)
-            logger.warning(
-                "поток потерян, повтор подключения",
-                extra={"camera_id": cam_id, "retry_in_sec": round(delay, 1), "attempt": reconnect_attempt + 1},
-            )
-            # Прерываемое ожидание — при shutdown не держим камеру в сне
-            # до 60с, а сразу уходим на освобождение ресурсов сверху цикла.
-            if shutdown_event.wait(delay):
-                continue
-            reconnect_attempt += 1
-            cap.release()
-            # Переоткрываем именно поток аналитики (субпоток, если задан) —
-            # раньше здесь по ошибке использовался основной поток, из-за чего
-            # детекция после первого разрыва связи молча переезжала на
-            # основной поток в обход двухпоточной схемы (ТЗ 18.1).
-            cap = open_capture(analyze_url)
-            if cap.isOpened():
-                update_status(cam_id, "online")
-            continue
-        if reconnect_attempt:
-            reconnect_attempt = 0
-
-        now = time.time()
-        # Авто-перезапуск ffmpeg-репабликации, если он умер — с тем же
-        # экспоненциальным бэкоффом, что и у RTSP-реконнекта, иначе
-        # недоступный основной поток означает попытку перезапуска ffmpeg на
-        # каждой итерации цикла кадров (fork/connect-storm, см. докстринг
-        # инициализации republish_attempt выше).
-        if republish and republish.poll() is not None:
-            if now >= republish_retry_at:
-                delay = reconnect_delay(republish_attempt)
-                logger.warning(
-                    "ffmpeg-репабликация упала, перезапускаю",
-                    extra={"camera_id": cam_id, "retry_in_sec": round(delay, 1), "attempt": republish_attempt + 1},
-                )
-                republish = start_republish(cam_id, rtsp_url)
-                republish_started_at = now
-                republish_attempt += 1
-                republish_retry_at = now + delay
-        elif republish and republish_attempt and (now - republish_started_at) > REPUBLISH_STABLE_SEC:
-            # Продержался достаточно долго живым — считаем восстановленным,
-            # следующий сбой снова начнёт бэкофф с базовой задержки.
-            republish_attempt = 0
-
-        # Адаптивная частота (ТЗ 18.3): при длительном покое опускаемся до idle_fps,
-        # при первом же движении мгновенно возвращаемся к полной частоте.
-        idle = (now - last_motion) > IDLE_AFTER_SEC
-        target_fps = CONFIG["idle_fps"] if idle else CONFIG["detection_fps"]
-        interval = 1.0 / max(1, target_fps)
-        if now - last_proc < interval:
-            if writer:
-                writer.write(frame)
-            continue
-        last_proc = now
-
-        # Пропуск кадров: анализируем каждый (frame_skip+1)-й отобранный кадр
-        frame_counter += 1
-        skip = int(CONFIG["frame_skip"])
-        if skip and (frame_counter % (skip + 1)) != 0:
-            if writer:
-                writer.write(frame)
-            continue
-
-        # Фактический FPS детекции по камере → в Redis для мониторинга
-        fps_frames += 1
-        if now - fps_window_start >= 10.0:
-            try:
-                r.hset("worker:fps", str(cam_id), round(fps_frames / (now - fps_window_start), 2))
-            except Exception:
-                pass
-            fps_window_start = now
-            fps_frames = 0
-
-        if now - last_latest_save > 2.0:
-            save_latest_frame(frame, cam_id)
-            last_latest_save = now
-
-        if now - last_state_reload > 10.0:
-            roi, active, motion_sens = load_cam_state(cam_id)
-            roi_mask = None
-            last_state_reload = now
-            if not active:
-                # Камера отключена или удалена — корректно останавливаем поток
-                logger.info("камера отключена, останавливаю обработку", extra={"camera_id": cam_id})
-                if writer:
-                    close_segment(datetime.utcnow())
-                cap.release()
-                if republish:
-                    republish.terminate()
-                update_status(cam_id, "disabled")
+        reconnect_attempt = 0
+        # Освобождение ресурсов вынесено в finally ниже. Раньше оно стояло в
+        # каждой из точек выхода по отдельности, и любое необработанное
+        # исключение в цикле кадров уносило нить мимо них: RTSP-захват OpenCV
+        # оставался открытым, а ffmpeg-репабликация — осиротевшим процессом
+        # (Popen не убивается сборщиком мусора). manager() поднимал камеру
+        # заново через ~10 с, поэтому утечка накапливалась по одному захвату и
+        # одному ffmpeg на каждый сбой. Самый вероятный источник таких
+        # исключений — не распознавание (оно и так под try), а обращения к БД
+        # в цикле: load_cam_state() ходит в Postgres каждые 10 с, и обычная для
+        # 24/7 перезагрузка БД роняла бы все 16 нитей разом (цикл 23).
+        while True:
+            if shutdown_event.is_set():
+                logger.info("остановка (shutdown), освобождаю ресурсы", extra={"camera_id": cam_id})
+                update_status(cam_id, "offline")
                 return
 
-        if roi_mask is None or roi_mask_shape != frame.shape[:2]:
-            roi_mask = build_roi_mask(roi, frame.shape)
-            roi_mask_shape = frame.shape[:2]
+            ok, frame = cap.read()
+            if not ok:
+                update_status(cam_id, "offline")
+                delay = reconnect_delay(reconnect_attempt)
+                logger.warning(
+                    "поток потерян, повтор подключения",
+                    extra={"camera_id": cam_id, "retry_in_sec": round(delay, 1), "attempt": reconnect_attempt + 1},
+                )
+                # Прерываемое ожидание — при shutdown не держим камеру в сне
+                # до 60с, а сразу уходим на освобождение ресурсов сверху цикла.
+                if shutdown_event.wait(delay):
+                    continue
+                reconnect_attempt += 1
+                cap.release()
+                # Переоткрываем именно поток аналитики (субпоток, если задан) —
+                # раньше здесь по ошибке использовался основной поток, из-за чего
+                # детекция после первого разрыва связи молча переезжала на
+                # основной поток в обход двухпоточной схемы (ТЗ 18.1).
+                cap = open_capture(analyze_url)
+                if cap.isOpened():
+                    update_status(cam_id, "online")
+                continue
+            if reconnect_attempt:
+                reconnect_attempt = 0
 
-        # ТЗ 18.7: пока ONVIF-подписка камеры здорова (недавний успешный
-        # pull), движение берётся из событий камеры — MOG2 целиком
-        # пропускается ради экономии CPU ("камера делает предобработку на
-        # своём чипе"). При проблемах с ONVIF (сеть, отвал подписки)
-        # onvif_healthy() перестаёт быть True без дополнительной логики
-        # здесь, и следующий же кадр прозрачно возвращается на обычный
-        # MOG2-префильтр — детекция не останавливается.
-        if onvif_config and onvif_healthy(cam_id):
-            motion = onvif_motion_recent(cam_id)
-        else:
-            small = cv2.resize(frame, (640, 360))
-            fg = bg.apply(small)
-            if roi_mask is not None:
-                small_mask = cv2.resize(roi_mask, (640, 360), interpolation=cv2.INTER_NEAREST)
-                fg = cv2.bitwise_and(fg, fg, mask=small_mask)
-            motion_pixels = int(np.count_nonzero(fg))
-            # Чувствительность камеры переопределяет общий порог профиля
-            threshold = motion_sens if motion_sens else CONFIG["motion_threshold"]
-            motion = motion_pixels > threshold
+            now = time.time()
+            # Авто-перезапуск ffmpeg-репабликации, если он умер — с тем же
+            # экспоненциальным бэкоффом, что и у RTSP-реконнекта, иначе
+            # недоступный основной поток означает попытку перезапуска ffmpeg на
+            # каждой итерации цикла кадров (fork/connect-storm, см. докстринг
+            # инициализации republish_attempt выше).
+            if republish and republish.poll() is not None:
+                if now >= republish_retry_at:
+                    delay = reconnect_delay(republish_attempt)
+                    logger.warning(
+                        "ffmpeg-репабликация упала, перезапускаю",
+                        extra={"camera_id": cam_id, "retry_in_sec": round(delay, 1), "attempt": republish_attempt + 1},
+                    )
+                    republish = start_republish(cam_id, rtsp_url)
+                    republish_started_at = now
+                    republish_attempt += 1
+                    republish_retry_at = now + delay
+            elif republish and republish_attempt and (now - republish_started_at) > REPUBLISH_STABLE_SEC:
+                # Продержался достаточно долго живым — считаем восстановленным,
+                # следующий сбой снова начнёт бэкофф с базовой задержки.
+                republish_attempt = 0
 
-        # Префильтр движения (ТЗ 18.4): в «максимальном» профиле отключается
-        # и детектор лиц работает по каждому кадру.
-        run_detector = motion or not CONFIG["motion_prefilter"]
-        faces = []
-        try:
-            if run_detector:
-                # Читаем глобальную модель, чтобы подхватить её горячую замену
-                detected = (FACE_APP or face_app).get(frame)
-                faces = [f for f in detected if bbox_in_roi(f.bbox.tolist(), roi_mask)]
-        except Exception:
-            logger.error("ошибка распознавания", exc_info=True, extra={"camera_id": cam_id})
+            # Адаптивная частота (ТЗ 18.3): при длительном покое опускаемся до idle_fps,
+            # при первом же движении мгновенно возвращаемся к полной частоте.
+            idle = (now - last_motion) > IDLE_AFTER_SEC
+            target_fps = CONFIG["idle_fps"] if idle else CONFIG["detection_fps"]
+            interval = 1.0 / max(1, target_fps)
+            if now - last_proc < interval:
+                if writer:
+                    writer.write(frame)
+                continue
+            last_proc = now
+
+            # Пропуск кадров: анализируем каждый (frame_skip+1)-й отобранный кадр
+            frame_counter += 1
+            skip = int(CONFIG["frame_skip"])
+            if skip and (frame_counter % (skip + 1)) != 0:
+                if writer:
+                    writer.write(frame)
+                continue
+
+            # Фактический FPS детекции по камере → в Redis для мониторинга
+            fps_frames += 1
+            if now - fps_window_start >= 10.0:
+                try:
+                    r.hset("worker:fps", str(cam_id), round(fps_frames / (now - fps_window_start), 2))
+                except Exception:
+                    pass
+                fps_window_start = now
+                fps_frames = 0
+
+            if now - last_latest_save > 2.0:
+                save_latest_frame(frame, cam_id)
+                last_latest_save = now
+
+            if now - last_state_reload > 10.0:
+                roi, active, motion_sens = load_cam_state(cam_id)
+                roi_mask = None
+                last_state_reload = now
+                if not active:
+                    # Камера отключена или удалена — корректно останавливаем
+                    # поток. Ресурсы (захват, ffmpeg, ONVIF-нить) освобождает
+                    # общий finally ниже; раньше этот путь глушил захват и
+                    # ffmpeg, но оставлял ONVIF-нить висеть с подпиской, и
+                    # повторное включение камеры добавляло рядом ещё одну.
+                    logger.info("камера отключена, останавливаю обработку", extra={"camera_id": cam_id})
+                    update_status(cam_id, "disabled")
+                    return
+
+            if roi_mask is None or roi_mask_shape != frame.shape[:2]:
+                roi_mask = build_roi_mask(roi, frame.shape)
+                roi_mask_shape = frame.shape[:2]
+
+            # ТЗ 18.7: пока ONVIF-подписка камеры здорова (недавний успешный
+            # pull), движение берётся из событий камеры — MOG2 целиком
+            # пропускается ради экономии CPU ("камера делает предобработку на
+            # своём чипе"). При проблемах с ONVIF (сеть, отвал подписки)
+            # onvif_healthy() перестаёт быть True без дополнительной логики
+            # здесь, и следующий же кадр прозрачно возвращается на обычный
+            # MOG2-префильтр — детекция не останавливается.
+            if onvif_config and onvif_healthy(cam_id):
+                motion = onvif_motion_recent(cam_id)
+            else:
+                small = cv2.resize(frame, (640, 360))
+                fg = bg.apply(small)
+                if roi_mask is not None:
+                    small_mask = cv2.resize(roi_mask, (640, 360), interpolation=cv2.INTER_NEAREST)
+                    fg = cv2.bitwise_and(fg, fg, mask=small_mask)
+                motion_pixels = int(np.count_nonzero(fg))
+                # Чувствительность камеры переопределяет общий порог профиля
+                threshold = motion_sens if motion_sens else CONFIG["motion_threshold"]
+                motion = motion_pixels > threshold
+
+            # Префильтр движения (ТЗ 18.4): в «максимальном» профиле отключается
+            # и детектор лиц работает по каждому кадру.
+            run_detector = motion or not CONFIG["motion_prefilter"]
             faces = []
+            try:
+                if run_detector:
+                    # Читаем глобальную модель, чтобы подхватить её горячую замену
+                    detected = (FACE_APP or face_app).get(frame)
+                    faces = [f for f in detected if bbox_in_roi(f.bbox.tolist(), roi_mask)]
+            except Exception:
+                logger.error("ошибка распознавания", exc_info=True, extra={"camera_id": cam_id})
+                faces = []
 
-        if motion or faces:
-            last_motion = now
-            if writer is None:
-                seg_started = datetime.utcnow()
-                fname = f"cam{cam_id}_{int(time.time())}.mp4"
-                seg_path = os.path.join(MEDIA_PATH, "segments", fname)
-                seg_tmp = seg_path.replace(".mp4", "_tmp.mp4")
-                seg_had_face = False
-                h, w = frame.shape[:2]
-                writer = cv2.VideoWriter(seg_tmp, fourcc, fps_out, (w, h))
-            if faces:
-                seg_had_face = True
-            writer.write(frame)
+            if motion or faces:
+                last_motion = now
+                if writer is None:
+                    seg_started = datetime.utcnow()
+                    fname = f"cam{cam_id}_{int(time.time())}.mp4"
+                    seg_path = os.path.join(MEDIA_PATH, "segments", fname)
+                    seg_tmp = seg_path.replace(".mp4", "_tmp.mp4")
+                    seg_had_face = False
+                    h, w = frame.shape[:2]
+                    writer = cv2.VideoWriter(seg_tmp, fourcc, fps_out, (w, h))
+                if faces:
+                    seg_had_face = True
+                writer.write(frame)
 
-        if writer and (
-            (now - last_motion > 5)
-            or (seg_started and (datetime.utcnow() - seg_started).total_seconds() > SEGMENT_MAX_SEC)
-        ):
-            close_segment(datetime.utcnow())
+            if writer and (
+                (now - last_motion > 5)
+                or (seg_started and (datetime.utcnow() - seg_started).total_seconds() > SEGMENT_MAX_SEC)
+            ):
+                close_segment(datetime.utcnow())
 
-        if not faces:
-            continue
+            if not faces:
+                continue
 
-        fh, fw = frame.shape[:2]
-        try:
-            process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url)
-        except Exception:
-            # Любой сбой на одном кадре не должен убивать нить камеры
-            logger.error("ошибка обработки лиц", exc_info=True, extra={"camera_id": cam_id})
+            fh, fw = frame.shape[:2]
+            try:
+                process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url)
+            except Exception:
+                # Любой сбой на одном кадре не должен убивать нить камеры
+                logger.error("ошибка обработки лиц", exc_info=True, extra={"camera_id": cam_id})
+    except Exception:
+        # Нить камеры умирает — но в JSON-логе, а не молчаливым стектрейсом
+        # threading.excepthook'а в stderr мимо ротации и структурированного
+        # вывода (ТЗ 12). manager() поднимет камеру заново через ~10 с;
+        # ресурсы к этому моменту уже освобождены блоком finally ниже.
+        logger.error("нить камеры аварийно завершилась", exc_info=True,
+                     extra={"camera_id": cam_id})
+        update_status(cam_id, "offline")
+    finally:
+        # Порядок важен: сначала снимаем ONVIF-нить (она держит сокет и
+        # подписку на камере), затем закрываем незавершённый сегмент, чтобы
+        # запись не пропала, и только потом отпускаем захват и ffmpeg.
+        onvif_stop.set()
+        if writer:
+            try:
+                close_segment(datetime.utcnow())
+            except Exception:
+                logger.error("не удалось закрыть сегмент при остановке", exc_info=True,
+                             extra={"camera_id": cam_id})
+        cap.release()
+        if republish:
+            republish.terminate()
+
 
 
 class _PendingEvent:
