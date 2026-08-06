@@ -32,6 +32,18 @@ function HealthBadge() {
   return <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}><span className={`dot ${dot}`} />{text}</div>;
 }
 
+/** Раздел меню. Не рисуется, если роль не даёт ни одного пункта внутри. */
+function NavGroup({ title, children }: { title: string; children: any }) {
+  const visible = (Array.isArray(children) ? children : [children]).filter(Boolean);
+  if (!visible.length) return null;
+  return (
+    <div className="nav-group">
+      <div className="nav-group-title">{title}</div>
+      {visible}
+    </div>
+  );
+}
+
 function Layout({ children }: { children: any }) {
   const nav = useNavigate();
   const role = getRole();
@@ -46,22 +58,37 @@ function Layout({ children }: { children: any }) {
     <div className="layout">
       <aside className="sidebar">
         <h1>FaceWatch</h1>
-        <nav className="nav">
-          <NavLink to="/dashboard">Дашборд</NavLink>
-          <NavLink to="/live">Камеры онлайн</NavLink>
-          <NavLink to="/wall">Стена распознавания</NavLink>
-          {can("admin", "operator") && <NavLink to="/persons">Карточки персон</NavLink>}
-          {can("admin", "operator") && <NavLink to="/search">Поиск по фото</NavLink>}
-          {can("admin", "operator") && <NavLink to="/archive">Архив</NavLink>}
-          {can("admin", "operator") && <NavLink to="/roi">Зоны детекции</NavLink>}
-          {can("admin", "operator") && <NavLink to="/reports">Отчёты</NavLink>}
-          {can("admin") && <NavLink to="/cameras">Управление камерами</NavLink>}
-          {can("admin") && <NavLink to="/users">Пользователи</NavLink>}
-          {can("admin", "operator") && <NavLink to="/monitoring">Мониторинг</NavLink>}
-          {can("admin") && <NavLink to="/settings">Настройки</NavLink>}
-          {can("admin") && <NavLink to="/audit">Журнал действий</NavLink>}
-        </nav>
-        <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
+        {/* Пункты сгруппированы по задачам, а не свалены одним списком из
+            тринадцати ссылок: раздел ищут взглядом за один проход, а не
+            перебором всего меню. Пустые группы (роль не даёт ни одного
+            пункта) не рисуются — заголовок без содержимого хуже, чем его
+            отсутствие. */}
+        <div className="nav-scroll">
+          <nav className="nav">
+            <NavGroup title="Наблюдение">
+              <NavLink to="/dashboard">Дашборд</NavLink>
+              <NavLink to="/live">Камеры онлайн</NavLink>
+              <NavLink to="/wall">Стена распознавания</NavLink>
+            </NavGroup>
+            <NavGroup title="Распознавание">
+              {can("admin", "operator") && <NavLink to="/persons">Карточки персон</NavLink>}
+              {can("admin", "operator") && <NavLink to="/search">Поиск по фото</NavLink>}
+              {can("admin", "operator") && <NavLink to="/roi">Зоны детекции</NavLink>}
+            </NavGroup>
+            <NavGroup title="Архив и отчёты">
+              {can("admin", "operator") && <NavLink to="/archive">Видеоархив</NavLink>}
+              {can("admin", "operator") && <NavLink to="/reports">Отчёты</NavLink>}
+            </NavGroup>
+            <NavGroup title="Администрирование">
+              {can("admin") && <NavLink to="/cameras">Камеры</NavLink>}
+              {can("admin", "operator") && <NavLink to="/monitoring">Мониторинг</NavLink>}
+              {can("admin") && <NavLink to="/settings">Настройки</NavLink>}
+              {can("admin") && <NavLink to="/users">Пользователи</NavLink>}
+              {can("admin") && <NavLink to="/audit">Журнал действий</NavLink>}
+            </NavGroup>
+          </nav>
+        </div>
+        <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
           <HealthBadge />
           <NavLink to="/profile" style={{ display: "block", fontSize: 12, marginBottom: 8 }}>
             {user} · {role}
