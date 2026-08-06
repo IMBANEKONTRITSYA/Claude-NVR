@@ -1,16 +1,26 @@
-"""Системный мониторинг (ТЗ 12): метрики хоста, состояние сервисов, Prometheus."""
+"""Системный мониторинг (SPEC §14): метрики хоста, состояние сервисов,
+хранилище архива (§21), Prometheus."""
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import psutil
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
-from ..db import SessionLocal
-from ..models import Camera, FaceEvent, VideoSegment
+from ..db import SessionLocal, get_db
+from ..models import Camera, FaceEvent, Setting, VideoSegment
 from ..auth import require_role, require_role_query
 from ..services.pubsub import get_redis
+from ..services.storage import (BYTES_PER_GB, DISK_CRIT_PCT, DISK_WARN_PCT,
+                                calibration, days_left, disk_alert_level,
+                                nominal_gb_per_day, required_gb)
+
+# SPEC §1: «Основной поток: H.265, 1280×720 @ 15 fps, 2048 kbps» — базовая
+# фактическая конфигурация камер объекта. Номинальный расход считается от
+# неё; см. пояснение в storage_report(), почему это константа, а не настройка.
+MAIN_STREAM_KBPS = 2048
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -128,3 +138,124 @@ async def prometheus_metrics(_=Depends(require_role_query("admin"))):
     for cam_id, value in m["camera_fps"].items():
         lines.append(f'facewatch_camera_fps{{camera="{cam_id}"}} {value}')
     return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+
+
+async def _setting_int(db: AsyncSession, key: str, default: int) -> int:
+    row = await db.get(Setting, key)
+    try:
+        return int(row.value) if row else default
+    except (TypeError, ValueError):
+        return default
+
+
+@router.get("/storage")
+async def storage_report(_=Depends(require_role("admin", "operator")),
+                         db: AsyncSession = Depends(get_db)):
+    """Состояние хранилища архива: заполнение, расход, прогноз (SPEC §5, §21).
+
+    Прогноз считается по **фактическому** расходу за последние сутки, а не
+    по номиналу `Mbps × 10.8`: SPEC §21 сам называет номинал завышенным
+    («с учётом VBR/smart-кодек фактически ~1.6–2 ТБ/сутки» против 2.6 ТБ
+    номинала), и прогноз по нему занижал бы срок хранения примерно в
+    полтора раза. Номинал остаётся в ответе рядом — как раз для калибровки,
+    которую требует §21.
+
+    Пока фактических данных нет (первые сутки после развёртывания, все
+    сегменты со `size_bytes` = 0 от старых строк), прогноз падает обратно
+    на номинал по числу включённых камер: показать прочерк администратору,
+    который только что развернул систему и хочет знать, хватит ли диска, —
+    хуже, чем показать расчётную оценку с явной пометкой источника.
+    """
+    try:
+        du = shutil.disk_usage(settings.MEDIA_PATH)
+        total, used, free = du.total, du.used, du.free
+    except OSError:
+        total = used = free = 0
+
+    day_ago = datetime.utcnow() - timedelta(days=1)
+    cams = (await db.execute(select(Camera))).scalars().all()
+    enabled = [c for c in cams if c.enabled]
+
+    # int() обязателен: SUM() по bigint Postgres возвращает numeric, драйвер
+    # отдаёт его как decimal.Decimal, и любое деление на float (прогноз,
+    # перевод в ГБ) падает с TypeError. Отдельная строка, а не приведение по
+    # месту, — деление тут ниже в четырёх местах.
+    measured_bytes = int((await db.execute(
+        select(func.coalesce(func.sum(VideoSegment.size_bytes), 0))
+        .where(VideoSegment.started_at >= day_ago)
+    )).scalar() or 0)
+    archive_bytes = int((await db.execute(
+        select(func.coalesce(func.sum(VideoSegment.size_bytes), 0))
+    )).scalar() or 0)
+    segments_day = (await db.execute(
+        select(func.count(VideoSegment.id)).where(VideoSegment.started_at >= day_ago)
+    )).scalar() or 0
+
+    # Номинал считается по фактическому битрейту основного потока из SPEC §1
+    # (2048 kbps). Это не настройка: слой записи ведёт remux потока как есть
+    # (§24 запрещает перекодирование), поэтому битрейт задаёт камера, а не
+    # система, и «настроить» его здесь было бы враньём.
+    nominal_per_day_gb = nominal_gb_per_day(MAIN_STREAM_KBPS, len(enabled))
+    measured_per_day_gb = measured_bytes / BYTES_PER_GB
+
+    source = "measured" if measured_bytes > 0 else "nominal"
+    per_day_bytes = measured_bytes if measured_bytes > 0 else nominal_per_day_gb * BYTES_PER_GB
+    left = days_left(free, per_day_bytes)
+
+    warn = await _setting_int(db, "disk_warn_pct", int(DISK_WARN_PCT))
+    crit = await _setting_int(db, "disk_crit_pct", int(DISK_CRIT_PCT))
+    used_pct = round(used * 100.0 / total, 1) if total else 0.0
+    global_retention = await _setting_int(db, "retention_days", 14)
+
+    return {
+        "disk_total_gb": round(total / BYTES_PER_GB, 1),
+        "disk_used_gb": round(used / BYTES_PER_GB, 1),
+        "disk_free_gb": round(free / BYTES_PER_GB, 1),
+        "disk_used_percent": used_pct,
+        "alert_level": disk_alert_level(used_pct, warn, crit),
+        "warn_percent": warn,
+        "crit_percent": crit,
+        "archive_gb": round(archive_bytes / BYTES_PER_GB, 1),
+        "segments_last_day": segments_day,
+        "measured_gb_per_day": round(measured_per_day_gb, 2),
+        "nominal_gb_per_day": round(nominal_per_day_gb, 2),
+        # Коэффициент калибровки (§21): >1 — расходуется быстрее расчёта.
+        "calibration": (lambda k: round(k, 3) if k is not None else None)(
+            calibration(measured_per_day_gb, nominal_per_day_gb)
+        ),
+        "forecast_source": source,
+        "days_left": round(left, 1) if left is not None else None,
+        "cameras_recording": len(enabled),
+        "retention_days": global_retention,
+        # Камеры с собственной глубиной хранения — чтобы администратор
+        # видел отклонения от глобальной настройки, не открывая каждую.
+        "per_camera_retention": {
+            str(c.id): c.retention_days for c in cams if c.retention_days
+        },
+    }
+
+
+@router.get("/storage/calculator")
+async def storage_calculator(
+    bitrate_kbps: int = Query(2048, ge=64, le=100_000),
+    cameras: int = Query(120, ge=1, le=1000),
+    days: int = Query(14, ge=1, le=3650),
+    _=Depends(require_role("admin")),
+):
+    """Калькулятор хранения SPEC §21: битрейт × камеры × дни → требуемый объём.
+
+    Отдельно от `/storage`: там — что происходит сейчас, здесь — «что если»,
+    и параметры приходят от администратора, а не из БД. Границы у всех трёх
+    numeric-параметров заданы явно (`Query(ge=, le=)`), иначе
+    `days=999999999` даёт переполнение в интерфейсе на пустом месте.
+    """
+    gb = required_gb(bitrate_kbps, cameras, days)
+    return {
+        "bitrate_kbps": bitrate_kbps,
+        "cameras": cameras,
+        "days": days,
+        "gb_per_day_per_camera": round(nominal_gb_per_day(bitrate_kbps), 2),
+        "gb_per_day_total": round(nominal_gb_per_day(bitrate_kbps, cameras), 1),
+        "required_gb": round(gb, 1),
+        "required_tb": round(gb / 1024, 2),
+    }

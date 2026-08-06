@@ -26,7 +26,8 @@ import pytest
 
 sqlalchemy = pytest.importorskip("sqlalchemy", reason="нужен SQLAlchemy")
 
-from sqlalchemy import Column, DateTime, Integer, String, create_engine, select  # noqa: E402
+from sqlalchemy import (BigInteger, Column, DateTime, Integer, String,  # noqa: E402
+                        create_engine, select)
 from sqlalchemy.orm import declarative_base, sessionmaker  # noqa: E402
 
 from segment_index import CONTINUOUS, index_new_segments  # noqa: E402
@@ -43,6 +44,12 @@ class VideoSegment(Base):
     file_path = Column(String(500))
     event_type = Column(String(20))
     duration_sec = Column(Integer)
+    # SPEC §21: размер сегмента фиксируется при индексации — по нему
+    # считается фактический расход диска и выбираются жертвы циклической
+    # перезаписи. Колонка обязана быть и здесь: модель передаётся в
+    # index_new_segments() параметром, и её расхождение с моделью воркера —
+    # ровно тот класс ошибки, который этот тест должен ловить.
+    size_bytes = Column(BigInteger, default=0)
 
 
 @pytest.fixture()
@@ -121,6 +128,26 @@ def test_repeated_indexing_does_not_duplicate_rows(tmp_path, session_factory):
 
     assert (first, second) == (2, 0)
     assert len(_rows(session_factory)) == 2
+
+
+def test_segment_size_is_recorded_for_storage_forecast(tmp_path, session_factory):
+    """Размер файла доезжает в архив (SPEC §21).
+
+    Это единственный источник фактического расхода диска: прогноз «на
+    сколько дней хватит места» и выбор жертв циклической перезаписи
+    считаются по этой колонке. Ноль здесь означал бы, что прогноз молча
+    откатывается на номинал и никогда не калибруется.
+    """
+    d = tmp_path / "segments"
+    d.mkdir()
+    _write(d / "cam7_1000.mp4", size=1_048_576)
+
+    index_new_segments(
+        session_factory, VideoSegment, str(d),
+        now=time.time(), from_timestamp=datetime.utcfromtimestamp,
+    )
+
+    assert [r.size_bytes for r in _rows(session_factory)] == [1_048_576]
 
 
 def test_segment_being_written_is_not_indexed_yet(tmp_path, session_factory):

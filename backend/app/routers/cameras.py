@@ -26,6 +26,7 @@ def _camera_out(c: Camera) -> CameraOut:
         mode=c.mode or "record_only", status=c.status,
         has_substream=bool(c.sub_rtsp_url_enc), motion_sensitivity=c.motion_sensitivity,
         onvif_enabled=bool(c.onvif_enabled), has_onvif=bool(c.onvif_host),
+        retention_days=c.retention_days,
     )
 
 
@@ -85,6 +86,7 @@ async def add_camera(payload: CameraIn, _=Depends(require_role("admin")), db: As
         onvif_port=payload.onvif_port,
         onvif_username=payload.onvif_username or None,
         onvif_password_enc=encrypt(payload.onvif_password) if payload.onvif_password else None,
+        retention_days=payload.retention_days,
     )
     db.add(cam)
     await db.commit()
@@ -117,6 +119,12 @@ async def update_camera(cam_id: int, payload: CameraIn, _=Depends(require_role("
     # затирать уже сохранённый пароль при обычном редактировании других полей.
     if payload.onvif_password:
         cam.onvif_password_enc = encrypt(payload.onvif_password)
+    # В отличие от пароля и субпотока, пустое значение здесь значимо: это
+    # «убрать собственный срок, следовать за глобальным». Отличить его от
+    # «поле не прислано» на модели с дефолтом None нельзя, и трактовка
+    # выбрана в пользу той, что выражается формой, — иначе снять
+    # собственный срок было бы нечем.
+    cam.retention_days = payload.retention_days
     await db.commit()
     await db.refresh(cam)
     await get_redis().publish("cameras:changed", str(cam.id))

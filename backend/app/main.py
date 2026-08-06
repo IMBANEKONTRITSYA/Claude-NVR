@@ -73,6 +73,21 @@ async def apply_schema_migrations(conn):
         "UPDATE cameras SET mode = 'analytics' WHERE mode IS NULL",
         "ALTER TABLE cameras ALTER COLUMN mode SET DEFAULT 'record_only'",
         "ALTER TABLE cameras ALTER COLUMN mode SET NOT NULL",
+        # SPEC §5, §21: глубина хранения по камерам. NULL намеренно — «следовать
+        # за глобальным retention_days», см. комментарий в models.py. Поэтому
+        # здесь нет ни DEFAULT, ни UPDATE: обновление не должно ничего менять
+        # в поведении существующих камер.
+        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS retention_days integer",
+        # SPEC §21: фактический расход и выбор старейших сегментов под
+        # циклическую перезапись. Существующим строкам ставится 0 («размер
+        # неизвестен»), а не фактический размер файла: обход архива на 120
+        # камерах за 14 дней — сотни тысяч stat() на старте приложения.
+        # Индексация дописывает размер только новым сегментам, и расчёт
+        # расхода это переживает — он идёт по последним суткам.
+        "ALTER TABLE video_segments ADD COLUMN IF NOT EXISTS size_bytes bigint DEFAULT 0",
+        "UPDATE video_segments SET size_bytes = 0 WHERE size_bytes IS NULL",
+        "ALTER TABLE video_segments ALTER COLUMN size_bytes SET DEFAULT 0",
+        "ALTER TABLE video_segments ALTER COLUMN size_bytes SET NOT NULL",
     ):
         await conn.execute(text(stmt))
     # HNSW-индексы pgvector для быстрого поиска по эмбеддингам (≤5с на 100k лиц).

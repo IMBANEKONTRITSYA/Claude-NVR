@@ -7,6 +7,9 @@ const EMPTY_FORM = {
   // на выбранных камерах, а не на каждой добавленной.
   name: "", rtsp_url: "", sub_rtsp_url: "", location: "", enabled: true, mode: "record_only",
   onvif_enabled: false, onvif_host: "", onvif_port: 80, onvif_username: "", onvif_password: "",
+  // SPEC §5: собственная глубина хранения. Пустая строка — «следовать за
+  // глобальной настройкой»; в payload уходит null, а не 0 (см. submit).
+  retention_days: "",
 };
 
 export function Cameras() {
@@ -30,8 +33,15 @@ export function Cameras() {
 
   const submit = async () => {
     try {
-      if (editing) await api.camUpdate(editing, form);
-      else await api.camAdd(form);
+      // Пустое поле глубины хранения — это null («следовать за глобальной»),
+      // а не 0: бэкенд отвергает 0 (ge=1), и без приведения сохранение
+      // камеры без собственного срока падало бы с 422.
+      const payload = {
+        ...form,
+        retention_days: form.retention_days === "" ? null : Number(form.retention_days),
+      };
+      if (editing) await api.camUpdate(editing, payload);
+      else await api.camAdd(payload);
       setForm(EMPTY_FORM);
       setEditing(null);
       load();
@@ -134,6 +144,17 @@ export function Cameras() {
             Запись ведётся в обоих режимах. Аналитика заметно нагружает процессор,
             поэтому её включают на нескольких выбранных камерах — предел задаётся
             в «Настройках» (по умолчанию 2).
+          </div>
+        </div>
+        <div style={{ marginBottom: 10, maxWidth: 460 }}>
+          <label>Глубина хранения этой камеры, суток</label>
+          <input type="number" min={1} max={3650} value={form.retention_days}
+            placeholder="как в общих настройках"
+            onChange={e => setForm({ ...form, retention_days: e.target.value })} />
+          <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+            Пусто — камера следует за глобальной глубиной хранения из «Настроек»
+            и продолжит следовать за ней при её изменении. Значение здесь
+            переопределяет её только для этой камеры.
           </div>
         </div>
         <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginRight: 12 }}>
@@ -329,6 +350,7 @@ export function Cameras() {
                     setForm({
                       name: c.name, rtsp_url: "", sub_rtsp_url: "", location: c.location, enabled: c.enabled,
                       mode: c.mode || "record_only",
+                      retention_days: c.retention_days == null ? "" : String(c.retention_days),
                       onvif_enabled: !!c.onvif_enabled, onvif_host: "", onvif_port: 80, onvif_username: "", onvif_password: "",
                     });
                   }}>Изм.</button>

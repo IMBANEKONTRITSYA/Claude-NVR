@@ -58,6 +58,9 @@ export function Settings() {
         detect_width: parseInt(s.detect_width),
         record_segment_min: parseInt(s.record_segment_min) || 5,
         analytics_cameras_max: parseInt(s.analytics_cameras_max) || 2,
+        disk_min_free_pct: parseInt(s.disk_min_free_pct) || 5,
+        disk_warn_pct: parseInt(s.disk_warn_pct) || 80,
+        disk_crit_pct: parseInt(s.disk_crit_pct) || 90,
       };
       const r = await api.putSettings(payload);
       setS(r);
@@ -130,7 +133,10 @@ export function Settings() {
 
       <div className="card" style={{ maxWidth: 520, marginBottom: 16 }}>
         <h3 style={{ marginTop: 0 }}>Детекция и хранение</h3>
-        <Field label="Глубина хранения архива (дней)" value={s.retention_days} onChange={upd("retention_days")} hint="После — видео и события удаляются автоматически" />
+        <Field label="Глубина хранения архива (дней)" value={s.retention_days} onChange={upd("retention_days")} hint="После — видео и события удаляются автоматически. Отдельным камерам можно задать свою глубину в карточке камеры" />
+        <Field label="Порог циклической перезаписи (% свободного)" value={s.disk_min_free_pct} onChange={upd("disk_min_free_pct")} hint="Когда свободного места меньше — удаляются самые старые сегменты, даже если их срок хранения не истёк. Страховка от остановки записи на переполненном диске" />
+        <Field label="Предупреждение о заполнении диска (%)" value={s.disk_warn_pct} onChange={upd("disk_warn_pct")} hint="Порог первого предупреждения в мониторинге и логах" />
+        <Field label="Критическое заполнение диска (%)" value={s.disk_crit_pct} onChange={upd("disk_crit_pct")} hint="Порог критического алерта" />
         <Field label="Частота детекции (FPS на канал)" value={s.detection_fps} onChange={upd("detection_fps")} hint="Рекомендуется 5; выше — больше нагрузка на CPU" />
         <Field label="Порог движения (пикселей)" value={s.motion_threshold} onChange={upd("motion_threshold")} hint="Чувствительность детектора движения; меньше — чувствительнее" />
         <Field label="Порог схожести лиц" value={s.similarity_threshold} onChange={upd("similarity_threshold")} step={0.05} hint="0.1–0.9; меньше → строже сопоставление с известными" />

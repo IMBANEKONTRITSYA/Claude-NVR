@@ -71,6 +71,11 @@ def index_new_segments(session_factory, segment_model, segments_dir: str, *,
                 file_path=seg["file_path"],
                 event_type=CONTINUOUS,
                 duration_sec=int(max(0.0, seg["ended_ts"] - seg["started_ts"])),
+                # SPEC §21: размер берётся здесь, в момент, когда файл уже
+                # дописан (`collect_complete_segments` отдаёт только такие),
+                # и больше не меняется. Считать его позже пришлось бы
+                # обходом архива на диске.
+                size_bytes=int(seg["size_bytes"]),
             ))
             added += 1
         if added:

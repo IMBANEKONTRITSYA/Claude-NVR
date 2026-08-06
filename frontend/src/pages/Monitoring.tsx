@@ -21,6 +21,128 @@ function Metric({ label, value, percent, hint }: any) {
   );
 }
 
+/** Калькулятор хранения (SPEC §21): битрейт × камеры × дни → требуемый объём. */
+function StorageCalculator() {
+  const [f, setF] = useState({ bitrate_kbps: 2048, cameras: 120, days: 14 });
+  const [res, setRes] = useState<any>(null);
+  const [err, setErr] = useState("");
+
+  const calc = () => api.storageCalc(f.bitrate_kbps, f.cameras, f.days)
+    .then(r => { setRes(r); setErr(""); })
+    .catch(e => { setRes(null); setErr(e.message); });
+
+  useEffect(() => { calc(); }, []);
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <h3 style={{ marginTop: 0 }}>Калькулятор хранения</h3>
+      <p className="muted" style={{ marginTop: 0 }}>
+        Сколько диска нужно под заданную глубину архива. Формула ТЗ: Мбит/с × 10.8 = ГБ/сутки на камеру.
+      </p>
+      <div className="grid" style={{ gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
+        <div>
+          <label>Битрейт основного потока, кбит/с</label>
+          <input type="number" min={64} max={100000} value={f.bitrate_kbps}
+            onChange={e => setF({ ...f, bitrate_kbps: Number(e.target.value) })} />
+        </div>
+        <div>
+          <label>Камер</label>
+          <input type="number" min={1} max={1000} value={f.cameras}
+            onChange={e => setF({ ...f, cameras: Number(e.target.value) })} />
+        </div>
+        <div>
+          <label>Глубина хранения, суток</label>
+          <input type="number" min={1} max={3650} value={f.days}
+            onChange={e => setF({ ...f, days: Number(e.target.value) })} />
+        </div>
+      </div>
+      <button className="btn" style={{ marginTop: 8 }} onClick={calc}>Рассчитать</button>
+      {err && <div className="empty" style={{ marginTop: 8 }}>{err}</div>}
+      {res && (
+        <div className="row" style={{ marginTop: 12 }}>
+          <Metric label="На камеру" value={`${res.gb_per_day_per_camera} ГБ/сут`} />
+          <Metric label="Суммарно" value={`${res.gb_per_day_total} ГБ/сут`} />
+          <Metric label="Требуется" value={`${res.required_tb} ТБ`}
+            hint={`${res.required_gb} ГБ на ${res.days} сут`} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Хранилище архива: заполнение, фактический расход, прогноз (SPEC §5, §21). */
+function StoragePanel({ isAdmin }: { isAdmin: boolean }) {
+  const [s, setS] = useState<any>(null);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    const tick = () => api.storage().then(r => { setS(r); setErr(""); }).catch(e => setErr(e.message));
+    tick();
+    const t = setInterval(tick, 15000);
+    return () => clearInterval(t);
+  }, []);
+
+  if (err) return <div className="card" style={{ marginBottom: 16 }}><h3 style={{ marginTop: 0 }}>Хранилище</h3><div className="empty">{err}</div></div>;
+  if (!s) return null;
+
+  const overrides = Object.entries(s.per_camera_retention || {});
+  // Прочерк вместо числа, пока расход не измерен: см. days_left() в
+  // services/storage.py — «бесконечность» в первые минуты была бы враньём.
+  const left = s.days_left == null ? "—" : `${s.days_left} сут`;
+  const alertText = s.alert_level === "critical"
+    ? `Диск заполнен более чем на ${s.crit_percent}% — старейшие сегменты будут удалены автоматически`
+    : s.alert_level === "warning"
+      ? `Диск заполнен более чем на ${s.warn_percent}%`
+      : "";
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <h3 style={{ marginTop: 0 }}>Хранилище архива</h3>
+      {alertText && (
+        <div style={{
+          padding: "8px 12px", borderRadius: 4, marginBottom: 12,
+          background: s.alert_level === "critical" ? "var(--red)" : "var(--orange)",
+          color: "#fff", fontWeight: 600,
+        }}>{alertText}</div>
+      )}
+      <div className="row">
+        <Metric label="Заполнение диска" value={`${s.disk_used_percent}%`}
+          percent={s.disk_used_percent} warn={s.warn_percent} crit={s.crit_percent}
+          hint={`свободно ${s.disk_free_gb} ГБ из ${s.disk_total_gb} ГБ`} />
+        <Metric label="Хватит места на" value={left}
+          hint={s.forecast_source === "measured"
+            ? `по фактическому расходу ${s.measured_gb_per_day} ГБ/сут`
+            : `расчётно, ${s.nominal_gb_per_day} ГБ/сут — фактических данных пока нет`} />
+        <Metric label="Расход за сутки" value={`${s.measured_gb_per_day} ГБ`}
+          hint={`расчётный ${s.nominal_gb_per_day} ГБ · сегментов ${s.segments_last_day}`} />
+        <Metric label="Объём архива" value={`${s.archive_gb} ГБ`}
+          hint={`глубина хранения ${s.retention_days} сут · камер на записи ${s.cameras_recording}`} />
+      </div>
+      {s.calibration != null && (
+        <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
+          Калибровка: фактический расход составляет {Math.round(s.calibration * 100)}% от расчётного
+          {s.calibration < 1 ? " (VBR и smart-кодек экономят)" : " (выше расчёта — проверьте битрейт камер)"}.
+        </div>
+      )}
+      {overrides.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
+            Камеры с собственной глубиной хранения:
+          </div>
+          <div>{overrides.map(([id, d]: any) => (
+            <span key={id} className="badge" style={{ marginRight: 6 }}>#{id}: {d} сут</span>
+          ))}</div>
+        </div>
+      )}
+      {isAdmin && (
+        <div className="muted" style={{ fontSize: 11, marginTop: 8 }}>
+          Глобальная глубина хранения и пороги алертов настраиваются в разделе «Настройки».
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function Monitoring() {
   const [m, setM] = useState<any>(null);
   const [err, setErr] = useState("");
@@ -50,6 +172,9 @@ export function Monitoring() {
           hint={`свободно ${m.disk_free_gb} ГБ из ${m.disk_total_gb} ГБ`} />
         {m.temperature_c != null && <Metric label="Температура" value={`${m.temperature_c}°C`} />}
       </div>
+
+      <StoragePanel isAdmin={isAdmin} />
+      {isAdmin && <StorageCalculator />}
 
       <div className="row" style={{ marginBottom: 16 }}>
         <Metric label="Камеры в сети" value={`${m.cameras_online} / ${m.cameras_enabled}`}
