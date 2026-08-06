@@ -3,10 +3,10 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 from ..config import settings
 from ..db import get_db
-from ..models import Camera
+from ..models import Camera, Setting
 from ..auth import require_role, get_current_user, get_user_from_query_token
 from ..schemas import OnvifBulkAddRequest, OnvifDescribeRequest, CameraIn, CameraOut, OnvifProfilesRequest, OnvifStreamUriRequest, ROIIn, RtspTest
 from ..services.encryption import encrypt, decrypt
@@ -14,13 +14,51 @@ from ..services.pubsub import get_redis
 
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 
+# Сколько камер разрешено держать в режиме analytics, если настройка не
+# задана. SPEC §1: «Аналитика ... только на N выбранных камерах (по
+# умолчанию 2)».
+DEFAULT_ANALYTICS_MAX = 2
+
 
 def _camera_out(c: Camera) -> CameraOut:
     return CameraOut(
-        id=c.id, name=c.name, location=c.location, enabled=c.enabled, status=c.status,
+        id=c.id, name=c.name, location=c.location, enabled=c.enabled,
+        mode=c.mode or "record_only", status=c.status,
         has_substream=bool(c.sub_rtsp_url_enc), motion_sensitivity=c.motion_sensitivity,
         onvif_enabled=bool(c.onvif_enabled), has_onvif=bool(c.onvif_host),
     )
+
+
+async def _analytics_limit(db: AsyncSession) -> int:
+    row = await db.get(Setting, "analytics_cameras_max")
+    try:
+        return max(1, int(row.value)) if row else DEFAULT_ANALYTICS_MAX
+    except (TypeError, ValueError):
+        return DEFAULT_ANALYTICS_MAX
+
+
+async def _ensure_analytics_slot(db: AsyncSession, exclude_id: int | None = None) -> None:
+    """Не даёт перевести в analytics больше камер, чем разрешено.
+
+    SPEC §24 выносит «Детекция лиц на всех 120 камерах без GPU» за рамки
+    версии, а §23 отводит аналитике 2-3 ядра из бюджета. Без явного предела
+    ничто не мешает администратору включить аналитику на всех камерах —
+    слой записи при этом устоит (он независим, §2), а вот воркер уйдёт в
+    неограниченное отставание, и деградация будет выглядеть как «система
+    тормозит», а не как «включено больше, чем рассчитано».
+    """
+    limit = await _analytics_limit(db)
+    q = select(func.count()).select_from(Camera).where(Camera.mode == "analytics")
+    if exclude_id is not None:
+        q = q.where(Camera.id != exclude_id)
+    current = (await db.execute(q)).scalar() or 0
+    if current >= limit:
+        raise HTTPException(
+            400,
+            f"Камер в режиме аналитики уже {current} — это предел "
+            f"(настройка analytics_cameras_max = {limit}). Переведите другую "
+            "камеру в режим «только запись» или увеличьте предел в настройках.",
+        )
 
 
 @router.get("", response_model=list[CameraOut])
@@ -31,12 +69,15 @@ async def list_cameras(_=Depends(get_current_user), db: AsyncSession = Depends(g
 
 @router.post("", response_model=CameraOut)
 async def add_camera(payload: CameraIn, _=Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
+    if payload.mode == "analytics":
+        await _ensure_analytics_slot(db)
     cam = Camera(
         name=payload.name,
         rtsp_url_enc=encrypt(payload.rtsp_url),
         sub_rtsp_url_enc=encrypt(payload.sub_rtsp_url) if payload.sub_rtsp_url else None,
         location=payload.location,
         enabled=payload.enabled,
+        mode=payload.mode,
         motion_sensitivity=payload.motion_sensitivity,
         status="offline",
         onvif_enabled=payload.onvif_enabled,
@@ -62,8 +103,11 @@ async def update_camera(cam_id: int, payload: CameraIn, _=Depends(require_role("
     # Пустое поле субпотока очищает его, отсутствующее — оставляет прежнее значение
     if payload.sub_rtsp_url is not None:
         cam.sub_rtsp_url_enc = encrypt(payload.sub_rtsp_url) if payload.sub_rtsp_url else None
+    if payload.mode == "analytics" and cam.mode != "analytics":
+        await _ensure_analytics_slot(db, exclude_id=cam.id)
     cam.location = payload.location
     cam.enabled = payload.enabled
+    cam.mode = payload.mode
     cam.motion_sensitivity = payload.motion_sensitivity
     cam.onvif_enabled = payload.onvif_enabled
     cam.onvif_host = payload.onvif_host or None
@@ -122,6 +166,12 @@ async def put_roi(cam_id: int, payload: ROIIn, _=Depends(require_role("admin", "
     cam = await db.get(Camera, cam_id)
     if not cam:
         raise HTTPException(404, "Камера не найдена")
+    # SPEC §11: «Scale Edition: доступно только для камер в режиме
+    # analytics». Зоны детекции у камеры, которая только пишется, ни на что
+    # не влияют — сохранить их значит показать оператору настройку, которая
+    # молча ничего не делает.
+    if (cam.mode or "record_only") != "analytics":
+        raise HTTPException(400, "Зоны детекции задаются только для камер в режиме аналитики")
     cam.roi = payload.model_dump()
     await db.commit()
     return {"ok": True}
@@ -348,6 +398,10 @@ async def onvif_bulk_add(
             sub_rtsp_url_enc=encrypt(data["sub_rtsp_url"]) if data.get("sub_rtsp_url") else None,
             location=item.location,
             enabled=payload.enabled,
+            # Массово найденные камеры заводятся только на запись (SPEC §1):
+            # аналитика включается точечно на выбранных, иначе поиск в сети
+            # из 120 устройств разом поставил бы детекцию на все.
+            mode="record_only",
             status="offline",
             onvif_enabled=payload.onvif_enabled,
             onvif_host=item.host,

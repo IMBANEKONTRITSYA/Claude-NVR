@@ -57,6 +57,7 @@ export function Settings() {
         cluster_interval_min: parseInt(s.cluster_interval_min),
         detect_width: parseInt(s.detect_width),
         record_segment_min: parseInt(s.record_segment_min) || 5,
+        analytics_cameras_max: parseInt(s.analytics_cameras_max) || 2,
       };
       const r = await api.putSettings(payload);
       setS(r);
@@ -124,6 +125,7 @@ export function Settings() {
         </div>
         <Field label="Интервал кластеризации (мин)" value={s.cluster_interval_min} onChange={upd("cluster_interval_min")} hint="Пакетное объединение дублей неизвестных персон" />
         <Field label="Длительность сегмента записи (мин)" value={s.record_segment_min} onChange={upd("record_segment_min")} hint="5–10 минут. Архив пишется как есть, без перекодирования, поэтому кодек и битрейт задаются на самой камере" />
+        <Field label="Камер в режиме аналитики, максимум" value={s.analytics_cameras_max} onChange={upd("analytics_cameras_max")} hint="Запись идёт по всем камерам; распознавание лиц — только на этом числе выбранных, оно и определяет нагрузку на процессор" />
       </div>
 
       <div className="card" style={{ maxWidth: 520, marginBottom: 16 }}>

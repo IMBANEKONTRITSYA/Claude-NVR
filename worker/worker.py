@@ -204,6 +204,9 @@ class Camera(Base):
     sub_rtsp_url_enc = Column(Text)      # субпоток для аналитики (ТЗ 18.1)
     location = Column(String)
     enabled = Column(Boolean)
+    # SPEC §2: record_only (по умолчанию) | analytics. Слой записи берёт все
+    # включённые камеры, слой аналитики — только analytics.
+    mode = Column(String, default="record_only")
     status = Column(String)
     roi = Column(JSON)
     motion_sensitivity = Column(Integer)
@@ -504,10 +507,20 @@ def save_latest_frame(frame, cam_id: int):
 
 
 def load_cam_state(cam_id: int) -> tuple[dict | None, bool, int | None]:
-    """(roi, active, motion_sensitivity). active=False — камера отключена или удалена."""
+    """(roi, active, motion_sensitivity).
+
+    `active=False` — нить аналитики должна завершиться: камера удалена,
+    отключена **или переведена в режим record_only**. Последнее — то же
+    самое условие остановки, что и отключение: переключение режима в
+    админке обязано применяться без перезапуска слоёв (SPEC §2), а нить,
+    продолжающая детекцию на камере, которую перевели «только на запись»,
+    ровно этому и противоречит.
+    """
     with Session() as s:
         cam = s.get(Camera, cam_id)
         if cam is None or not cam.enabled:
+            return None, False, None
+        if (getattr(cam, "mode", None) or "record_only") != "analytics":
             return None, False, None
         return cam.roi, True, getattr(cam, "motion_sensitivity", None)
 
@@ -1232,6 +1245,13 @@ def manager():
                     # аналитики: камера попадает в него сразу после расшифровки
                     # адреса (SPEC §2).
                     record_cams.append((cam.id, rtsp))
+                    # SPEC §6: детекция и распознавание — только на камерах в
+                    # режиме analytics. На камерах record_only нить не
+                    # поднимается вовсе: на целевых 120 камерах это ровно то,
+                    # что §24 выносит за рамки версии («Детекция лиц на всех
+                    # 120 камерах без GPU»).
+                    if (getattr(cam, "mode", None) or "record_only") != "analytics":
+                        continue
                     if cam.id in threads and threads[cam.id].is_alive():
                         continue
                     onvif_config = None

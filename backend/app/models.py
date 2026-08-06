@@ -43,6 +43,14 @@ class Camera(Base):
     sub_rtsp_url_enc: Mapped[str | None] = mapped_column(Text, nullable=True)  # субпоток: аналитика
     location: Mapped[str] = mapped_column(String(120), default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    # SPEC §2, §3: режим камеры. `record_only` — камера только пишется слоем
+    # записи (MediaMTX, remux); `analytics` — дополнительно обрабатывается
+    # слоем аналитики (детекция и распознавание лиц). По умолчанию
+    # `record_only`: SPEC §1 отводит аналитике N выбранных камер (по
+    # умолчанию 2) из 120, а §24 прямо выносит «Детекция лиц на всех 120
+    # камерах без GPU» за рамки версии.
+    mode: Mapped[str] = mapped_column(String(20), default="record_only",
+                                      server_default=text("'record_only'"))
     status: Mapped[str] = mapped_column(String(20), default="offline")  # online|offline|disabled
     roi: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # {"polygons": [[[x,y],...]]}
     motion_sensitivity: Mapped[int | None] = mapped_column(Integer, nullable=True)  # переопределяет профиль

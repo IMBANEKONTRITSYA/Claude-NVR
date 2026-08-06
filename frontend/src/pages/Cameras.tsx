@@ -3,7 +3,9 @@ import { api } from "../api";
 import { useUI } from "../ui";
 
 const EMPTY_FORM = {
-  name: "", rtsp_url: "", sub_rtsp_url: "", location: "", enabled: true,
+  // Режим по умолчанию — только запись (SPEC §2): аналитика включается явно
+  // на выбранных камерах, а не на каждой добавленной.
+  name: "", rtsp_url: "", sub_rtsp_url: "", location: "", enabled: true, mode: "record_only",
   onvif_enabled: false, onvif_host: "", onvif_port: 80, onvif_username: "", onvif_password: "",
 };
 
@@ -121,6 +123,18 @@ export function Cameras() {
           <div><label>RTSP URL</label><input value={form.rtsp_url} onChange={e => setForm({ ...form, rtsp_url: e.target.value })} placeholder="rtsp://user:pass@ip:554/stream" /></div>
           <div><label>RTSP субпотока (для детекции)</label><input value={form.sub_rtsp_url} onChange={e => setForm({ ...form, sub_rtsp_url: e.target.value })} placeholder="640x360, необязательно" /></div>
           <div><label>Локация</label><input value={form.location} onChange={e => setForm({ ...form, location: e.target.value })} /></div>
+        </div>
+        <div style={{ marginBottom: 10, maxWidth: 460 }}>
+          <label>Режим камеры</label>
+          <select value={form.mode} onChange={e => setForm({ ...form, mode: e.target.value })}>
+            <option value="record_only">Только запись — непрерывный архив, без распознавания</option>
+            <option value="analytics">Аналитика — запись плюс детекция и распознавание лиц</option>
+          </select>
+          <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+            Запись ведётся в обоих режимах. Аналитика заметно нагружает процессор,
+            поэтому её включают на нескольких выбранных камерах — предел задаётся
+            в «Настройках» (по умолчанию 2).
+          </div>
         </div>
         <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginRight: 12 }}>
           <input type="checkbox" style={{ width: "auto" }} checked={form.enabled} onChange={e => setForm({ ...form, enabled: e.target.checked })} />
@@ -287,7 +301,7 @@ export function Cameras() {
 
       <div className="card">
         <table>
-          <thead><tr><th>ID</th><th>Название</th><th>Локация</th><th>Статус</th><th>Активна</th><th></th></tr></thead>
+          <thead><tr><th>ID</th><th>Название</th><th>Локация</th><th>Режим</th><th>Статус</th><th>Активна</th><th></th></tr></thead>
           <tbody>
             {cams.map(c => (
               <tr key={c.id}>
@@ -298,6 +312,7 @@ export function Cameras() {
                   {c.onvif_enabled && <span className="muted" style={{ fontSize: 10, marginLeft: 6 }} title="Движение — по событиям ONVIF">ONVIF</span>}
                 </td>
                 <td>{c.location}</td>
+                <td>{c.mode === "analytics" ? "Аналитика" : "Только запись"}</td>
                 <td><span className={`badge ${c.status}`}>{c.status}</span></td>
                 <td>
                   <label style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
@@ -313,6 +328,7 @@ export function Cameras() {
                     setEditing(c.id);
                     setForm({
                       name: c.name, rtsp_url: "", sub_rtsp_url: "", location: c.location, enabled: c.enabled,
+                      mode: c.mode || "record_only",
                       onvif_enabled: !!c.onvif_enabled, onvif_host: "", onvif_port: 80, onvif_username: "", onvif_password: "",
                     });
                   }}>Изм.</button>
@@ -320,7 +336,7 @@ export function Cameras() {
                 </td>
               </tr>
             ))}
-            {cams.length === 0 && <tr><td colSpan={6} className="empty">Камер нет</td></tr>}
+            {cams.length === 0 && <tr><td colSpan={7} className="empty">Камер нет</td></tr>}
           </tbody>
         </table>
       </div>

@@ -64,15 +64,10 @@ def _insert_face_event(pg_conn, camera_id: int, person_id: int | None, _seeded=N
     return eid
 
 
-def _make_camera(client, admin_headers, request) -> int:
-    name = f"cam_{request.node.name}"[:60]
-    r = client.post(
-        "/api/cameras",
-        json={"name": name, "rtsp_url": "rtsp://cam/stream"},
-        headers=admin_headers,
-    )
-    assert r.status_code == 200, r.text
-    return r.json()["id"]
+def _make_camera(make_camera, request) -> int:
+    """Камера под тест. Уборку делает фикстура `make_camera` (conftest.py):
+    до цикла 24 камеры оставались в БД и копились от прогона к прогону."""
+    return make_camera(f"cam_{request.node.name}"[:60])["id"]
 
 
 def test_persons_list_requires_auth(client):
@@ -155,8 +150,8 @@ def test_persons_delete_requires_admin_not_operator(client, admin_headers, make_
     assert r.status_code == 200
 
 
-def test_persons_merge_reassigns_events_and_deletes_source(client, admin_headers, pg_conn, request, _seeded):
-    cam_id = _make_camera(client, admin_headers, request)
+def test_persons_merge_reassigns_events_and_deletes_source(client, admin_headers, pg_conn, request, _seeded, make_camera):
+    cam_id = _make_camera(make_camera, request)
     src_id = _insert_person(pg_conn, f"src_{request.node.name}"[:60], _seeded=_seeded)
     dst_id = _insert_person(pg_conn, f"dst_{request.node.name}"[:60], _seeded=_seeded)
     ev_id = _insert_face_event(pg_conn, cam_id, src_id, _seeded=_seeded)
@@ -184,8 +179,8 @@ def test_persons_gallery_empty_for_unknown_person(client, admin_headers):
     assert r.json() == []
 
 
-def test_persons_enhance_queues_upscale_jobs(client, admin_headers, pg_conn, request, _seeded):
-    cam_id = _make_camera(client, admin_headers, request)
+def test_persons_enhance_queues_upscale_jobs(client, admin_headers, pg_conn, request, _seeded, make_camera):
+    cam_id = _make_camera(make_camera, request)
     pid = _insert_person(pg_conn, f"enh_{request.node.name}"[:60], _seeded=_seeded)
     _insert_face_event(pg_conn, cam_id, pid, _seeded=_seeded)
     _insert_face_event(pg_conn, cam_id, pid, _seeded=_seeded)

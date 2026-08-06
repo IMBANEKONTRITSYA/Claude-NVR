@@ -3,13 +3,33 @@ worker (недоступен в CI — см. .github/workflows/ci.yml): сете
 подменяется monkeypatch'ем httpx.AsyncClient.post, а сам pgvector-поиск
 по face_events выполняется на настоящей БД — не мок."""
 import httpx
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_seeded(pg_conn):
+    """Убирает камеры/персоны/события, засеянные
+    `_seed_camera_and_matching_event`. До цикла 24 они оставались в БД —
+    в CI незаметно (свежий контейнер на прогон), но локально камеры
+    копились от прогона к прогону, а с появлением предела на камеры в
+    режиме analytics (SPEC §1) начали ронять соседние тесты."""
+    seeded = {"cameras": [], "persons": []}
+    yield seeded
+    with pg_conn.cursor() as cur:
+        if seeded["cameras"]:
+            cur.execute("DELETE FROM face_events WHERE camera_id = ANY(%s)", (seeded["cameras"],))
+        if seeded["persons"]:
+            cur.execute("DELETE FROM face_events WHERE person_id = ANY(%s)", (seeded["persons"],))
+            cur.execute("DELETE FROM persons WHERE id = ANY(%s)", (seeded["persons"],))
+        if seeded["cameras"]:
+            cur.execute("DELETE FROM cameras WHERE id = ANY(%s)", (seeded["cameras"],))
 
 
 def _vec(seed: float = 0.02) -> str:
     return "[" + ",".join(f"{seed:.4f}" for _ in range(512)) + "]"
 
 
-def _seed_camera_and_matching_event(pg_conn):
+def _seed_camera_and_matching_event(pg_conn, _seeded=None):
     with pg_conn.cursor() as cur:
         cur.execute(
             "INSERT INTO cameras (name, rtsp_url_enc, location, enabled, status, created_at) "
@@ -26,6 +46,9 @@ def _seed_camera_and_matching_event(pg_conn):
             "VALUES (%s, %s, NOW(), CAST(%s AS vector), true, false)",
             (cam_id, person_id, _vec()),
         )
+    if _seeded is not None:
+        _seeded["cameras"].append(cam_id)
+        _seeded["persons"].append(person_id)
     return cam_id, person_id
 
 
@@ -76,11 +99,11 @@ def test_search_face_forbidden_for_operator_role_that_lacks_grant(client, make_u
     assert r.status_code == 503
 
 
-def test_search_face_finds_matching_event_with_mocked_worker(client, admin_headers, monkeypatch, pg_conn):
+def test_search_face_finds_matching_event_with_mocked_worker(client, admin_headers, monkeypatch, pg_conn, _cleanup_seeded):
     """Подменяет только сетевой вызов к worker'у — сам косинусный поиск по
     pgvector и сборка ответа идут по настоящей БД, включая join с segment_id."""
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_worker_post)
-    _cam_id, person_id = _seed_camera_and_matching_event(pg_conn)
+    _cam_id, person_id = _seed_camera_and_matching_event(pg_conn, _cleanup_seeded)
 
     r = client.post(
         "/api/search/face",
@@ -93,9 +116,9 @@ def test_search_face_finds_matching_event_with_mocked_worker(client, admin_heade
     assert any(item["person_id"] == person_id and item["similarity"] >= 0.99 for item in results)
 
 
-def test_search_face_filters_by_status_and_date_range(client, admin_headers, monkeypatch, pg_conn):
+def test_search_face_filters_by_status_and_date_range(client, admin_headers, monkeypatch, pg_conn, _cleanup_seeded):
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_worker_post)
-    _cam_id, person_id = _seed_camera_and_matching_event(pg_conn)
+    _cam_id, person_id = _seed_camera_and_matching_event(pg_conn, _cleanup_seeded)
 
     r = client.post(
         "/api/search/face",
