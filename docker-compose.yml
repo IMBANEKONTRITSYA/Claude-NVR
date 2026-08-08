@@ -155,13 +155,25 @@ services:
       MEDIAMTX_API_URL: http://mediamtx:9997
     volumes:
       - media:/media
+      # Модели распознавания. В образ они вкладываются на сборке, но том
+      # нужен для изолированного сервера: туда их кладут вручную, если
+      # сборка шла без доступа в интернет. Путь — тот, куда смотрит
+      # InsightFace по умолчанию (~/.insightface у пользователя root).
+      - insightface-models:/root/.insightface
     healthcheck:
+      # Проверяется живость воркера, а НЕ готовность модели: с цикла 26
+      # отказ загрузки модели не роняет воркер (SPEC §2 — «отказ аналитики
+      # не влияет на запись»), и помечать контейнер нездоровым из-за неё
+      # значило бы уронить запись 120 камер из-за неработающей аналитики.
+      # Состояние модели отдаётся полем model_ready того же /health и видно
+      # в «Мониторинге».
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9000/health',timeout=3).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 5
-      # Первый старт качает модель InsightFace (~30 МБ) — даём запас
-      start_period: 300s
+      # API поднимается до загрузки модели, поэтому запас нужен только на
+      # старт интерпретатора и импорт cv2/insightface.
+      start_period: 60s
     restart: unless-stopped
     # По умолчанию Docker ждёт SIGTERM только 10с и досылает SIGKILL —
     # graceful shutdown (закрытие VideoCapture по каждой камере) может не
@@ -265,3 +277,6 @@ volumes:
   media:
   backups:
   frontend_certs:
+  # Модели распознавания: вкладываются в образ на сборке, том нужен для
+  # изолированного сервера, куда их кладут вручную (см. INSTALL).
+  insightface-models:

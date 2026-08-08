@@ -318,6 +318,42 @@ def load_face_app(model_name: str | None = None):
     return app
 
 
+def _try_load_model() -> bool:
+    """Загружает модель, не роняя процесс при отказе (SPEC §2).
+
+    Возвращает успех и оставляет причину отказа в `MODEL_ERROR`, чтобы
+    интерфейс мог показать её администратору: молчаливое «аналитика не
+    работает» отличить от «камеры нет в кадре» невозможно.
+    """
+    global MODEL_ERROR
+    logger.info("загрузка модели InsightFace...")
+    try:
+        load_face_app()
+    except Exception as exc:
+        MODEL_ERROR = f"{type(exc).__name__}: {exc}"[:300]
+        logger.error(
+            "не удалось загрузить модель распознавания — слой аналитики "
+            "выключен, запись при этом продолжается (SPEC §2). При первом "
+            "запуске модель скачивается из интернета; на изолированном "
+            "сервере положите её в том insightface-models вручную",
+            exc_info=True, extra={"model": CONFIG["face_model"]},
+        )
+        return False
+    MODEL_ERROR = None
+    logger.info("модель готова")
+    return True
+
+
+# Причина, по которой модель не загрузилась (None — загружена). Публикуется
+# в Redis вместе со статусом слоя записи, чтобы интерфейс объяснял отказ
+# аналитики, а не показывал пустую стену распознавания без пояснений.
+MODEL_ERROR: str | None = None
+
+# Как часто пробовать загрузить модель заново после отказа. Модель может
+# появиться без перезапуска контейнера — например, администратор положил
+# файлы в том, — и требовать ради этого рестарта незачем.
+MODEL_RETRY_SEC = 300
+
 _last_status: dict[int, str] = {}
 
 # Камеры, чей статус в этот момент известен слою записи. Для них слой
@@ -1424,7 +1460,13 @@ def publish_record_layer_status(cam_names) -> dict:
     _record_layer_owned.intersection_update(states)
 
     payload = {"streams": list(states.values()), "summary": summarize(states),
-               "segment_gaps": gaps, "updated_at": time.time()}
+               "segment_gaps": gaps, "updated_at": time.time(),
+               # Состояние слоя аналитики едет здесь же: у него уже есть
+               # читатель и TTL. Отдельный ключ ради двух полей означал бы
+               # второй запрос из бэкенда на каждый показ страницы.
+               "analytics": {"model_ready": FACE_APP is not None,
+                             "model": CONFIG["face_model"],
+                             "error": MODEL_ERROR}}
     try:
         r.set("record:layer", json.dumps(payload), ex=120)
     except Exception:
@@ -1484,36 +1526,63 @@ def manager():
     # Настройки читаем ДО загрузки модели: профиль задаёт face_model и
     # detect_width, иначе выбор в админке не применялся бы до перезапуска.
     refresh_config()
-    logger.info("загрузка модели InsightFace...")
-    face_app = load_face_app()
-    logger.info("модель готова")
-    loaded_model = (CONFIG["face_model"], CONFIG["detect_width"])
 
-    # Внутренний HTTP-API для извлечения эмбеддинга (поиск по фото)
+    # HTTP-API поднимается ПЕРВЫМ — до модели.
+    #
+    # Он обслуживает автообнаружение камер по ONVIF, которое к распознаванию
+    # лиц отношения не имеет вовсе (SPEC §3). Пока запуск стоял после
+    # загрузки модели, отказ загрузки уносил и его: администратор не мог
+    # даже найти камеры в сети, а бэкенд отвечал «Сервис распознавания
+    # недоступен» на запрос, распознавания не касающийся.
+    #
+    # Модель передаётся функцией, а не значением: она может появиться
+    # позже (см. цикл дозагрузки ниже), и API обязан это подхватить.
     try:
         from embed_api import start_embed_api
-        start_embed_api(face_app, port=9000)
+        start_embed_api(lambda: FACE_APP, port=9000)
         logger.info("embed-API запущен", extra={"port": 9000})
     except Exception:
         logger.error("не удалось запустить embed-API", exc_info=True)
 
+    # Отказ загрузки модели НЕ должен ронять процесс (SPEC §2: «Отказ
+    # аналитики НЕ влияет на запись»).
+    #
+    # До этого фикса `load_face_app()` стоял здесь голым вызовом, и любая
+    # его ошибка убивала весь воркер — вместе со слоем записи, индексацией
+    # сегментов, статусами камер и ONVIF-API. На практике это происходило
+    # штатно: InsightFace скачивает модель из интернета при первом запуске,
+    # а production-сервер видеонаблюдения обычно изолирован. Контейнер
+    # уходил в бесконечный CrashLoop, и запись не велась вообще.
+    loaded_model = None
+    _try_load_model()
+    if FACE_APP is not None:
+        loaded_model = (CONFIG["face_model"], CONFIG["detect_width"])
+
     threads: dict[int, threading.Thread] = {}
     last_cleanup = 0.0
     last_recluster = 0.0
+    last_model_retry = time.time()
 
     logger.info("конфиг воркера", extra={"config": CONFIG})
 
     while not shutdown_event.is_set():
         try:
             refresh_config()
+            want_model = (CONFIG["face_model"], CONFIG["detect_width"])
             # Смена модели/разрешения в профиле применяется без перезапуска
-            if (CONFIG["face_model"], CONFIG["detect_width"]) != loaded_model:
+            if FACE_APP is not None and want_model != loaded_model:
                 logger.info("параметры модели изменились, перезагружаю")
-                try:
-                    load_face_app()  # обновляет глобальный FACE_APP
-                    loaded_model = (CONFIG["face_model"], CONFIG["detect_width"])
-                except Exception:
-                    logger.error("не удалось сменить модель", exc_info=True)
+                if _try_load_model():
+                    loaded_model = want_model
+            elif FACE_APP is None and time.time() - last_model_retry > MODEL_RETRY_SEC:
+                # Повторная попытка после отказа: модель могла появиться без
+                # перезапуска контейнера (администратор положил файлы в том,
+                # починился доступ в интернет). Раз в 5 минут, а не каждый
+                # проход: скачивание модели идёт минуты и блокирует цикл.
+                last_model_retry = time.time()
+                if _try_load_model():
+                    loaded_model = want_model
+                    logger.info("слой аналитики включён: модель загружена")
             record_cams: list[tuple[int, str]] = []
             record_cam_names: list[tuple[int, str]] = []
             with Session() as s:
@@ -1538,6 +1607,11 @@ def manager():
                     # 120 камерах без GPU»).
                     if (getattr(cam, "mode", None) or "record_only") != "analytics":
                         continue
+                    # Без модели нить аналитики не поднимается: она упала бы
+                    # на первом же кадре. Слой записи выше этой строки уже
+                    # отработал — камера пишется независимо (SPEC §2).
+                    if FACE_APP is None:
+                        continue
                     if cam.id in threads and threads[cam.id].is_alive():
                         continue
                     onvif_config = None
@@ -1556,7 +1630,7 @@ def manager():
                             "password": onvif_password,
                         }
                     t = threading.Thread(
-                        target=camera_worker, args=(cam.id, rtsp, face_app, sub, onvif_config), daemon=True
+                        target=camera_worker, args=(cam.id, rtsp, FACE_APP, sub, onvif_config), daemon=True
                     )
                     t.start()
                     threads[cam.id] = t
