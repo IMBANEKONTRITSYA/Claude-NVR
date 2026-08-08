@@ -187,6 +187,7 @@ async def record_layer_status(_=Depends(require_role("admin", "operator")),
             "segments_last_day": segments_day,
             "gb_last_day": round(bytes_day / BYTES_PER_GB, 2),
             "streams": [], "summary": None, "segment_gaps": [],
+            "analytics": None,
         }
 
     return {
@@ -198,6 +199,10 @@ async def record_layer_status(_=Depends(require_role("admin", "operator")),
         "streams": payload.get("streams") or [],
         "summary": payload.get("summary"),
         "segment_gaps": payload.get("segment_gaps") or [],
+        # Состояние слоя аналитики: отказ загрузки модели больше не роняет
+        # воркер (SPEC §2), поэтому его надо где-то показать — иначе
+        # «распознавание молчит» неотличимо от «в кадре никого нет».
+        "analytics": payload.get("analytics"),
     }
 
 

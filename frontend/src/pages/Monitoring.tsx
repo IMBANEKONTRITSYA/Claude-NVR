@@ -62,6 +62,28 @@ function RecordLayerPanel() {
     <div className="card" style={{ marginBottom: 16 }}>
       <h3 style={{ marginTop: 0 }}>Слой записи</h3>
 
+      {/* Отказ аналитики показывается отдельно от записи: с цикла 26 он
+          больше не роняет воркер (SPEC §2), поэтому без явного сообщения
+          «распознавание молчит» неотличимо от «в кадре никого нет». */}
+      {d.analytics && d.analytics.model_ready === false && (
+        <div style={{
+          padding: "8px 12px", borderRadius: 4, marginBottom: 12,
+          background: "var(--orange)", color: "#000", fontWeight: 600,
+        }}>
+          Распознавание лиц выключено: модель «{d.analytics.model}» не загружена.
+          Запись при этом идёт нормально.
+          {d.analytics.error && (
+            <div style={{ fontWeight: 400, fontSize: 12, marginTop: 4 }}>
+              {d.analytics.error}
+            </div>
+          )}
+          <div style={{ fontWeight: 400, fontSize: 12, marginTop: 4 }}>
+            При первом запуске модель скачивается из интернета. На сервере без
+            доступа в сеть положите её в том insightface-models — см. INSTALL.
+          </div>
+        </div>
+      )}
+
       {!d.available ? (
         <div className="empty">
           {d.reason || "Нет данных"} — за сутки записано {d.segments_last_day} сегментов
