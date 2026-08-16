@@ -62,6 +62,22 @@ function RecordLayerPanel() {
     <div className="card" style={{ marginBottom: 16 }}>
       <h3 style={{ marginTop: 0 }}>Слой записи</h3>
 
+      {/* Недоступный Control API — причина, по которой статусы всех
+          потоков «неизвестны». Без неё интерфейс показывал бы «неизвестно»
+          на всей стене камер без единого намёка, куда смотреть. */}
+      {d.control_api_error && (
+        <div style={{
+          padding: "8px 12px", borderRadius: 4, marginBottom: 12,
+          background: "var(--red)", color: "#fff", fontWeight: 600,
+        }}>
+          Нет связи с медиасервером MediaMTX — статусы потоков записи неизвестны,
+          пути записи не синхронизируются.
+          <div style={{ fontWeight: 400, fontSize: 12, marginTop: 4 }}>
+            {d.control_api_error}
+          </div>
+        </div>
+      )}
+
       {/* Отказ аналитики показывается отдельно от записи: с цикла 26 он
           больше не роняет воркер (SPEC §2), поэтому без явного сообщения
           «распознавание молчит» неотличимо от «в кадре никого нет». */}

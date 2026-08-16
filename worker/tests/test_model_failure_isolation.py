@@ -171,3 +171,73 @@ def test_embed_explains_why_search_is_unavailable():
     body = r.json()
     assert body["ok"] is False
     assert body["error"] == MODEL_UNAVAILABLE
+
+
+# --- недоступный Control API виден, а не молчит ---------------------------
+
+def _broken_api(monkeypatch, exc=OSError("Connection refused")):
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def runtime_paths(self):
+            raise exc
+
+    monkeypatch.setattr(worker, "MediaMTXClient", _Client)
+    monkeypatch.setattr(worker, "_last_segment_ts", lambda ids: {})
+    monkeypatch.setattr(worker.r, "set", lambda *a, **k: True)
+    monkeypatch.setattr(worker, "_record_api_error", None)
+    monkeypatch.setattr(worker, "_record_prev_status", None)
+
+
+def test_control_api_failure_reason_reaches_the_interface(monkeypatch):
+    """Причина недоступности Control API обязана быть видимой.
+
+    Пока она писалась на debug, отказ выглядел так: статусы камер молча
+    замирали, интерфейс показывал всю стену офлайн, и в журнале не было ни
+    строчки — понять, что сломался именно Control API, было нечем.
+    """
+    _broken_api(monkeypatch)
+    payload = worker.publish_record_layer_status([(1, "Проходная")])
+
+    assert payload["control_api_error"]
+    assert "Connection refused" in payload["control_api_error"]
+
+
+def test_control_api_failure_leaves_statuses_untouched(monkeypatch):
+    """Недоступный Control API — «неизвестно», а не «камера пропала».
+
+    Позитивный контроль к предыдущему: статус в БД не трогается, иначе
+    рестарт MediaMTX гасил бы всю стену из 120 камер разом.
+    """
+    _broken_api(monkeypatch)
+    written = []
+    monkeypatch.setattr(worker, "update_status",
+                        lambda *a, **k: written.append(a))
+
+    payload = worker.publish_record_layer_status([(1, "Проходная")])
+
+    assert written == []
+    assert payload["summary"]["streams_unknown"] == 1
+
+
+def test_recovered_control_api_clears_the_reason(monkeypatch):
+    """Восстановление связи снимает сообщение: иначе интерфейс показывал бы
+    старую аварию на здоровом медиасервере."""
+    _broken_api(monkeypatch)
+    worker.publish_record_layer_status([(1, "Проходная")])
+    assert worker._record_api_error is not None
+
+    class _Ok:
+        def __init__(self, *a, **k):
+            pass
+
+        def runtime_paths(self):
+            return {"cam1": {"name": "cam1", "online": True, "inboundBytes": 1}}
+
+    monkeypatch.setattr(worker, "MediaMTXClient", _Ok)
+    monkeypatch.setattr(worker, "update_status", lambda *a, **k: None)
+    payload = worker.publish_record_layer_status([(1, "Проходная")])
+
+    assert payload["control_api_error"] is None
+    assert worker._record_api_error is None
