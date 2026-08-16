@@ -281,6 +281,256 @@ def _synthetic_onnx_model() -> bytes | None:
     return model.SerializeToString()
 
 
+# --- поиск похожих лиц (SPEC §12, §26) ------------------------------------
+
+# SPEC §12: «время поиска ≤ 3–5 сек на базе до 100 000 лиц».
+FACESEARCH_ROWS = 100_000
+EMBED_DIM = 512  # models.FaceEvent.embedding — Vector(512)
+
+# Отдельная схема, а не таблицы приложения: бенчмарк засевает сотню тысяч
+# строк, и делать это в `public` означало бы либо снести архив разработчика,
+# либо оставить после себя 100k мусорных событий. `search_path` позволяет
+# гонять НЕИЗМЕНЁННЫЙ production-SQL из routers/search.py — если бы запрос
+# пришлось переписывать под бенчмарк, мерился бы уже не он.
+FACESEARCH_SCHEMA = "bench_facesearch"
+
+# Запрос скопирован из backend/app/routers/search.py дословно (без
+# опциональных фильтров по дате и статусу, которых в базовом сценарии
+# поиска по фото нет). Копия, а не импорт: бенчмарк не должен тянуть
+# зависимости бэкенда, но расхождение с оригиналом обесценивает замер —
+# при правке search.py эту строку нужно обновить.
+FACESEARCH_SQL = """
+    SELECT fe.id, fe.person_id, fe.camera_id, fe.ts, fe.snapshot_path,
+           p.name, p.status,
+           1 - (fe.embedding <=> CAST(%(vec)s AS vector)) AS similarity,
+           (SELECT vs.id FROM video_segments vs
+              WHERE vs.camera_id = fe.camera_id
+                AND fe.ts >= vs.started_at AND fe.ts <= vs.ended_at
+              ORDER BY vs.started_at DESC LIMIT 1) AS segment_id
+    FROM face_events fe
+    LEFT JOIN persons p ON p.id = fe.person_id
+    WHERE fe.embedding IS NOT NULL
+      AND (1 - (fe.embedding <=> CAST(%(vec)s AS vector))) >= %(threshold)s
+    ORDER BY similarity DESC LIMIT %(limit)s
+"""
+
+# Тот же смысл, но порядок задан прямо оператором расстояния, а не
+# выражением-псевдонимом: планировщик pgvector берёт HNSW-индекс только для
+# `ORDER BY <столбец> <=> <константа>`. Разница между двумя вариантами и
+# есть ответ на вопрос, работает ли индекс в production-запросе.
+FACESEARCH_SQL_INDEXED = """
+    SELECT fe.id, fe.person_id, fe.camera_id, fe.ts, fe.snapshot_path,
+           p.name, p.status,
+           1 - (fe.embedding <=> CAST(%(vec)s AS vector)) AS similarity,
+           (SELECT vs.id FROM video_segments vs
+              WHERE vs.camera_id = fe.camera_id
+                AND fe.ts >= vs.started_at AND fe.ts <= vs.ended_at
+              ORDER BY vs.started_at DESC LIMIT 1) AS segment_id
+    FROM face_events fe
+    LEFT JOIN persons p ON p.id = fe.person_id
+    WHERE fe.embedding IS NOT NULL
+    ORDER BY fe.embedding <=> CAST(%(vec)s AS vector) LIMIT %(limit)s
+"""
+
+
+# Число «персон» в засеваемой базе: эмбеддинги кладутся кластерами вокруг
+# центроидов, а не равномерно по сфере. Это не украшательство, а условие
+# осмысленности замера: случайные векторы в 512 измерениях почти
+# ортогональны друг другу (косинусная схожесть ≈ 0), порог эндпоинта 0.4 не
+# проходит НИ ОДНА строка, и запрос меряется на пустом результате — то есть
+# не делает той работы (сортировка, LEFT JOIN, подзапрос на сегмент),
+# ради которой его и меряют. Первый прогон этого бенчмарка выдал ровно
+# такую картину: 0 строк на 2000 эмбеддингов.
+FACESEARCH_CLUSTERS = 500
+
+# Разброс внутри кластера. Считается не на глаз: для единичного центроида
+# и шума со стандартным отклонением s по каждой из dim координат
+# косинусная схожесть ≈ 1/sqrt(1 + s²·dim). При dim=512 значение 0.021
+# даёт ≈ 0.90 — столько же, сколько у двух снимков одного человека.
+#
+# Первая версия брала 0.35 «на глаз»: шум полностью забивал центроид
+# (компоненты единичного вектора в 512 измерениях имеют масштаб
+# 1/sqrt(512) ≈ 0.044), схожесть выходила 0.12, и порог 0.4 снова не
+# проходила ни одна строка — та же вырожденность, что и на равномерных
+# векторах, только менее заметная.
+FACESEARCH_SPREAD = 0.021
+
+
+def _random_unit_vector(rnd, dim: int = EMBED_DIM) -> list[float]:
+    """Нормированный вектор — как эмбеддинг лица.
+
+    Косинусное расстояние определено на направлении, поэтому
+    ненормированные случайные векторы дали бы распределение схожести, не
+    похожее на настоящее, и порог отсекал бы не то количество строк.
+    """
+    v = [rnd.gauss(0.0, 1.0) for _ in range(dim)]
+    norm = sum(x * x for x in v) ** 0.5 or 1.0
+    return [x / norm for x in v]
+
+
+def _near(rnd, centroid: list[float], spread: float = FACESEARCH_SPREAD) -> list[float]:
+    """Вектор рядом с центроидом — повторное появление того же человека."""
+    v = [c + rnd.gauss(0.0, spread) for c in centroid]
+    norm = sum(x * x for x in v) ** 0.5 or 1.0
+    return [x / norm for x in v]
+
+
+def _seed_facesearch(conn, rows: int, log=None) -> dict:
+    """Засеять схему бенчмарка `rows` эмбеддингами и построить HNSW-индекс."""
+    import io
+    import random
+
+    rnd = random.Random(20260816)
+    timings: dict = {}
+    with conn.cursor() as cur:
+        cur.execute(f"DROP SCHEMA IF EXISTS {FACESEARCH_SCHEMA} CASCADE")
+        cur.execute(f"CREATE SCHEMA {FACESEARCH_SCHEMA}")
+        cur.execute(f"SET search_path = {FACESEARCH_SCHEMA}, public")
+        cur.execute("CREATE TABLE persons (id serial PRIMARY KEY, name text, status text)")
+        cur.execute(
+            "CREATE TABLE video_segments (id serial PRIMARY KEY, camera_id int, "
+            "started_at timestamp, ended_at timestamp)"
+        )
+        cur.execute(
+            "CREATE TABLE face_events (id serial PRIMARY KEY, camera_id int, "
+            "person_id int, ts timestamp, snapshot_path text, "
+            f"embedding vector({EMBED_DIM}))"
+        )
+        # Немного персон и сегментов — LEFT JOIN и коррелированный подзапрос
+        # на сегмент входят в измеряемый запрос и стоят своего времени.
+        cur.execute(
+            "INSERT INTO persons (name, status) SELECT 'p' || g, "
+            "CASE WHEN g % 3 = 0 THEN 'known' ELSE 'unknown' END "
+            "FROM generate_series(1, 500) g"
+        )
+        cur.execute(
+            "INSERT INTO video_segments (camera_id, started_at, ended_at) "
+            "SELECT (g % 120) + 1, NOW() - (g || ' minutes')::interval, "
+            "NOW() - ((g - 5) || ' minutes')::interval "
+            "FROM generate_series(1, 2000) g"
+        )
+
+        # Центроиды «персон»: вокруг них и раскладываются эмбеддинги.
+        centroids = [_random_unit_vector(rnd) for _ in range(FACESEARCH_CLUSTERS)]
+
+        t0 = time.perf_counter()
+        batch = 2000
+        done = 0
+        while done < rows:
+            n = min(batch, rows - done)
+            buf = io.StringIO()
+            for i in range(n):
+                vec = _near(rnd, centroids[(done + i) % FACESEARCH_CLUSTERS])
+                # Четыре знака после запятой: на 512 измерениях полная
+                # точность раздувает COPY-поток в разы, не меняя ни
+                # расстояний, ни поведения индекса.
+                lit = "[" + ",".join(f"{x:.4f}" for x in vec) + "]"
+                cam = (done + i) % 120 + 1
+                person = (done + i) % 500 + 1
+                buf.write(f"{cam}\t{person}\t2026-08-01 00:00:00\t/media/s.jpg\t{lit}\n")
+            buf.seek(0)
+            cur.copy_from(buf, "face_events",
+                          columns=("camera_id", "person_id", "ts", "snapshot_path", "embedding"))
+            done += n
+            if log and done % 20000 == 0:
+                log(f"  засеяно {done}/{rows}")
+        timings["seed_sec"] = round(time.perf_counter() - t0, 2)
+
+        t0 = time.perf_counter()
+        cur.execute("CREATE INDEX ON face_events USING hnsw (embedding vector_cosine_ops)")
+        cur.execute("CREATE INDEX ON video_segments (camera_id, started_at)")
+        timings["index_build_sec"] = round(time.perf_counter() - t0, 2)
+
+        t0 = time.perf_counter()
+        cur.execute("ANALYZE face_events")
+        cur.execute("ANALYZE video_segments")
+        cur.execute("ANALYZE persons")
+        timings["analyze_sec"] = round(time.perf_counter() - t0, 2)
+
+    # Запрос идёт «фотографией» человека, который в базе есть: оператор
+    # ищет known-персону, а не случайный шум. Вектор берётся рядом с
+    # центроидом, а не самим центроидом, — точное совпадение с засеянной
+    # строкой было бы вырожденным случаем.
+    timings["_query_vec"] = _near(rnd, centroids[0])
+    return timings
+
+
+def _time_query(cur, sql: str, params: dict, repeats: int = 5) -> dict:
+    samples = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        cur.execute(sql, params)
+        got = cur.fetchall()
+        samples.append(time.perf_counter() - t0)
+    return {
+        "ms_mean": round(statistics.mean(samples) * 1000, 1),
+        "ms_p95": round(max(samples) * 1000, 1),
+        "rows_returned": len(got),
+    }
+
+
+def bench_facesearch(rows: int = FACESEARCH_ROWS, keep: bool = False, log=None) -> dict:
+    """Поиск похожих лиц на базе из `rows` эмбеддингов (SPEC §12: ≤ 3–5 с).
+
+    Меряется **запрос**, а не весь эндпоинт: извлечение эмбеддинга из
+    загруженного фото идёт в воркере (это `inference` выше и отдельная
+    строка бюджета), а норматив §12 говорит о «времени поиска на базе до
+    100 000 лиц» — то есть о той части, которая растёт с размером базы.
+    """
+    try:
+        import psycopg2  # noqa: F401
+    except ImportError:
+        return {"skipped": "psycopg2 не установлен"}
+
+    dsn = os.environ.get("BENCH_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    if not dsn:
+        return {"skipped": "не задан DATABASE_URL/BENCH_DATABASE_URL"}
+    # SQLAlchemy-DSN (postgresql+asyncpg://) psycopg2 не понимает.
+    dsn = dsn.replace("+asyncpg", "").replace("+psycopg2", "")
+
+    import psycopg2
+    try:
+        conn = psycopg2.connect(dsn, connect_timeout=5)
+    except Exception as e:
+        return {"skipped": f"Postgres недоступен: {e}"}
+    conn.autocommit = True
+
+    out: dict = {"rows": rows}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+            row = cur.fetchone()
+            out["pgvector"] = row[0] if row else "?"
+
+        seeded = _seed_facesearch(conn, rows, log=log)
+        qvec = "[" + ",".join(f"{x:.4f}" for x in seeded.pop("_query_vec")) + "]"
+        out.update(seeded)
+
+        with conn.cursor() as cur:
+            cur.execute(f"SET search_path = {FACESEARCH_SCHEMA}, public")
+            # Порог 0.4 — дефолт эндпоинта (threshold_form(0.4)), limit 100.
+            params = {"vec": qvec, "threshold": 0.4, "limit": 100}
+            for key, sql in (("production_query", FACESEARCH_SQL),
+                             ("indexed_order_by", FACESEARCH_SQL_INDEXED)):
+                out[key] = _time_query(cur, sql, params)
+                cur.execute("EXPLAIN (FORMAT TEXT) " + sql, params)
+                plan = "\n".join(r[0] for r in cur.fetchall())
+                # Признак использования HNSW — сканирование именно по
+                # индексу на `embedding`. Подстрока "Index Scan" сама по
+                # себе не годится: в плане есть и подзапрос на сегмент со
+                # своим обычным btree-индексом.
+                out[key]["uses_hnsw"] = "Index Scan using face_events_embedding" in plan
+                out[key]["seq_scan_on_faces"] = "Seq Scan on face_events" in plan
+                out[key]["plan"] = plan
+    finally:
+        if not keep:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP SCHEMA IF EXISTS {FACESEARCH_SCHEMA} CASCADE")
+        conn.close()
+    return out
+
+
 # --- runner ---------------------------------------------------------------
 
 def run(groups: set[str]) -> dict:
@@ -313,6 +563,14 @@ def run(groups: set[str]) -> dict:
             result["prefilter"] = bench_motion_prefilter(clip)
         if "inference" in groups:
             result["inference"] = bench_inference()
+        if "facesearch" in groups:
+            result["facesearch"] = bench_facesearch(
+                rows=int(os.environ.get("BENCH_FACES", FACESEARCH_ROWS)),
+                # Прогресс засева идёт в stderr: stdout занят JSON'ом
+                # для CI, и печать в него ломала разбор результата.
+                log=(None if os.environ.get("BENCH_QUIET")
+                     else lambda m: print(m, file=sys.stderr)),
+            )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     return result
@@ -346,10 +604,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--json", action="store_true", help="машиночитаемый вывод")
     ap.add_argument("--only", action="append", default=None,
-                    choices=["decode", "prefilter", "inference"],
+                    choices=["decode", "prefilter", "inference", "facesearch"],
                     help="выполнить только указанные группы (можно повторять)")
     args = ap.parse_args()
 
+    # facesearch не входит в набор по умолчанию: он засевает 100 000 строк и
+    # строит HNSW-индекс — это минуты, а не секунды, и требует живого
+    # Postgres. Запускается явно (`--only facesearch`), в том числе из
+    # отдельной CI-джобы.
     groups = set(args.only) if args.only else {"decode", "prefilter", "inference"}
     res = run(groups)
 
@@ -387,6 +649,20 @@ def main() -> int:
             print(f"  {'ms/лицо (p95)':28} {inf['ms_per_face_p95']:8.2f}")
             print(f"  {'лиц/с':28} {inf['faces_per_sec']:8.1f}")
             print(f"  провайдеры: {', '.join(inf['providers'])}")
+    if "facesearch" in res:
+        fs = res["facesearch"]
+        print("\nПоиск похожих лиц (SPEC §12: ≤ 3–5 с на 100 000 лиц):")
+        if "skipped" in fs:
+            print(f"  пропущено: {fs['skipped']}")
+        else:
+            print(f"  база: {fs['rows']} эмбеддингов, pgvector {fs['pgvector']}")
+            print(f"  засев {fs['seed_sec']} с, индекс HNSW {fs['index_build_sec']} с")
+            for key, title in (("production_query", "запрос из search.py"),
+                               ("indexed_order_by", "ORDER BY по оператору")):
+                q = fs[key]
+                print(f"  {title:24} {q['ms_mean']:8.1f} мс  (p95 {q['ms_p95']:.1f}, "
+                      f"строк {q['rows_returned']}, HNSW: "
+                      f"{'да' if q['uses_hnsw'] else 'НЕТ'})")
     return 0
 
 
