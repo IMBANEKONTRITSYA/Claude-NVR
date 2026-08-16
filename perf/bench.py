@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Бенчмарки горячих путей FaceWatch (SPEC §19, §23, §26).
+"""Бенчмарки горячих путей FaceWatch (SPEC §7, §15, §19).
 
-Меряется то, что определяет, влезет ли система в бюджет целевого сервера
-(2× Xeon E5-2670, 64 потока, без GPU, без AVX2 — SPEC §23):
+Меряется то, что определяет, влезет ли система в бюджет сервера объекта.
+Порядок нумерации — по редакции «Production NVR Edition» (2026-08-16):
+§19 задаёт нормативы производительности, §7 — норматив поиска по архиву,
+§15 — слой распознавания лиц, §20 — классы серверов (от N100 до 2× Xeon):
 
 * **decode** — кадров в секунду при декодировании основного потока (720p
-  H.265). Определяет потолок слоя аналитики: SPEC §26 требует ≥ 5 FPS на
-  канал, §23 отводит аналитике 2–3 ядра.
-* **prefilter** — стоимость префильтра движения (MOG2/KNN, SPEC §19).
+  H.265). Определяет потолок слоя аналитики: SPEC §19 требует ≥ 5 FPS на
+  канал, §16 отводит камере analytics 0.5–1.5 ядра при 5 FPS.
+* **prefilter** — стоимость префильтра движения (MOG2/KNN, SPEC §15:
+  профили производительности аналитики).
   Идёт по каждому кадру до детектора, поэтому его цена входит в бюджет
   целиком.
-* **inference** — миллисекунд на лицо на CPU (SPEC §23: «бенчмарк
-  инференса на целевом CPU в CI»).
+* **inference** — миллисекунд на лицо на CPU (§21: ONNX Runtime CPU /
+  OpenVINO как рекомендованный рантайм).
 
 Запуск:
 
@@ -21,7 +24,8 @@
 
 Осознанные ограничения, которые нельзя лечить в песочнице:
 
-* **Числа не переносятся на целевой сервер напрямую.** У E5-2670 нет AVX2
+* **Числа не переносятся на сервер объекта напрямую.** У E5-2670 (верхний
+  класс §20) нет AVX2
   и слабее single-thread; любой современный хост даёт завышенный
   результат. Смысл прогона в CI — не абсолют, а **отслеживание
   деградации между циклами** на одинаковом железе раннера.
@@ -531,20 +535,36 @@ def bench_facesearch(rows: int = FACESEARCH_ROWS, keep: bool = False, log=None) 
     return out
 
 
-# --- поиск по архиву (SPEC §26: ≤ 5 с) ------------------------------------
+# --- поиск по архиву (SPEC §7: ≤ 5 с на 500 000 сегментов) ----------------
 
 ARCHIVE_SCHEMA = "bench_archive"
 
-# Боевой объём слоя записи по SPEC §1/§20/§21: 120 камер, сегменты по 5 минут
-# (нижняя граница «5–10 минут» из §20 — она даёт больше строк, то есть
-# худший случай), retention по умолчанию 14 дней (§21).
-ARCHIVE_CAMERAS = 120
+# Объём задаётся **числом сегментов**, а не числом камер.
+#
+# §7 новой редакции ТЗ (Production NVR Edition) формулирует норматив
+# именно так: «поиск по архиву ≤ 5 секунд на объёме до 500 000
+# сегментов». До этого объём считался как «120 камер × 14 дней», но §1
+# снял фиксированные 120 камер (объект — 12–250+), а §22 прямо запрещает
+# такой хардкод: на объекте из 250 камер норматив достигался бы вдвое
+# раньше, чем наступает заявленный предел.
+#
+# Число камер выводится из целевого объёма, а не наоборот. Сегменты по
+# 5 минут — нижняя граница §5 (она даёт больше строк, то есть худший
+# случай), retention 14 дней — значение по умолчанию.
+ARCHIVE_SEGMENTS = 500_000
 ARCHIVE_DAYS = 14
 ARCHIVE_SEGMENT_SEC = 300
-# События лиц идут только с камер analytics (§6: «только для камер в режиме
-# analytics», по умолчанию 2) — объём базы лиц берётся из §12.
+# События лиц идут только с камер analytics (§15: «только для камер в
+# режиме analytics») — объём базы лиц берётся из норматива §15
+# («≤ 3-5 с на базе до 100 000 лиц»).
 ARCHIVE_ANALYTICS_CAMERAS = 2
 ARCHIVE_FACES = 100_000
+
+
+def _archive_cameras(segments: int = ARCHIVE_SEGMENTS) -> int:
+    """Сколько камер писать, чтобы получить заданное число сегментов."""
+    per_camera = ARCHIVE_DAYS * 86400 // ARCHIVE_SEGMENT_SEC
+    return max(1, -(-segments // per_camera))  # округление вверх
 
 
 def _archive_ddl() -> list[str]:
@@ -628,8 +648,9 @@ def _archive_queries():
     ]
 
 
-def _seed_archive(conn, log=None) -> dict:
-    segments = ARCHIVE_CAMERAS * ARCHIVE_DAYS * (86400 // ARCHIVE_SEGMENT_SEC)
+def _seed_archive(conn, log=None, target_segments: int = ARCHIVE_SEGMENTS) -> dict:
+    cameras = _archive_cameras(target_segments)
+    segments = cameras * ARCHIVE_DAYS * (86400 // ARCHIVE_SEGMENT_SEC)
     t0 = time.perf_counter()
     with conn.cursor() as cur:
         cur.execute(f"DROP SCHEMA IF EXISTS {ARCHIVE_SCHEMA} CASCADE")
@@ -638,7 +659,7 @@ def _seed_archive(conn, log=None) -> dict:
         for stmt in _archive_ddl():
             cur.execute(stmt)
         if log:
-            log(f"  засев {segments} сегментов ({ARCHIVE_CAMERAS} камер × "
+            log(f"  засев {segments} сегментов ({cameras} камер × "
                 f"{ARCHIVE_DAYS} дней)...")
         last = ARCHIVE_DAYS * 86400 // ARCHIVE_SEGMENT_SEC - 1
         cur.execute(f"""
@@ -652,7 +673,7 @@ def _seed_archive(conn, log=None) -> dict:
                        + ((s + 1) * interval '{ARCHIVE_SEGMENT_SEC} seconds'),
                    '/media/segments/cam' || c || '_' || s || '.mp4',
                    'continuous', {ARCHIVE_SEGMENT_SEC}, 75000000
-            FROM generate_series(1, {ARCHIVE_CAMERAS}) c,
+            FROM generate_series(1, {cameras}) c,
                  generate_series(0, {last}) s
         """)
         if log:
@@ -674,6 +695,7 @@ def _seed_archive(conn, log=None) -> dict:
         size = cur.fetchone()[0]
     return {
         "segments": segments,
+        "cameras": cameras,
         "faces": ARCHIVE_FACES,
         "table_mb": round(size / 1024 / 1024, 1),
         "seed_sec": round(time.perf_counter() - t0, 1),
@@ -681,14 +703,15 @@ def _seed_archive(conn, log=None) -> dict:
 
 
 def bench_archive(keep: bool = False, log=None) -> dict:
-    """Поиск по архиву на боевом объёме записи (SPEC §26: ≤ 5 с).
+    """Поиск по архиву на объёме норматива (SPEC §7: ≤ 5 с на 500 000 сегментов).
 
     Меряется запрос, а не весь эндпоинт: сериализация 200 строк не растёт
     с размером архива, а норматив говорит именно о поиске по нему.
 
     Смысл замера — не «уложились ли», а **на чём именно** уложились: время
     в норматив может влезать случайно, за счёт запаса железа, при плане с
-    полным перебором (так §12 25 циклов «проходил», ни разу не задев HNSW).
+    полным перебором (так поиск по фото 25 циклов «проходил», ни разу не
+    задев HNSW).
     Поэтому рядом с миллисекундами печатается признак Seq Scan.
     """
     try:
@@ -861,7 +884,7 @@ def main() -> int:
             print(f"  провайдеры: {', '.join(inf['providers'])}")
     if "archive" in res:
         ar = res["archive"]
-        print("\nПоиск по архиву (SPEC §26: ≤ 5 с):")
+        print("\nПоиск по архиву (SPEC §7: ≤ 5 с на 500 000 сегментов):")
         if "skipped" in ar:
             print(f"  пропущено: {ar['skipped']}")
         else:
