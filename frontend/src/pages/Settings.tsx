@@ -22,11 +22,15 @@ export function Settings() {
   const [busy, setBusy] = useState(false);
 
   const [titles, setTitles] = useState<Record<string, string>>({});
+  const [profileNote, setProfileNote] = useState("");
 
   const load = () => api.getSettings().then(setS).catch(() => {});
   useEffect(() => {
     load();
-    api.listProfiles().then((r: any) => setTitles(r.titles || {})).catch(() => {});
+    api.listProfiles().then((r: any) => {
+      setTitles(r.titles || {});
+      setProfileNote(r.note || "");
+    }).catch(() => {});
   }, []);
 
   const applyProfile = async (name: string) => {
@@ -92,11 +96,18 @@ export function Settings() {
         {["economy", "standard", "maximum"].map(p => (
           <div key={p} style={{ marginBottom: 8 }}>
             <button className={`btn ${s.performance_profile === p ? "" : "secondary"}`}
-              style={{ width: "100%", textAlign: "left" }} onClick={() => applyProfile(p)}>
+              style={{ width: "100%", textAlign: "left", whiteSpace: "normal", lineHeight: 1.35 }}
+              onClick={() => applyProfile(p)}>
               {titles[p] || p}
             </button>
           </div>
         ))}
+        {/* SPEC §19: профиль относится только к слою аналитики. Без этой
+            строки администратор объекта на 120 камер разумно предполагает,
+            что переключение затронет запись. */}
+        {profileNote && (
+          <div className="muted" style={{ fontSize: 12, marginTop: 10 }}>{profileNote}</div>
+        )}
       </div>
 
       <div className="card" style={{ maxWidth: 520, marginBottom: 16 }}>
