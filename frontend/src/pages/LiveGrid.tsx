@@ -1,9 +1,16 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Hls from "hls.js";
 import { api, camSnapshotUrl } from "../api";
 import { useWebSocket } from "../useWebSocket";
+import { Pager } from "../Pager";
+import {
+  DEFAULT_LAYOUT, LAYOUTS, Layout, MIN_ZOOM, Pan,
+  applyZoom, clampPage, clampPan, gridColumns, isLayout, pageSlice, zoomTransform,
+} from "../liveLayout";
 
 type Box = { id: number; name: string; is_known: boolean; x: number; y: number; w: number; h: number; ts: number };
+
+const LAYOUT_KEY = "fw_live_layout";
 
 function CameraTile({ cam, boxes, onClick }: any) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -17,6 +24,11 @@ function CameraTile({ cam, boxes, onClick }: any) {
   // рамок лиц: при object-fit contain кадр вписывается с полями, и рамка,
   // посчитанная от размеров плитки, уехала бы на величину поля.
   const [videoRect, setVideoRect] = useState<{ l: number; t: number; w: number; h: number } | null>(null);
+  // SPEC §4: цифровой зум. Состояние держится на плитке, а не на стене:
+  // оператор увеличивает одну камеру, остальные при этом не трогает.
+  const [zoom, setZoom] = useState(MIN_ZOOM);
+  const [pan, setPan] = useState<Pan>({ x: 0, y: 0 });
+  const drag = useRef<{ x: number; y: number; moved: boolean } | null>(null);
 
   // Двойной клик — настоящий браузерный полноэкранный режим
   const toggleFullscreen = () => {
@@ -94,32 +106,87 @@ function CameraTile({ cam, boxes, onClick }: any) {
     };
   };
 
+  // Колесо мыши — привычный для NVR жест увеличения. preventDefault, иначе
+  // страница уезжает под курсором вместо приближения кадра.
+  const onWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    setZoom(z => {
+      const next = applyZoom(z, pan, e.deltaY < 0 ? 1.25 : 1 / 1.25);
+      setPan(next.pan);
+      return next.zoom;
+    });
+  };
+
+  // Тянуть кадр можно только когда есть что тянуть (zoom > 1). Порог в
+  // 3 пикселя отличает перетаскивание от клика: без него любое
+  // микросмещение мыши разворачивало бы камеру на всю стену.
+  const onPointerDown = (e: React.PointerEvent) => {
+    if (zoom <= MIN_ZOOM) return;
+    drag.current = { x: e.clientX, y: e.clientY, moved: false };
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+  };
+  const onPointerMove = (e: React.PointerEvent) => {
+    const d = drag.current;
+    const box = tileRef.current;
+    if (!d || !box) return;
+    const dx = (e.clientX - d.x) / box.clientWidth;
+    const dy = (e.clientY - d.y) / box.clientHeight;
+    if (Math.abs(e.clientX - d.x) > 3 || Math.abs(e.clientY - d.y) > 3) d.moved = true;
+    d.x = e.clientX; d.y = e.clientY;
+    setPan(p => ({ x: clampPan(p.x + dx, zoom), y: clampPan(p.y + dy, zoom) }));
+  };
+  const onPointerUp = () => { drag.current = null; };
+
+  const resetZoom = () => { setZoom(MIN_ZOOM); setPan({ x: 0, y: 0 }); };
+
+  const handleClick = () => {
+    // Клик, завершивший перетаскивание, разворачивать камеру не должен.
+    if (drag.current?.moved) return;
+    onClick?.();
+  };
+
+  const transform = zoomTransform(zoom, pan);
+
   return (
-    <div className="cam-tile" ref={tileRef} onClick={onClick} onDoubleClick={toggleFullscreen}
-      title="Клик — развернуть в сетке, двойной клик — на весь экран">
+    <div className="cam-tile" ref={tileRef} onClick={handleClick} onDoubleClick={toggleFullscreen}
+      onWheel={onWheel} onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
+      style={{ cursor: zoom > MIN_ZOOM ? "grab" : undefined }}
+      title="Клик — развернуть в сетке, двойной клик — на весь экран, колесо — цифровой зум">
       <div className="lbl">
         {cam.name} <span className={`badge ${cam.status}`}>{cam.status}</span>
       </div>
-      {/* objectFit: contain, а не cover: в видеонаблюдении обрезать часть
-          кадра нельзя — с cover в полноэкранном режиме срезало края вместе
-          с наложенными камерой датой и временем. Поля по бокам честнее
-          потерянного куска кадра. */}
-      <video ref={videoRef} muted autoPlay playsInline
-        style={{ width: "100%", height: "100%", objectFit: "contain",
-                 display: error ? "none" : "block" }} />
-      {error && !snapshotFailed && (
-        <img src={camSnapshotUrl(cam.id)} alt=""
-          style={{ width: "100%", height: "100%", objectFit: "contain" }}
-          onError={() => setSnapshotFailed(true)} />
-      )}
+      {/* Зум двигает видео вместе с рамками лиц одной трансформацией:
+          посчитай рамки отдельно — они разъехались бы с кадром. */}
+      <div style={{ position: "absolute", inset: 0, overflow: "hidden", transform,
+                    transformOrigin: "center center" }}>
+        {/* objectFit: contain, а не cover: в видеонаблюдении обрезать часть
+            кадра нельзя — с cover в полноэкранном режиме срезало края вместе
+            с наложенными камерой датой и временем. Поля по бокам честнее
+            потерянного куска кадра. */}
+        <video ref={videoRef} muted autoPlay playsInline
+          style={{ width: "100%", height: "100%", objectFit: "contain",
+                   display: error ? "none" : "block" }} />
+        {error && !snapshotFailed && (
+          <img src={camSnapshotUrl(cam.id)} alt=""
+            style={{ width: "100%", height: "100%", objectFit: "contain" }}
+            onError={() => setSnapshotFailed(true)} />
+        )}
+        {boxes.map((b: Box) => (
+          <div key={b.id} className="bbox" style={boxStyle(b)}>
+            <span className="bbox-label" style={{ background: b.is_known ? "var(--green)" : "var(--orange)" }}>
+              {b.name}
+            </span>
+          </div>
+        ))}
+      </div>
       {error && snapshotFailed && <div className="nostream">Камера недоступна</div>}
-      {boxes.map((b: Box) => (
-        <div key={b.id} className="bbox" style={boxStyle(b)}>
-          <span className="bbox-label" style={{ background: b.is_known ? "var(--green)" : "var(--orange)" }}>
-            {b.name}
-          </span>
+      {zoom > MIN_ZOOM && (
+        <div className="zoom-badge" onClick={e => { e.stopPropagation(); resetZoom(); }}
+          title="Сбросить цифровой зум">
+          {zoom.toFixed(1)}× ✕
         </div>
-      ))}
+      )}
     </div>
   );
 }
@@ -128,6 +195,16 @@ export function LiveGrid() {
   const [cams, setCams] = useState<any[]>([]);
   const [full, setFull] = useState<number | null>(null);
   const [boxesByCam, setBoxesByCam] = useState<Record<number, Box[]>>({});
+  // SPEC §4: «грид: 1, 4, 9, 16 камер на экран». Раскладка запоминается —
+  // дежурный держит свою стену между сменами вкладок и перезагрузками.
+  const [layout, setLayout] = useState<Layout>(() => {
+    const saved = Number(localStorage.getItem(LAYOUT_KEY));
+    return isLayout(saved) ? saved : DEFAULT_LAYOUT;
+  });
+  const [page, setPage] = useState(1);
+  const [filter, setFilter] = useState("");
+
+  useEffect(() => { localStorage.setItem(LAYOUT_KEY, String(layout)); }, [layout]);
 
   useEffect(() => {
     api.cameras().then(setCams).catch(() => {});
@@ -164,22 +241,63 @@ export function LiveGrid() {
     return () => clearInterval(t);
   }, []);
 
-  const n = cams.length;
-  const cols = n <= 1 ? 1 : n <= 4 ? 2 : n <= 9 ? 3 : 4;
-  const display = full !== null ? cams.filter(c => c.id === full) : cams;
+  // Фильтр по имени и локации — способ добраться до нужной камеры на
+  // объекте, где страниц два десятка (§4: «переключение между камерами
+  // без перезагрузки страницы»).
+  const filtered = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    return q ? cams.filter(c => `${c.name} ${c.location}`.toLowerCase().includes(q)) : cams;
+  }, [cams, filter]);
+
+  // Номер страницы приводится к существующим при смене раскладки, фильтра
+  // или числа камер — иначе стена молча оказывается пустой.
+  const safePage = clampPage(page, filtered.length, layout);
+  useEffect(() => { if (safePage !== page) setPage(safePage); }, [safePage, page]);
+
+  // Развёрнутая камера — это ровно одна плитка, остальные плееры при этом
+  // не держатся: смысл разворота в том, чтобы отдать ей всю полосу.
+  const single = full !== null ? filtered.find(c => c.id === full) : undefined;
+  const display = single ? [single] : pageSlice(filtered, safePage, layout);
+  const cols = single ? 1 : gridColumns(layout);
 
   return (
     <div>
       <h2>Камеры в реальном времени</h2>
-      <div className="muted" style={{ marginBottom: 12 }}>
-        Клик по плитке — полноэкранный режим. Поток отдаётся MediaMTX по HLS, рамки лиц — через WebSocket.
+      <div className="toolbar">
+        <span className="muted">Мозаика:</span>
+        {LAYOUTS.map(n => (
+          <button key={n} className={`btn sm ${layout === n && !single ? "" : "secondary"}`}
+            onClick={() => { setFull(null); setLayout(n); }}>
+            {n === 1 ? "1 камера" : `${n} камер`}
+          </button>
+        ))}
+        {single && (
+          <button className="btn sm secondary" onClick={() => setFull(null)}>
+            ← Вернуться к мозаике
+          </button>
+        )}
+        <input value={filter} onChange={e => { setFilter(e.target.value); setPage(1); }}
+          placeholder="Фильтр по имени или локации"
+          style={{ marginLeft: "auto", maxWidth: 260 }} />
       </div>
-      <div className="cam-mosaic" style={{ gridTemplateColumns: `repeat(${full !== null ? 1 : cols}, 1fr)` }}>
+      <div className="muted" style={{ marginBottom: 12 }}>
+        Клик по плитке — развернуть камеру, двойной клик — полный экран,
+        колесо мыши — цифровой зум (кадр тянется мышью). Поток отдаётся
+        MediaMTX по HLS, рамки лиц — через WebSocket.
+      </div>
+      <div className="cam-mosaic" style={{ gridTemplateColumns: `repeat(${cols}, 1fr)` }}>
         {display.map(c => (
           <CameraTile key={c.id} cam={c} boxes={boxesByCam[c.id] || []} onClick={() => setFull(full === c.id ? null : c.id)} />
         ))}
-        {cams.length === 0 && <div className="empty">Камеры не добавлены</div>}
+        {filtered.length === 0 && (
+          <div className="empty">{cams.length === 0 ? "Камеры не добавлены" : "Нет камер по фильтру"}</div>
+        )}
       </div>
+      {/* Пагинация, а не бесконечная стена: на объекте из 250 камер (§1)
+          одновременно живут максимум 16 HLS-плееров. */}
+      {!single && (
+        <Pager page={safePage} pageSize={layout} total={filtered.length} onPage={setPage} />
+      )}
     </div>
   );
 }

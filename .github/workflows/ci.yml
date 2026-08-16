@@ -196,6 +196,15 @@ jobs:
       - name: Install frontend deps
         working-directory: frontend
         run: npm ci --legacy-peer-deps
+      # SPEC §21 перечисляет JS-тестраннер в стеке, но до цикла 28 его в
+      # проекте не было вовсе: логика интерфейса проверялась только
+      # статическими проверками из backend/tests, которые видят текст
+      # файла, а не поведение. Первый набор — раскладка стены и цифровой
+      # зум (§4): сколько плиток реально попадёт на экран, тестом видно, а
+      # чтением исходника — нет.
+      - name: Unit tests
+        working-directory: frontend
+        run: npm test
       - name: Build
         working-directory: frontend
         run: npm run build
