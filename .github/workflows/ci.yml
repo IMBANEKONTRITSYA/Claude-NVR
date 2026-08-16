@@ -52,6 +52,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install ffmpeg
+        # Экспорт фрагмента архива (SPEC §5) собирает MP4 вызовом ffmpeg, и
+        # в production-образе бэкенда он есть (backend/Dockerfile). На
+        # раннере GitHub его нет: тесты экспорта аккуратно пропускаются
+        # (skipif на shutil.which), и в этом-то и опасность — прогон
+        # выглядит зелёным, а целая функция ТЗ не проверяется вовсе.
+        # Замерено: без этого шага 20 тестов уходят в skip и покрытие
+        # падает с 77.5% до 74.7%, ниже порога джобы.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Install backend deps
         working-directory: backend
         run: |
