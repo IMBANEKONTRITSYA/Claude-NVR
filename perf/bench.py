@@ -531,6 +531,210 @@ def bench_facesearch(rows: int = FACESEARCH_ROWS, keep: bool = False, log=None) 
     return out
 
 
+# --- поиск по архиву (SPEC §26: ≤ 5 с) ------------------------------------
+
+ARCHIVE_SCHEMA = "bench_archive"
+
+# Боевой объём слоя записи по SPEC §1/§20/§21: 120 камер, сегменты по 5 минут
+# (нижняя граница «5–10 минут» из §20 — она даёт больше строк, то есть
+# худший случай), retention по умолчанию 14 дней (§21).
+ARCHIVE_CAMERAS = 120
+ARCHIVE_DAYS = 14
+ARCHIVE_SEGMENT_SEC = 300
+# События лиц идут только с камер analytics (§6: «только для камер в режиме
+# analytics», по умолчанию 2) — объём базы лиц берётся из §12.
+ARCHIVE_ANALYTICS_CAMERAS = 2
+ARCHIVE_FACES = 100_000
+
+
+def _archive_ddl() -> list[str]:
+    """DDL, повторяющий models.py (включая одиночные индексы).
+
+    Таблицы создаются вручную, а не через `Base.metadata.create_all`, чтобы
+    бенчмарк не тянул asyncpg/pgvector и не зависел от инициализации
+    приложения. Расхождение с моделью ловится тестом
+    backend/tests/test_archive_bench_matches_model.py.
+    """
+    return [
+        """CREATE TABLE video_segments (
+             id serial PRIMARY KEY,
+             camera_id integer NOT NULL,
+             started_at timestamp NOT NULL,
+             ended_at timestamp NOT NULL,
+             file_path varchar(500) NOT NULL,
+             event_type varchar(20) NOT NULL,
+             duration_sec integer NOT NULL DEFAULT 0,
+             size_bytes bigint NOT NULL DEFAULT 0)""",
+        """CREATE TABLE face_events (
+             id serial PRIMARY KEY,
+             camera_id integer NOT NULL,
+             person_id integer,
+             ts timestamp NOT NULL,
+             snapshot_path varchar(500),
+             orig_snapshot_path varchar(500),
+             enhanced boolean NOT NULL DEFAULT false,
+             bbox json,
+             is_known boolean NOT NULL DEFAULT false)""",
+        "CREATE INDEX ix_video_segments_camera_id ON video_segments (camera_id)",
+        "CREATE INDEX ix_video_segments_started_at ON video_segments (started_at)",
+        "CREATE INDEX ix_video_segments_ended_at ON video_segments (ended_at)",
+        "CREATE INDEX ix_face_events_camera_id ON face_events (camera_id)",
+        "CREATE INDEX ix_face_events_person_id ON face_events (person_id)",
+        "CREATE INDEX ix_face_events_ts ON face_events (ts)",
+    ]
+
+
+def _archive_queries():
+    """Фильтры страницы «Видеоархив» — как их составляет интерфейс.
+
+    Запросы собираются **production-функцией** `segments_query()` из
+    backend/app/services/archive_query.py и компилируются в SQL. Копии SQL
+    здесь нет намеренно: копия расходится с оригиналом молча (урок цикла 26),
+    и тогда бенчмарк подтверждает норматив для запроса, которого в
+    приложении уже нет.
+    """
+    import sys as _sys
+    from pathlib import Path
+
+    backend = Path(__file__).resolve().parents[1] / "backend"
+    if str(backend) not in _sys.path:
+        _sys.path.insert(0, str(backend))
+    from sqlalchemy.dialects import postgresql
+    from app.services.archive_query import segments_query  # noqa: E402
+
+    def sql(**kw):
+        q = segments_query(**kw)
+        return str(q.compile(dialect=postgresql.dialect(),
+                             compile_kwargs={"literal_binds": True}))
+
+    # Даты берутся внутри окна засева (последние 14 дней).
+    day3 = "CURRENT_TIMESTAMP - interval '3 days'"
+    day2 = "CURRENT_TIMESTAMP - interval '2 days'"
+    from datetime import datetime, timedelta
+    now = datetime.utcnow()
+    d_from, d_to = now - timedelta(days=3), now - timedelta(days=2)
+
+    return [
+        ("без фильтров", sql()),
+        ("камера", sql(camera_id=77)),
+        ("камера + сутки", sql(camera_id=77, date_from=d_from, date_to=d_to)),
+        ("только даты", sql(date_from=d_from, date_to=d_to)),
+        # Редкий event_type: строк нет вовсе, то есть отсев идёт по всей
+        # таблице — худший случай для этого фильтра.
+        ("тип события (редкий)", sql(event_type="face")),
+        ("персона", sql(person_id=42)),
+        ("персона + камера + сутки",
+         sql(person_id=42, camera_id=1, date_from=d_from, date_to=d_to)),
+    ]
+
+
+def _seed_archive(conn, log=None) -> dict:
+    segments = ARCHIVE_CAMERAS * ARCHIVE_DAYS * (86400 // ARCHIVE_SEGMENT_SEC)
+    t0 = time.perf_counter()
+    with conn.cursor() as cur:
+        cur.execute(f"DROP SCHEMA IF EXISTS {ARCHIVE_SCHEMA} CASCADE")
+        cur.execute(f"CREATE SCHEMA {ARCHIVE_SCHEMA}")
+        cur.execute(f"SET search_path = {ARCHIVE_SCHEMA}, public")
+        for stmt in _archive_ddl():
+            cur.execute(stmt)
+        if log:
+            log(f"  засев {segments} сегментов ({ARCHIVE_CAMERAS} камер × "
+                f"{ARCHIVE_DAYS} дней)...")
+        last = ARCHIVE_DAYS * 86400 // ARCHIVE_SEGMENT_SEC - 1
+        cur.execute(f"""
+            INSERT INTO video_segments
+                (camera_id, started_at, ended_at, file_path, event_type,
+                 duration_sec, size_bytes)
+            SELECT c,
+                   now()::timestamp - interval '{ARCHIVE_DAYS} days'
+                       + (s * interval '{ARCHIVE_SEGMENT_SEC} seconds'),
+                   now()::timestamp - interval '{ARCHIVE_DAYS} days'
+                       + ((s + 1) * interval '{ARCHIVE_SEGMENT_SEC} seconds'),
+                   '/media/segments/cam' || c || '_' || s || '.mp4',
+                   'continuous', {ARCHIVE_SEGMENT_SEC}, 75000000
+            FROM generate_series(1, {ARCHIVE_CAMERAS}) c,
+                 generate_series(0, {last}) s
+        """)
+        if log:
+            log(f"  засев {ARCHIVE_FACES} событий лиц...")
+        step = max(1, ARCHIVE_DAYS * 86400 // ARCHIVE_FACES)
+        cur.execute(f"""
+            INSERT INTO face_events (camera_id, person_id, ts, snapshot_path, is_known)
+            SELECT 1 + (i % {ARCHIVE_ANALYTICS_CAMERAS}),
+                   1 + (i % 500),
+                   now()::timestamp - interval '{ARCHIVE_DAYS} days'
+                       + (i * interval '{step} seconds'),
+                   '/media/faces/f' || i || '.jpg',
+                   (i % 3) = 0
+            FROM generate_series(1, {ARCHIVE_FACES}) i
+        """)
+        cur.execute("ANALYZE video_segments")
+        cur.execute("ANALYZE face_events")
+        cur.execute("SELECT pg_total_relation_size('video_segments')")
+        size = cur.fetchone()[0]
+    return {
+        "segments": segments,
+        "faces": ARCHIVE_FACES,
+        "table_mb": round(size / 1024 / 1024, 1),
+        "seed_sec": round(time.perf_counter() - t0, 1),
+    }
+
+
+def bench_archive(keep: bool = False, log=None) -> dict:
+    """Поиск по архиву на боевом объёме записи (SPEC §26: ≤ 5 с).
+
+    Меряется запрос, а не весь эндпоинт: сериализация 200 строк не растёт
+    с размером архива, а норматив говорит именно о поиске по нему.
+
+    Смысл замера — не «уложились ли», а **на чём именно** уложились: время
+    в норматив может влезать случайно, за счёт запаса железа, при плане с
+    полным перебором (так §12 25 циклов «проходил», ни разу не задев HNSW).
+    Поэтому рядом с миллисекундами печатается признак Seq Scan.
+    """
+    try:
+        import psycopg2  # noqa: F401
+    except ImportError:
+        return {"skipped": "psycopg2 не установлен"}
+
+    dsn = os.environ.get("BENCH_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    if not dsn:
+        return {"skipped": "не задан DATABASE_URL/BENCH_DATABASE_URL"}
+    dsn = dsn.replace("+asyncpg", "").replace("+psycopg2", "")
+
+    try:
+        queries = _archive_queries()
+    except Exception as e:  # sqlalchemy/backend недоступны
+        return {"skipped": f"не удалось собрать production-запрос: {e}"}
+
+    import psycopg2
+    try:
+        conn = psycopg2.connect(dsn, connect_timeout=5)
+    except Exception as e:
+        return {"skipped": f"Postgres недоступен: {e}"}
+    conn.autocommit = True
+
+    out: dict = {"limit_sec": 5.0}
+    try:
+        out.update(_seed_archive(conn, log=log))
+        with conn.cursor() as cur:
+            cur.execute(f"SET search_path = {ARCHIVE_SCHEMA}, public")
+            measured = {}
+            for name, sql in queries:
+                measured[name] = _time_query(cur, sql, {}, repeats=3)
+                cur.execute("EXPLAIN (FORMAT TEXT) " + sql)
+                plan = "\n".join(r[0] for r in cur.fetchall())
+                measured[name]["seq_scan"] = "Seq Scan on video_segments" in plan
+            out["queries"] = measured
+            out["worst_ms"] = max(q["ms_mean"] for q in measured.values())
+            out["within_limit"] = out["worst_ms"] <= out["limit_sec"] * 1000
+    finally:
+        if not keep:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP SCHEMA IF EXISTS {ARCHIVE_SCHEMA} CASCADE")
+        conn.close()
+    return out
+
+
 # --- runner ---------------------------------------------------------------
 
 def run(groups: set[str]) -> dict:
@@ -563,6 +767,11 @@ def run(groups: set[str]) -> dict:
             result["prefilter"] = bench_motion_prefilter(clip)
         if "inference" in groups:
             result["inference"] = bench_inference()
+        if "archive" in groups:
+            result["archive"] = bench_archive(
+                log=(None if os.environ.get("BENCH_QUIET")
+                     else lambda m: print(m, file=sys.stderr)),
+            )
         if "facesearch" in groups:
             result["facesearch"] = bench_facesearch(
                 rows=int(os.environ.get("BENCH_FACES", FACESEARCH_ROWS)),
@@ -604,14 +813,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--json", action="store_true", help="машиночитаемый вывод")
     ap.add_argument("--only", action="append", default=None,
-                    choices=["decode", "prefilter", "inference", "facesearch"],
+                    choices=["decode", "prefilter", "inference", "facesearch",
+                             "archive"],
                     help="выполнить только указанные группы (можно повторять)")
     args = ap.parse_args()
 
-    # facesearch не входит в набор по умолчанию: он засевает 100 000 строк и
-    # строит HNSW-индекс — это минуты, а не секунды, и требует живого
-    # Postgres. Запускается явно (`--only facesearch`), в том числе из
-    # отдельной CI-джобы.
+    # facesearch и archive не входят в набор по умолчанию: они засевают
+    # сотни тысяч строк и требуют живого Postgres — это минуты, а не
+    # секунды. Запускаются явно (`--only facesearch`, `--only archive`),
+    # в том числе из отдельной CI-джобы.
     groups = set(args.only) if args.only else {"decode", "prefilter", "inference"}
     res = run(groups)
 
@@ -649,6 +859,22 @@ def main() -> int:
             print(f"  {'ms/лицо (p95)':28} {inf['ms_per_face_p95']:8.2f}")
             print(f"  {'лиц/с':28} {inf['faces_per_sec']:8.1f}")
             print(f"  провайдеры: {', '.join(inf['providers'])}")
+    if "archive" in res:
+        ar = res["archive"]
+        print("\nПоиск по архиву (SPEC §26: ≤ 5 с):")
+        if "skipped" in ar:
+            print(f"  пропущено: {ar['skipped']}")
+        else:
+            print(f"  база: {ar['segments']} сегментов ({ar['table_mb']} МБ), "
+                  f"{ar['faces']} событий лиц, засев {ar['seed_sec']} с")
+            for name, q in ar["queries"].items():
+                print(f"  {name:26} {q['ms_mean']:8.1f} мс  (p95 {q['ms_p95']:.1f}, "
+                      f"строк {q['rows_returned']}"
+                      f"{', Seq Scan' if q['seq_scan'] else ''})")
+            verdict = "укладывается" if ar["within_limit"] else "НЕ УКЛАДЫВАЕТСЯ"
+            print(f"  худший запрос: {ar['worst_ms']:.1f} мс — {verdict} "
+                  f"в норматив {ar['limit_sec']} с")
+
     if "facesearch" in res:
         fs = res["facesearch"]
         print("\nПоиск похожих лиц (SPEC §12: ≤ 3–5 с на 100 000 лиц):")

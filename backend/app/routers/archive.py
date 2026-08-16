@@ -7,11 +7,12 @@ from sqlalchemy import select
 from starlette.background import BackgroundTask
 from ..config import settings
 from ..db import get_db
-from ..models import VideoSegment, FaceEvent
+from ..models import VideoSegment
 from ..auth import require_role, require_role_query
 from ..params import limit_param
 from ..schemas import SegmentOut
 from ..services import export as export_svc
+from ..services.archive_query import segments_query
 
 router = APIRouter(prefix="/api/archive", tags=["archive"])
 
@@ -27,29 +28,12 @@ async def list_segments(
     _=Depends(require_role("admin", "operator")),
     db: AsyncSession = Depends(get_db),
 ):
-    q = select(VideoSegment).order_by(VideoSegment.started_at.desc()).limit(limit)
-    if camera_id:
-        q = q.where(VideoSegment.camera_id == camera_id)
-    if event_type:
-        q = q.where(VideoSegment.event_type == event_type)
-    if date_from:
-        q = q.where(VideoSegment.started_at >= date_from)
-    if date_to:
-        q = q.where(VideoSegment.started_at <= date_to)
-    if person_id:
-        # Сегмент относится к персоне, если на той же камере есть событие лица
-        # этой персоны во временном диапазоне сегмента.
-        exists_q = (
-            select(FaceEvent.id)
-            .where(
-                FaceEvent.person_id == person_id,
-                FaceEvent.camera_id == VideoSegment.camera_id,
-                FaceEvent.ts >= VideoSegment.started_at,
-                FaceEvent.ts <= VideoSegment.ended_at,
-            )
-            .exists()
-        )
-        q = q.where(exists_q)
+    # Сам запрос живёт в services/archive_query.py: его же импортирует
+    # бенчмарк норматива §26, чтобы мерить production-запрос, а не копию.
+    q = segments_query(
+        camera_id=camera_id, date_from=date_from, date_to=date_to,
+        event_type=event_type, person_id=person_id, limit=limit,
+    )
     r = await db.execute(q)
     return r.scalars().all()
 
