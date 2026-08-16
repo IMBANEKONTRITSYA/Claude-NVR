@@ -47,9 +47,11 @@ export function Persons() {
   const rename = async () => {
     const name = prompt("Имя персоны:", sel.name);
     if (name === null) return;
-    const u = await api.personUpdate(sel.id, { name });
-    setSel(u);
-    load();
+    try {
+      const u = await api.personUpdate(sel.id, { name });
+      setSel(u);
+      load();
+    } catch (e: any) { toast(e.message, "err"); }
   };
 
   const enhance = async () => {
@@ -62,10 +64,12 @@ export function Persons() {
 
   const merge = async () => {
     if (!mergeTarget) return;
-    await api.personMerge(sel.id, mergeTarget);
-    setSel(null);
-    setMergeTarget(null);
-    load();
+    try {
+      await api.personMerge(sel.id, mergeTarget);
+      setSel(null);
+      setMergeTarget(null);
+      load();
+    } catch (e: any) { toast(e.message, "err"); }
   };
 
   const remove = async () => {
@@ -138,17 +142,27 @@ export function Persons() {
               {enhMsg && <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>{enhMsg}</div>}
               <div style={{ marginTop: 12 }}>
                 <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                  {/* Молчаливый отказ здесь опаснее прочих: галочка просто
+                      отскакивала обратно, а оператор оставался в уверенности,
+                      что персона в watchlist и Telegram-оповещение придёт. */}
                   <input type="checkbox" style={{ width: "auto" }} checked={!!sel.alert_on_detection} onChange={async e => {
-                    const u = await api.personUpdate(sel.id, { alert_on_detection: e.target.checked });
-                    setSel({ ...sel, ...u });
+                    try {
+                      const u = await api.personUpdate(sel.id, { alert_on_detection: e.target.checked });
+                      setSel({ ...sel, ...u });
+                    } catch (err: any) { toast(err.message, "err"); }
                   }} />
                   В watchlist (Telegram-оповещение при детекции)
                 </label>
                 <label>Заметки</label>
+                {/* Поле неуправляемое (defaultValue): при отказе текст
+                    остаётся на экране и выглядит сохранённым — без catch
+                    заметка терялась совершенно молча. */}
                 <textarea rows={3} defaultValue={sel.notes || ""} onBlur={async e => {
                   if (e.target.value !== (sel.notes || "")) {
-                    const u = await api.personUpdate(sel.id, { notes: e.target.value });
-                    setSel({ ...sel, ...u });
+                    try {
+                      const u = await api.personUpdate(sel.id, { notes: e.target.value });
+                      setSel({ ...sel, ...u });
+                    } catch (err: any) { toast(err.message, "err"); }
                   }
                 }} />
               </div>

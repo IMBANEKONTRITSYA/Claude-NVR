@@ -11,7 +11,16 @@ export function ROI() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const W = 800, H = 450;
 
-  useEffect(() => { api.cameras().then(setCams); }, []);
+  // SPEC §11: «доступно только для камер в режиме analytics». Бэкенд это и
+  // проверяет (PUT /roi отдаёт 400 для record_only), но выпадающий список
+  // отдавал ВСЕ камеры — а record_only по §3 режим по умолчанию, то есть на
+  // объекте из 120 камер 118 позиций списка приводили к отказу уже после
+  // того, как оператор нарисовал полигон.
+  useEffect(() => {
+    api.cameras()
+      .then((all: any[]) => setCams(all.filter(c => c.mode === "analytics")))
+      .catch((e: any) => toast(e.message, "err"));
+  }, []);
   useEffect(() => {
     if (camId == null) return;
     api.camRoiGet(camId).then(r => {
@@ -66,8 +75,13 @@ export function ROI() {
   const save = async () => {
     if (camId == null) return;
     const norm = polys.map(p => p.map(([x, y]) => [x / W, y / H]));
-    await api.camRoiPut(camId, norm);
-    toast("Зоны сохранены", "ok");
+    // Без catch отказ сохранения был не виден вовсе: req() бросает Error на
+    // любой !res.ok, toast об успехе просто не выполнялся, и оператор
+    // оставался с нарисованным полигоном и без единого сообщения.
+    try {
+      await api.camRoiPut(camId, norm);
+      toast("Зоны сохранены", "ok");
+    } catch (e: any) { toast(e.message, "err"); }
   };
 
   return (
@@ -78,6 +92,12 @@ export function ROI() {
           <option value="">— камера —</option>
           {cams.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
         </select>
+        {cams.length === 0 && (
+          <span className="muted">
+            Нет камер в режиме аналитики — зоны детекции задаются только для них.
+            Переведите камеру в режим «аналитика» на странице «Камеры».
+          </span>
+        )}
         <button className="btn secondary" onClick={closePoly} disabled={poly.length < 3}>Закрыть полигон</button>
         <button className="btn secondary" onClick={() => setPoly([])}>Сбросить текущий</button>
         <button className="btn secondary" onClick={() => setPolys([])}>Очистить все</button>
