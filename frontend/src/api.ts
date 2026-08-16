@@ -148,6 +148,13 @@ export const api = {
       body: JSON.stringify({ host, port, username, password, profile_token }),
     }),
   cameras: () => req("/api/cameras"),
+  // SPEC §3: импорт/экспорт конфигурации камер. Выгрузка открывается
+  // прямой ссылкой (см. camerasExportUrl), загрузка идёт multipart'ом.
+  camerasImport: (file: File, dry_run = false) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return req(`/api/cameras/import?dry_run=${dry_run ? "1" : "0"}`, { method: "POST", body: fd });
+  },
   camAdd: (b: any) => req("/api/cameras", { method: "POST", body: JSON.stringify(b) }),
   camUpdate: (id: number, b: any) => req(`/api/cameras/${id}`, { method: "PUT", body: JSON.stringify(b) }),
   camDelete: (id: number) => req(`/api/cameras/${id}`, { method: "DELETE" }),
@@ -211,6 +218,12 @@ export function mediaUrl(rel: string | null | undefined): string {
   const [kind, name] = rel.split("/");
   const t = getToken();
   return `/api/media/${kind}/${name}?token=${t}`;
+}
+
+// SPEC §3: ссылка на выгрузку конфигурации камер. Как и отчёты, файл
+// скачивается прямой ссылкой браузера, поэтому токен идёт в query string.
+export function camerasExportUrl(format: "csv" | "json", includeSecrets: boolean): string {
+  return `/api/cameras/export?format=${format}&include_secrets=${includeSecrets ? "1" : "0"}&token=${getToken()}`;
 }
 
 export function camSnapshotUrl(id: number): string {

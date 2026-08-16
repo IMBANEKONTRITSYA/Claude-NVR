@@ -29,7 +29,7 @@ FRONTEND_SRC = Path(__file__).resolve().parents[2] / "frontend" / "src"
 # api.ts целиком нельзя: там же лежат геттеры, у которых молчаливый отказ
 # не теряет действие оператора (страница просто останется пустой).
 MUTATING = re.compile(
-    r"\bapi\.(\w*(?:Put|Post|Delete|Patch|Add|Create|Update|Merge|Enhance|Apply|Bulk)\w*)\s*\(",
+    r"\bapi\.(\w*(?:Put|Post|Delete|Patch|Add|Create|Update|Merge|Enhance|Apply|Bulk|Import)\w*)\s*\(",
     re.IGNORECASE,
 )
 

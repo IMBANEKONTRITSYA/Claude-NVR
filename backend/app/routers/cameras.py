@@ -1,18 +1,28 @@
 import os
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func
 from ..config import settings
 from ..db import get_db
 from ..models import Camera, Setting
-from ..auth import require_role, get_current_user, get_user_from_query_token
+from ..auth import require_role, require_role_query, get_current_user, get_user_from_query_token
 from ..schemas import OnvifBulkAddRequest, OnvifDescribeRequest, CameraIn, CameraOut, OnvifProfilesRequest, OnvifStreamUriRequest, ROIIn, RtspTest
+from ..services import camera_config
 from ..services.encryption import encrypt, decrypt
 from ..services.pubsub import get_redis
 
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
+
+# Потолки импорта (SPEC §3, §16: масштаб объекта — 12–250+ камер).
+# 1000 строк с запасом перекрывают верх диапазона; ограничение нужно не
+# ради него, а чтобы разбор не стал способом занять память бэкенда
+# файлом на сотни мегабайт. 4 МБ — тот же запас по размеру: строка
+# конфигурации камеры это ~200 байт.
+MAX_IMPORT_ROWS = 1000
+MAX_IMPORT_BYTES = 4 * 1024 * 1024
 
 # Сколько камер разрешено держать в режиме analytics, если настройка не
 # задана. SPEC §1: «Аналитика ... только на N выбранных камерах (по
@@ -429,3 +439,216 @@ async def onvif_bulk_add(
     if added:
         await get_redis().publish("cameras:changed", "bulk")
     return {"added": added, "skipped": skipped, "failed": failed}
+
+
+@router.get("/export")
+async def export_cameras(
+    format: str = Query("csv", pattern="^(csv|json)$"),
+    include_secrets: bool = Query(False),
+    _=Depends(require_role_query("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Выгрузка конфигурации всех камер файлом (SPEC §3).
+
+    Ссылка открывается браузером напрямую, поэтому токен идёт в query
+    string, а роль сверяется с БД (`require_role_query`), как в отчётах:
+    разжалованный из админа не должен выгружать RTSP-учётки ещё 30 минут
+    до истечения access-токена.
+
+    По умолчанию пароли в RTSP-URL вырезаны — см. services/camera_config.
+    Выгрузка с `include_secrets=1` пишется в журнал аудита отдельным
+    действием, как и просмотр адреса одной камеры.
+    """
+    r = await db.execute(select(Camera).order_by(Camera.id))
+    rows = [
+        camera_config.camera_row(
+            c,
+            decrypt(c.rtsp_url_enc),
+            decrypt(c.sub_rtsp_url_enc) if c.sub_rtsp_url_enc else None,
+            include_secrets=include_secrets,
+        )
+        for c in r.scalars().all()
+    ]
+    if format == "json":
+        body, media, name = camera_config.rows_to_json(rows), "application/json", "cameras.json"
+    else:
+        body, media, name = camera_config.rows_to_csv(rows), "text/csv", "cameras.csv"
+    return Response(
+        content=body.encode("utf-8-sig" if format == "csv" else "utf-8"),
+        media_type=media,
+        headers={"Content-Disposition": f"attachment; filename={name}"},
+    )
+
+
+def _row_to_camera_in(row: dict, existing: Camera | None) -> CameraIn:
+    """Строка файла → провалидированный CameraIn.
+
+    Валидация RTSP-URL, режима и retention переиспользует ту же модель,
+    что и веб-форма: расхождение между «что примет форма» и «что примет
+    импорт» рано или поздно даёт камеру, которую воркер не сможет открыть.
+    """
+    name = str(row.get("name") or "").strip()
+    if not name:
+        raise ValueError("не заполнено поле name")
+
+    main = str(row.get("rtsp_url") or "").strip()
+    sub_raw = row.get("sub_rtsp_url")
+    sub = str(sub_raw).strip() if sub_raw is not None else ""
+
+    # `***` — «пароль вырезан выгрузкой»: для известной камеры значит
+    # «оставить сохранённый URL», для новой подставить его неоткуда.
+    if camera_config.is_masked(main) or (not main and existing):
+        if not existing:
+            raise ValueError(
+                "в поле rtsp_url пароль вырезан выгрузкой (***), а такой камеры ещё нет — "
+                "укажите полный RTSP-URL с паролем"
+            )
+        main = decrypt(existing.rtsp_url_enc)
+    if camera_config.is_masked(sub):
+        if not existing:
+            raise ValueError(
+                "в поле sub_rtsp_url пароль вырезан выгрузкой (***), а такой камеры ещё нет — "
+                "укажите полный RTSP-URL с паролем"
+            )
+        sub = decrypt(existing.sub_rtsp_url_enc) if existing.sub_rtsp_url_enc else ""
+
+    mode = str(row.get("mode") or (existing.mode if existing else "record_only")).strip() or "record_only"
+    try:
+        return CameraIn(
+            name=name,
+            rtsp_url=main,
+            sub_rtsp_url=sub or None,
+            location=str(row.get("location") or "").strip(),
+            enabled=camera_config.parse_bool(row.get("enabled"), True if existing is None else existing.enabled),
+            mode=mode,
+            motion_sensitivity=camera_config.parse_int(row.get("motion_sensitivity"), "motion_sensitivity"),
+            retention_days=camera_config.parse_int(row.get("retention_days"), "retention_days"),
+            onvif_enabled=camera_config.parse_bool(row.get("onvif_enabled"), False if existing is None else existing.onvif_enabled),
+            onvif_host=str(row.get("onvif_host") or "").strip() or None,
+            onvif_port=camera_config.parse_int(row.get("onvif_port"), "onvif_port"),
+            onvif_username=str(row.get("onvif_username") or "").strip() or None,
+        )
+    except ValidationError as e:
+        raise ValueError("; ".join(_pydantic_messages(e))) from None
+
+
+def _pydantic_messages(e: ValidationError) -> list[str]:
+    out = []
+    for err in e.errors():
+        field = ".".join(str(p) for p in err.get("loc", ())) or "?"
+        out.append(f"поле {field}: {err.get('msg')}")
+    return out
+
+
+@router.post("/import")
+async def import_cameras(
+    file: UploadFile = File(...),
+    dry_run: bool = Query(False),
+    _=Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Загрузка конфигурации камер из CSV/JSON (SPEC §3).
+
+    **Всё или ничего.** Если хоть одна строка не прошла проверку, не
+    применяется ни одна: наполовину загруженный файл на 200 камер хуже,
+    чем незагруженный, — оператор не знает, до какой строки дошло, а
+    повторная загрузка исправленного файла завела бы дубли. Ошибки
+    возвращаются списком с номерами строк, чтобы файл можно было
+    поправить целиком за один заход.
+
+    `dry_run=1` — проверка без записи: тот же разбор и те же ошибки, но
+    без изменений в БД.
+    """
+    content = await file.read()
+    if len(content) > MAX_IMPORT_BYTES:
+        raise HTTPException(413, f"файл больше {MAX_IMPORT_BYTES // 1024} КБ")
+    try:
+        raw_rows = camera_config.parse_file(content, file.filename or "")
+    except camera_config.ImportError_ as e:
+        raise HTTPException(400, str(e))
+    if not raw_rows:
+        raise HTTPException(400, "в файле нет ни одной камеры")
+    if len(raw_rows) > MAX_IMPORT_ROWS:
+        raise HTTPException(413, f"в файле больше {MAX_IMPORT_ROWS} камер")
+
+    existing = {c.name: c for c in (await db.execute(select(Camera).order_by(Camera.id))).scalars().all()}
+
+    errors: list[dict] = []
+    planned: list[tuple[str, CameraIn, Camera | None]] = []
+    seen: set[str] = set()
+    # Предел камер аналитики считается по итоговому состоянию всего файла,
+    # а не по каждой строке отдельно: файл может и снимать режим analytics
+    # с одних камер, и ставить на другие, и промежуточное состояние
+    # посреди разбора не имеет смысла.
+    analytics_after = {c.name for c in existing.values() if (c.mode or "record_only") == "analytics"}
+
+    for idx, row in enumerate(raw_rows, start=1):
+        name = str(row.get("name") or "").strip()
+        prior = existing.get(name)
+        try:
+            if name and name in seen:
+                raise ValueError(f"имя «{name}» встречается в файле дважды")
+            payload = _row_to_camera_in(row, prior)
+        except ValueError as e:
+            errors.append({"row": idx, "name": name, "error": str(e)})
+            continue
+        seen.add(name)
+        if payload.mode == "analytics":
+            analytics_after.add(name)
+        else:
+            analytics_after.discard(name)
+        planned.append(("update" if prior else "create", payload, prior))
+
+    limit = await _analytics_limit(db)
+    analytics_before = sum(1 for c in existing.values() if (c.mode or "record_only") == "analytics")
+    # Блокируется только импорт, который делает хуже. Если предел уже
+    # превышен (его понизили в настройках позже, чем расставили режимы),
+    # файл, который аналитики не добавляет, всё равно должен применяться —
+    # иначе система запирает сама себя: поправить конфигурацию файлом
+    # нельзя, пока конфигурация не поправлена.
+    if len(analytics_after) > limit and len(analytics_after) > analytics_before:
+        errors.append({
+            "row": 0,
+            "name": "",
+            "error": (
+                f"после импорта камер в режиме аналитики стало бы {len(analytics_after)} "
+                f"при пределе {limit} (настройка analytics_cameras_max)"
+            ),
+        })
+
+    created = sum(1 for a, _, _ in planned if a == "create")
+    updated = len(planned) - created
+    result = {
+        "ok": not errors,
+        "dry_run": dry_run,
+        "total": len(raw_rows),
+        "created": created if not errors else 0,
+        "updated": updated if not errors else 0,
+        "errors": errors,
+    }
+    if errors or dry_run:
+        if errors:
+            result["created"] = result["updated"] = 0
+        return result
+
+    for action, payload, prior in planned:
+        cam = prior if action == "update" else Camera(status="offline")
+        cam.name = payload.name
+        cam.rtsp_url_enc = encrypt(payload.rtsp_url)
+        cam.sub_rtsp_url_enc = encrypt(payload.sub_rtsp_url) if payload.sub_rtsp_url else None
+        cam.location = payload.location
+        cam.enabled = payload.enabled
+        cam.mode = payload.mode
+        cam.motion_sensitivity = payload.motion_sensitivity
+        cam.retention_days = payload.retention_days
+        cam.onvif_enabled = payload.onvif_enabled
+        cam.onvif_host = payload.onvif_host
+        cam.onvif_port = payload.onvif_port
+        cam.onvif_username = payload.onvif_username
+        if action == "create":
+            db.add(cam)
+    await db.commit()
+    # Один сигнал на весь файл: слой аналитики перечитывает список камер
+    # целиком, и 200 публикаций подряд ему ничего не добавляют.
+    await get_redis().publish("cameras:changed", "import")
+    return result
