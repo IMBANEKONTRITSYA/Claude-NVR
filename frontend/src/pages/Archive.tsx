@@ -6,8 +6,23 @@ export function Archive() {
   const [segs, setSegs] = useState<any[]>([]);
   const [f, setF] = useState({ camera_id: "", event_type: "", date_from: "", date_to: "", person_id: "" });
   const [sel, setSel] = useState<any | null>(null);
+  // Границы экспортируемого фрагмента (ТЗ §5). Держатся отдельно от
+  // фильтров поиска: оператор ищет по часам, а выгружает минуты.
+  const [exp, setExp] = useState({ from: "", to: "" });
 
   useEffect(() => { api.cameras().then(setCams); search(); }, []);
+
+  // Выбор сегмента подставляет его границы как начальное окно экспорта —
+  // дальше оператор сужает их до нужного события.
+  //
+  // Значения берутся из ответа API как есть и уходят обратно как есть, без
+  // преобразования часовых поясов: столбцы `video_segments` наивные и
+  // хранят UTC, и любой промежуточный `new Date()` сдвинул бы окно на
+  // смещение пояса браузера — выгрузился бы не тот отрезок.
+  useEffect(() => {
+    if (!sel) return;
+    setExp({ from: String(sel.started_at).slice(0, 19), to: String(sel.ended_at ?? "").slice(0, 19) });
+  }, [sel]);
 
   const search = async () => {
     const params: Record<string, string> = {};
@@ -16,6 +31,16 @@ export function Archive() {
   };
 
   const url = (id: number) => `/api/archive/file/${id}`;
+
+  const exportUrl = (cameraId: number, from: string, to: string) => {
+    const q = new URLSearchParams({
+      camera_id: String(cameraId),
+      date_from: from,
+      date_to: to,
+      token: getToken() ?? "",
+    });
+    return `/api/archive/export?${q}`;
+  };
 
   return (
     <div>
@@ -79,6 +104,43 @@ export function Archive() {
               <a className="btn" href={`${url(sel.id)}?token=${getToken()}`} download style={{ marginTop: 8, display: "inline-block" }}>
                 Скачать MP4
               </a>
+
+              {/* ТЗ §5 «экспорт фрагментов»: до этого архив умел отдавать
+                  только сегмент целиком, и событие на границе двух
+                  сегментов оператор склеивал вручную. Фрагмент собирается
+                  remux'ом поверх скольких угодно сегментов камеры. */}
+              <div style={{ marginTop: 16, borderTop: "1px solid #333", paddingTop: 12 }}>
+                <h4 style={{ margin: "0 0 8px" }}>Экспорт фрагмента</h4>
+                <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <div>
+                    <label>С</label>
+                    <input type="datetime-local" step="1" value={exp.from}
+                           onChange={e => setExp({ ...exp, from: e.target.value })} />
+                  </div>
+                  <div>
+                    <label>По</label>
+                    <input type="datetime-local" step="1" value={exp.to}
+                           onChange={e => setExp({ ...exp, to: e.target.value })} />
+                  </div>
+                </div>
+                <a className="btn"
+                   href={exportUrl(sel.camera_id, exp.from, exp.to)}
+                   download
+                   style={{
+                     marginTop: 8, display: "inline-block",
+                     // Пустые границы дали бы 422 от сервера; ссылка
+                     // гасится до запроса.
+                     pointerEvents: exp.from && exp.to ? undefined : "none",
+                     opacity: exp.from && exp.to ? 1 : 0.5,
+                   }}>
+                  Скачать фрагмент
+                </a>
+                <div className="empty" style={{ marginTop: 6, fontSize: 12 }}>
+                  Фрагмент склеивается из сегментов камеры без перекодирования,
+                  поэтому начало сдвигается к ближайшему опорному кадру —
+                  на 1–2 секунды раньше указанного.
+                </div>
+              </div>
             </>
           ) : <div className="empty">Выберите сегмент</div>}
         </div>
