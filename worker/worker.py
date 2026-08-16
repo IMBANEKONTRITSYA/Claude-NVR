@@ -125,6 +125,11 @@ IDLE_AFTER_SEC = 20
 # потока, а не на факт «сейчас offline» — см. record_status.newly_lost).
 _record_prev_status: dict[int, str] | None = None
 
+# Последняя причина недоступности Control API MediaMTX (None — доступен).
+# Хранится, чтобы, во-первых, не повторять одно и то же предупреждение
+# каждые 10 секунд, во-вторых — показать причину в «Мониторинге».
+_record_api_error: str | None = None
+
 # pool_size подобран под целевую нагрузку ТЗ: каждая из до 16 камер держит
 # свой поток с короткоживущими сессиями (load_cam_state, запись событий),
 # плюс сегментный транскод/рекластеризация в отдельных потоках — дефолтный
@@ -1396,13 +1401,29 @@ def publish_record_layer_status(cam_names) -> dict:
     """
     global _record_prev_status
 
+    global _record_api_error
+
     try:
         runtime = MediaMTXClient(MEDIAMTX_API_URL).runtime_paths()
-    except Exception:
+        _record_api_error = None
+    except Exception as exc:
         # Control API недоступен — это `unknown`, а не «120 камер offline»:
-        # см. пояснение в record_status.py. Ошибка логируется на debug, а не
-        # error: при рестарте MediaMTX она штатная и повторяется каждые 10 с.
-        logger.debug("Control API MediaMTX недоступен", exc_info=True)
+        # см. пояснение в record_status.py.
+        #
+        # Причина ОБЯЗАНА быть видимой. Пока она писалась на debug, отказ
+        # выглядел так: статусы камер молча замирали, интерфейс показывал
+        # всю стену офлайн, и в логах не было ни строчки — понять, что
+        # сломался именно Control API, было нечем. Уровень warning с
+        # подавлением повторов: сообщение повторяется раз в ~10 секунд,
+        # и без подавления оно заполнило бы журнал целиком.
+        reason = f"{type(exc).__name__}: {exc}"[:300]
+        if reason != _record_api_error:
+            logger.warning(
+                "Control API MediaMTX недоступен — статусы потоков записи "
+                "неизвестны, синхронизация путей не идёт",
+                extra={"url": MEDIAMTX_API_URL, "reason": reason},
+            )
+        _record_api_error = reason
         runtime = None
 
     states = stream_states(cam_names, runtime)
@@ -1464,6 +1485,10 @@ def publish_record_layer_status(cam_names) -> dict:
                # Состояние слоя аналитики едет здесь же: у него уже есть
                # читатель и TTL. Отдельный ключ ради двух полей означал бы
                # второй запрос из бэкенда на каждый показ страницы.
+               # Причина, по которой статусы потоков неизвестны. Без неё
+               # интерфейс показывал бы «неизвестно» на всех камерах без
+               # единого намёка, куда смотреть.
+               "control_api_error": _record_api_error,
                "analytics": {"model_ready": FACE_APP is not None,
                              "model": CONFIG["face_model"],
                              "error": MODEL_ERROR}}

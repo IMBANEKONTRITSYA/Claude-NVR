@@ -187,7 +187,7 @@ async def record_layer_status(_=Depends(require_role("admin", "operator")),
             "segments_last_day": segments_day,
             "gb_last_day": round(bytes_day / BYTES_PER_GB, 2),
             "streams": [], "summary": None, "segment_gaps": [],
-            "analytics": None,
+            "analytics": None, "control_api_error": None,
         }
 
     return {
@@ -203,6 +203,7 @@ async def record_layer_status(_=Depends(require_role("admin", "operator")),
         # воркер (SPEC §2), поэтому его надо где-то показать — иначе
         # «распознавание молчит» неотличимо от «в кадре никого нет».
         "analytics": payload.get("analytics"),
+        "control_api_error": payload.get("control_api_error"),
     }
 
 
