@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, camerasExportUrl } from "../api";
 import { useUI } from "../ui";
 
 const EMPTY_FORM = {
@@ -27,7 +27,12 @@ export function Cameras() {
   const [bulkResult, setBulkResult] = useState<any | null>(null);
   const [loadingProfiles, setLoadingProfiles] = useState(false);
   const [profiles, setProfiles] = useState<any[] | null>(null);
-  const [tab, setTab] = useState<"form" | "scan">("form");
+  const [tab, setTab] = useState<"form" | "scan" | "io">("form");
+  // SPEC §3: импорт/экспорт конфигурации камер
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<any | null>(null);
+  const [exportSecrets, setExportSecrets] = useState(false);
   const [filter, setFilter] = useState("");
   // Учётные данные для поиска в сети — свои, а не из формы камеры. Раньше
   // массовое добавление брало логин и пароль из полей редактируемой камеры,
@@ -179,6 +184,28 @@ export function Cameras() {
     } catch (e: any) { toast(e.message, "err"); }
   };
 
+  // SPEC §3: импорт конфигурации. Загрузка идёт в два шага — сначала
+  // проверка (dry_run), и только по её итогу оператор подтверждает запись.
+  // Файл на 200 камер, применённый вслепую, разом переписывает весь парк,
+  // а показать, что именно изменится, стоит одного запроса.
+  const runImport = async (f: File, dryRun: boolean) => {
+    setImporting(true);
+    try {
+      const r = await api.camerasImport(f, dryRun);
+      setImportResult({ ...r, filename: f.name });
+      if (!r.ok) toast(`Файл не принят: ошибок ${r.errors.length}`, "err");
+      else if (dryRun) toast(`Проверка пройдена: добавится ${r.created}, обновится ${r.updated}`, "ok");
+      else {
+        toast(`Импорт применён: добавлено ${r.created}, обновлено ${r.updated}`, "ok");
+        setImportFile(null);
+        load();
+      }
+    } catch (e: any) {
+      setImportResult(null);
+      toast(e.message, "err");
+    } finally { setImporting(false); }
+  };
+
   const shown = filter.trim()
     ? cams.filter(c => `${c.id} ${c.name} ${c.location}`.toLowerCase().includes(filter.trim().toLowerCase()))
     : cams;
@@ -196,6 +223,9 @@ export function Cameras() {
         </button>
         <button className={tab === "scan" ? "active" : ""} onClick={() => setTab("scan")}>
           Поиск камер в сети (ONVIF)
+        </button>
+        <button className={tab === "io" ? "active" : ""} onClick={() => setTab("io")}>
+          Импорт / экспорт
         </button>
       </div>
 
@@ -438,6 +468,73 @@ export function Cameras() {
                   </div>
                 )}
               </div>
+            )}
+          </div>
+        )}
+      </div>
+      )}
+
+      {/* SPEC §3: импорт/экспорт конфигурации камер (CSV/JSON). Ради этого
+          объект на 250 камер переносится с тестового стенда на боевой
+          сервер файлом, а не двумя сотнями заполнений формы. */}
+      {tab === "io" && (
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>Экспорт конфигурации</h3>
+        <p className="muted" style={{ marginTop: 0 }}>
+          Выгружаются все {cams.length} камер: имя, локация, режим, RTSP-адреса,
+          глубина хранения, параметры ONVIF. Пароли в RTSP-адресах по умолчанию
+          заменены на <code>***</code> — такой файл безопасно передавать и хранить,
+          а при загрузке обратно пароль уже заведённой камеры сохраняется.
+        </p>
+        <label className="row" style={{ gap: 6, marginBottom: 10 }}>
+          <input type="checkbox" checked={exportSecrets}
+            onChange={e => setExportSecrets(e.target.checked)} />
+          <span>Выгрузить пароли камер открытым текстом (действие пишется в журнал аудита)</span>
+        </label>
+        <div className="row">
+          <a className="btn" href={camerasExportUrl("csv", exportSecrets)}>Скачать CSV</a>
+          <a className="btn secondary" href={camerasExportUrl("json", exportSecrets)}>Скачать JSON</a>
+        </div>
+
+        <h3 style={{ marginTop: 24 }}>Импорт конфигурации</h3>
+        <p className="muted" style={{ marginTop: 0 }}>
+          Принимается CSV или JSON того же формата. Камера опознаётся по полю
+          <code> name</code>: известное имя — обновление, новое — добавление.
+          Файл применяется целиком: если хоть в одной строке ошибка, не
+          применяется ни одна.
+        </p>
+        <div className="row">
+          <input type="file" accept=".csv,.json,text/csv,application/json"
+            onChange={e => { setImportFile(e.target.files?.[0] || null); setImportResult(null); }} />
+          <button className="btn secondary" disabled={!importFile || importing}
+            onClick={() => importFile && runImport(importFile, true)}>
+            {importing ? "Проверка…" : "Проверить файл"}
+          </button>
+          <button className="btn" disabled={!importFile || importing}
+            onClick={async () => {
+              if (!importFile) return;
+              if (!(await confirm("Применить конфигурацию из файла? Существующие камеры с совпадающими именами будут перезаписаны."))) return;
+              runImport(importFile, false);
+            }}>
+            Применить
+          </button>
+        </div>
+        {importResult && (
+          <div style={{ marginTop: 12, fontSize: 13 }}>
+            <div className={importResult.ok ? "" : "muted"}>
+              Файл <strong>{importResult.filename}</strong>: строк {importResult.total},
+              {" "}добавить {importResult.created}, обновить {importResult.updated}
+              {importResult.dry_run ? " (проверка, изменения не применены)" : ""}
+            </div>
+            {importResult.errors?.length > 0 && (
+              <ul style={{ color: "var(--red)", marginBottom: 0 }}>
+                {importResult.errors.map((e: any, i: number) => (
+                  <li key={i}>
+                    {e.row ? `строка ${e.row}` : "файл"}
+                    {e.name ? ` (${e.name})` : ""}: {e.error}
+                  </li>
+                ))}
+              </ul>
             )}
           </div>
         )}

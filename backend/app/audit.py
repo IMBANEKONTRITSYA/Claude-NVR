@@ -49,6 +49,11 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/api/cameras/onvif/stream-uri"): "Получен RTSP-адрес камеры по ONVIF",
     ("POST", "/api/cameras/onvif/describe"): "Диагностический дамп ONVIF-ответов камеры",
     ("POST", "/api/cameras/onvif/bulk-add"): "Массовое добавление камер (ONVIF)",
+    # SPEC §3, импорт/экспорт конфигурации. Импорт меняет разом весь парк
+    # камер, выгрузка с include_secrets=1 раздаёт RTSP-учётки файлом —
+    # оба действия журналируются наравне с просмотром адреса одной камеры.
+    ("POST", "/api/cameras/import"): "Импорт конфигурации камер из файла",
+    ("GET", "/api/cameras/export"): "Выгрузка конфигурации камер",
     # --- пользователи ---
     ("POST", "/api/users"): "Создан пользователь",
     ("DELETE", "/api/users/{user_id}"): "Удалён пользователь",
