@@ -239,6 +239,12 @@ def get_profiles(
             continue
         name_elem = _find_one(p, "Name")
         name = (name_elem.text or "").strip() if name_elem is not None else None
+        # Наличие PTZConfiguration в профиле — единственный признак, по
+        # которому можно узнать, что камера поворотная, не делая отдельного
+        # запроса к PTZ-сервису. Он же отвечает на второй вопрос: PTZ-команды
+        # принимает не любой профиль камеры, а только тот, к которому
+        # привязана PTZ-конфигурация (см. select_ptz_profile ниже).
+        has_ptz = _find_one(p, "PTZConfiguration") is not None
         # Разрешение из VideoEncoderConfiguration — по нему выбирается, какой
         # профиль основной, а какой субпоток (ТЗ 18.1: детекция идёт на
         # низкоразрешающем субпотоке). Выбирать по порядку в списке ненадёжно:
@@ -252,7 +258,8 @@ def get_profiles(
                 height = int((h_elem.text or "").strip()) if h_elem is not None else None
             except ValueError:
                 width = height = None
-        profiles.append({"token": token, "name": name or token, "width": width, "height": height})
+        profiles.append({"token": token, "name": name or token, "width": width,
+                         "height": height, "ptz": has_ptz})
     return profiles
 
 
@@ -754,6 +761,184 @@ def scan_subnet(
                 # найденный, порядок targets детерминирован (порты по возрастанию).
                 found.setdefault(device["host"], device)
     return list(found.values())
+
+
+_PTZ_NS = "http://www.onvif.org/ver20/ptz/wsdl"
+
+# Сколько камера крутится, если команда «стоп» не дошла. SPEC §4 требует
+# PTZ-управление, но самое опасное в нём — не отказ повернуться, а поворот,
+# который не прекращается: оператор зажал стрелку, вкладка браузера умерла
+# (или порвалась сеть между сервером и камерой), и купол уезжает в потолок,
+# а точка остаётся без обзора до ручного вмешательства. ONVIF предусматривает
+# на этот случай Timeout прямо в ContinuousMove — камера сама останавливается,
+# если новой команды не пришло. Это делает Stop оптимизацией отзывчивости, а
+# не единственным способом остановиться.
+#
+# 2 секунды: заметно дольше интервала повторной отправки при удержании
+# кнопки (фронтенд шлёт move каждые 500 мс, см. LiveGrid), поэтому
+# непрерывное движение не дёргается, и достаточно коротко, чтобы «зависший»
+# поворот измерялся секундами, а не минутами.
+PTZ_MOVE_TIMEOUT_SEC = 2
+
+# Диапазон нормализованных скоростей ONVIF (generic velocity space).
+PTZ_VELOCITY_MIN = -1.0
+PTZ_VELOCITY_MAX = 1.0
+
+
+def clamp_velocity(value: float) -> float:
+    """Приводит скорость к нормализованному диапазону ONVIF [-1, 1].
+
+    Камеры реагируют на выход за диапазон по-разному: одни отвечают SOAP-
+    ошибкой, другие молча берут максимум, третьи — интерпретируют значение по
+    модулю и уезжают в противоположную сторону. Ограничение на нашей стороне
+    делает поведение одинаковым для всех, а вместе с валидацией в API
+    (Field(ge=-1, le=1)) закрывает вопрос «что придёт с фронтенда».
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if v != v:  # NaN: float("nan") проходит проверки на диапазон, но не сравнения
+        return 0.0
+    return max(PTZ_VELOCITY_MIN, min(PTZ_VELOCITY_MAX, v))
+
+
+def select_ptz_profile(profiles: list[dict]) -> dict | None:
+    """Профиль, к которому привязана PTZ-конфигурация.
+
+    Брать первый профиль подряд нельзя: на большинстве прошивок
+    PTZConfiguration есть только у основного профиля, а субпоток (который в
+    списке может идти первым) PTZ-команд не принимает и отвечает
+    `NoConfig`/`InvalidArgVal`. Отсутствие такого профиля означает, что
+    камера не поворотная, — это не ошибка, а штатный ответ для купола или
+    фиксированной камеры (SPEC §4: «PTZ-управление (если поддерживается
+    камерой)»).
+    """
+    for p in profiles or []:
+        if p.get("ptz"):
+            return p
+    return None
+
+
+def _ptz_url(host: str, port: int) -> str:
+    return f"http://{host}:{port}/onvif/PTZ"
+
+
+def continuous_move(
+    host: str, port: int, profile_token: str,
+    pan: float = 0.0, tilt: float = 0.0, zoom: float = 0.0,
+    username: str | None = None, password: str | None = None,
+    move_timeout_sec: int = PTZ_MOVE_TIMEOUT_SEC, timeout: float = 5.0,
+) -> None:
+    """ContinuousMove: поворот с заданной скоростью до команды Stop либо до
+    истечения move_timeout_sec (см. PTZ_MOVE_TIMEOUT_SEC — страховка от
+    бесконечного поворота при потере связи).
+
+    PanTilt и Zoom — в namespace схемы (tt), а не PTZ-сервиса: это разные
+    namespace в одном запросе, и прошивки, требующие соответствия WSDL,
+    отвергают запрос, где Velocity собрана целиком в ptz-namespace.
+    """
+    body = (
+        f'<ContinuousMove xmlns="{_PTZ_NS}">'
+        f"<ProfileToken>{_xml_escape(profile_token)}</ProfileToken>"
+        "<Velocity>"
+        f'<PanTilt xmlns="{_SCHEMA_NS}" x="{clamp_velocity(pan):.3f}" y="{clamp_velocity(tilt):.3f}"/>'
+        f'<Zoom xmlns="{_SCHEMA_NS}" x="{clamp_velocity(zoom):.3f}"/>'
+        "</Velocity>"
+        f"<Timeout>PT{int(move_timeout_sec)}S</Timeout>"
+        "</ContinuousMove>"
+    )
+    _post(_ptz_url(host, port), _soap_envelope(body, username, password), timeout)
+
+
+def ptz_stop(
+    host: str, port: int, profile_token: str,
+    username: str | None = None, password: str | None = None, timeout: float = 5.0,
+) -> None:
+    """Stop: останавливает и поворот, и зум одной командой.
+
+    Оба флага всегда true: раздельная остановка нужна там, где зум и поворот
+    задаются независимыми органами управления, а в веб-интерфейсе кнопку
+    отпускают целиком.
+    """
+    body = (
+        f'<Stop xmlns="{_PTZ_NS}">'
+        f"<ProfileToken>{_xml_escape(profile_token)}</ProfileToken>"
+        "<PanTilt>true</PanTilt><Zoom>true</Zoom>"
+        "</Stop>"
+    )
+    _post(_ptz_url(host, port), _soap_envelope(body, username, password), timeout)
+
+
+def get_presets(
+    host: str, port: int, profile_token: str,
+    username: str | None = None, password: str | None = None, timeout: float = 5.0,
+) -> list[dict]:
+    """GetPresets: сохранённые позиции камеры ({token, name}).
+
+    Пресеты — половина смысла PTZ на объекте: оператор не наводится вручную
+    каждый раз, а прыгает на «Ворота», «Касса», «Парковка».
+    """
+    body = (
+        f'<GetPresets xmlns="{_PTZ_NS}">'
+        f"<ProfileToken>{_xml_escape(profile_token)}</ProfileToken>"
+        "</GetPresets>"
+    )
+    raw = _post(_ptz_url(host, port), _soap_envelope(body, username, password), timeout)
+    try:
+        root = ET.fromstring(raw)
+    except (ET.ParseError, DefusedXmlException) as e:
+        raise OnvifError(f"невалидный XML в ответе GetPresets: {e}") from e
+    presets = []
+    for p in _find_all(root, "Preset"):
+        token = p.attrib.get("token")
+        if not token:
+            continue
+        name_elem = _find_one(p, "Name")
+        name = (name_elem.text or "").strip() if name_elem is not None else ""
+        presets.append({"token": token, "name": name or token})
+    return presets
+
+
+def goto_preset(
+    host: str, port: int, profile_token: str, preset_token: str,
+    username: str | None = None, password: str | None = None, timeout: float = 5.0,
+) -> None:
+    """GotoPreset: наводит камеру на сохранённую позицию."""
+    body = (
+        f'<GotoPreset xmlns="{_PTZ_NS}">'
+        f"<ProfileToken>{_xml_escape(profile_token)}</ProfileToken>"
+        f"<PresetToken>{_xml_escape(preset_token)}</PresetToken>"
+        "</GotoPreset>"
+    )
+    _post(_ptz_url(host, port), _soap_envelope(body, username, password), timeout)
+
+
+def set_preset(
+    host: str, port: int, profile_token: str, name: str,
+    username: str | None = None, password: str | None = None, timeout: float = 5.0,
+) -> str | None:
+    """SetPreset: запоминает текущее положение камеры под именем.
+
+    Возвращает присвоенный камерой токен пресета (прошивки нумеруют их сами)
+    или None, если ответ его не содержит, — сама позиция при этом сохранена,
+    и следующий GetPresets её покажет.
+    """
+    body = (
+        f'<SetPreset xmlns="{_PTZ_NS}">'
+        f"<ProfileToken>{_xml_escape(profile_token)}</ProfileToken>"
+        f"<PresetName>{_xml_escape(name)}</PresetName>"
+        "</SetPreset>"
+    )
+    raw = _post(_ptz_url(host, port), _soap_envelope(body, username, password), timeout)
+    try:
+        root = ET.fromstring(raw)
+    except (ET.ParseError, DefusedXmlException) as e:
+        raise OnvifError(f"невалидный XML в ответе SetPreset: {e}") from e
+    token_elem = _find_one(root, "PresetToken")
+    if token_elem is None or not (token_elem.text or "").strip():
+        return None
+    return token_elem.text.strip()
 
 
 def is_motion_event(topic: str | None, state: str | None = None) -> bool:

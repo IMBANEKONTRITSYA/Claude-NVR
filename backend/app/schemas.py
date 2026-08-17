@@ -236,6 +236,34 @@ class OnvifBulkAddRequest(BaseModel):
     onvif_enabled: bool = True
 
 
+class PtzMoveIn(BaseModel):
+    """Скорости поворота и зума в нормализованном пространстве ONVIF.
+
+    Границы проверяются здесь, а не только в воркере: значение вне [-1, 1]
+    часть прошивок трактует по модулю и уводит камеру в сторону,
+    противоположную нажатой стрелке, а `nan`/`inf` из JSON вообще не имеют
+    смысла как скорость. Отказ на границе API дешевле, чем разбирательство,
+    почему купол уехал.
+    """
+    pan: float = Field(0.0, ge=-1.0, le=1.0, allow_inf_nan=False)
+    tilt: float = Field(0.0, ge=-1.0, le=1.0, allow_inf_nan=False)
+    zoom: float = Field(0.0, ge=-1.0, le=1.0, allow_inf_nan=False)
+    # Токен PTZ-профиля, полученный из GET /api/cameras/{id}/ptz. Без него
+    # воркер резолвит профиль сам — лишний GetProfiles на каждую команду,
+    # поэтому интерфейс его передаёт.
+    profile_token: str | None = None
+
+
+class PtzPresetGotoIn(BaseModel):
+    preset_token: str = Field(min_length=1, max_length=128)
+    profile_token: str | None = None
+
+
+class PtzPresetSaveIn(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    profile_token: str | None = None
+
+
 class ROIIn(BaseModel):
     polygons: list[list[list[float]]]
 

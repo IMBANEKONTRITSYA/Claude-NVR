@@ -146,3 +146,18 @@ table tbody tr { border-top: 1px solid var(--border); }
 table tbody tr:hover { background: var(--bg2); }
 .table-scroll { max-height: 60vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
 .btn.sm { padding: 3px 9px; font-size: 12px; }
+
+/* Пульт PTZ (SPEC §4). Показывается под развёрнутой камерой. */
+.ptz-pad { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap;
+           margin-top: 12px; padding: 12px; border: 1px solid var(--border);
+           border-radius: 8px; background: var(--panel); }
+.ptz-grid { display: grid; grid-template-columns: repeat(3, 36px); gap: 4px; }
+.ptz-center { display: block; }
+/* touch-action: none — иначе на планшете удержание стрелки прокручивает
+   страницу вместо поворота камеры, а pointerup приходит как pointercancel.
+   user-select: none — двойное нажатие подряд выделяло бы символ стрелки. */
+.ptz-btn { width: 36px; height: 36px; padding: 0; font-size: 16px; line-height: 1;
+           touch-action: none; user-select: none; }
+.ptz-zoom { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.ptz-presets { display: flex; align-items: center; gap: 8px; }
+.ptz-error { flex-basis: 100%; color: var(--orange); font-size: 13px; }

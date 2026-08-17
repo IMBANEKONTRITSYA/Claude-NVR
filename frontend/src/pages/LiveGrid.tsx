@@ -1,16 +1,157 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Hls from "hls.js";
-import { api, camSnapshotUrl } from "../api";
+import { api, camSnapshotUrl, getRole } from "../api";
 import { useWebSocket } from "../useWebSocket";
 import { Pager } from "../Pager";
 import {
   DEFAULT_LAYOUT, LAYOUTS, Layout, MIN_ZOOM, Pan,
   applyZoom, clampPage, clampPan, gridColumns, isLayout, pageSlice, zoomTransform,
 } from "../liveLayout";
+import { PtzHold, PtzVector } from "../ptz";
 
 type Box = { id: number; name: string; is_known: boolean; x: number; y: number; w: number; h: number; ts: number };
+type Preset = { token: string; name: string };
 
 const LAYOUT_KEY = "fw_live_layout";
+
+// Скорость поворота и зума. Не максимум: на 1.0 купол проскакивает точку
+// мимо, и оператор ловит её несколькими нажатиями туда-обратно.
+const PTZ_SPEED = 0.6;
+const PTZ_ZOOM_SPEED = 0.5;
+
+const PTZ_BUTTONS: { label: string; title: string; v: PtzVector }[] = [
+  { label: "↖", title: "Влево-вверх", v: { pan: -PTZ_SPEED, tilt: PTZ_SPEED } },
+  { label: "↑", title: "Вверх", v: { tilt: PTZ_SPEED } },
+  { label: "↗", title: "Вправо-вверх", v: { pan: PTZ_SPEED, tilt: PTZ_SPEED } },
+  { label: "←", title: "Влево", v: { pan: -PTZ_SPEED } },
+  { label: "·", title: "", v: {} },
+  { label: "→", title: "Вправо", v: { pan: PTZ_SPEED } },
+  { label: "↙", title: "Влево-вниз", v: { pan: -PTZ_SPEED, tilt: -PTZ_SPEED } },
+  { label: "↓", title: "Вниз", v: { tilt: -PTZ_SPEED } },
+  { label: "↘", title: "Вправо-вниз", v: { pan: PTZ_SPEED, tilt: -PTZ_SPEED } },
+];
+
+/** Пульт PTZ развёрнутой камеры (SPEC §4).
+ *
+ * Только для развёрнутой камеры, а не для каждой плитки мозаики: в сетке
+ * 4×4 пульт негде разместить, и, что важнее, случайное нажатие увело бы
+ * камеру, на которую оператор в этот момент даже не смотрит. */
+function PtzPad({ camId }: { camId: number }) {
+  const [supported, setSupported] = useState<boolean | null>(null);
+  const [presets, setPresets] = useState<Preset[]>([]);
+  const [profileToken, setProfileToken] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const holdRef = useRef<PtzHold | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    setSupported(null);
+    setError(null);
+    api.camPtz(camId)
+      .then((r: any) => {
+        if (!alive) return;
+        setSupported(!!r.supported);
+        setPresets(r.presets || []);
+        setProfileToken(r.profile_token ?? null);
+        if (r.error) setError(r.error);
+      })
+      .catch(() => { if (alive) setSupported(false); });
+    return () => { alive = false; };
+  }, [camId]);
+
+  // Контроллер удержания пересоздаётся вместе с камерой и обязательно
+  // останавливает её при размонтировании: свернуть камеру в мозаику, не
+  // отпустив стрелку, — самый простой способ оставить купол в движении.
+  useEffect(() => {
+    const hold = new PtzHold({
+      move: v => api.camPtzMove(camId, { ...v, profile_token: profileToken }),
+      stop: () => api.camPtzStop(camId, profileToken),
+      onError: (e: any) => setError(e?.message || "Камера не приняла команду"),
+    });
+    holdRef.current = hold;
+    return () => { hold.dispose(); holdRef.current = null; };
+  }, [camId, profileToken]);
+
+  // Отпускание кнопки вне её границ (курсор увели с пульта и отпустили над
+  // видео или вообще за окном) до слушателя на самой кнопке не доходит —
+  // pointerup ловится на окне.
+  useEffect(() => {
+    const stop = () => holdRef.current?.end();
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+    window.addEventListener("blur", stop);
+    return () => {
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      window.removeEventListener("blur", stop);
+    };
+  }, []);
+
+  if (supported === null) return <div className="ptz-pad muted">Проверка PTZ…</div>;
+  if (!supported) return null;
+
+  const goto = async (token: string) => {
+    setBusy(true);
+    try {
+      await api.camPtzGoto(camId, token, profileToken);
+      setError(null);
+    } catch (e: any) {
+      setError(e?.message || "Не удалось перейти на позицию");
+    } finally { setBusy(false); }
+  };
+
+  const savePreset = async () => {
+    const name = window.prompt("Название позиции");
+    if (!name?.trim()) return;
+    setBusy(true);
+    try {
+      const r: any = await api.camPtzSavePreset(camId, name.trim(), profileToken);
+      setPresets(r.presets || []);
+      setError(null);
+    } catch (e: any) {
+      setError(e?.message || "Не удалось сохранить позицию");
+    } finally { setBusy(false); }
+  };
+
+  // Нажатие останавливает всплытие: плитка под пультом разворачивает камеру
+  // по клику и уходит в полноэкранный режим по двойному, а пультом кликают
+  // часто и подряд.
+  const holdProps = (v: PtzVector) => ({
+    onPointerDown: (e: React.PointerEvent) => { e.stopPropagation(); holdRef.current?.start(v); },
+    onPointerUp: (e: React.PointerEvent) => { e.stopPropagation(); holdRef.current?.end(); },
+    onPointerLeave: () => holdRef.current?.end(),
+    onClick: (e: React.MouseEvent) => e.stopPropagation(),
+    onDoubleClick: (e: React.MouseEvent) => e.stopPropagation(),
+  });
+
+  return (
+    <div className="ptz-pad" onClick={e => e.stopPropagation()}>
+      <div className="ptz-grid">
+        {PTZ_BUTTONS.map((b, i) => (
+          b.title
+            ? <button key={i} className="btn sm secondary ptz-btn" title={b.title} {...holdProps(b.v)}>{b.label}</button>
+            : <span key={i} className="ptz-center" />
+        ))}
+      </div>
+      <div className="ptz-zoom">
+        <button className="btn sm secondary ptz-btn" title="Приблизить" {...holdProps({ zoom: PTZ_ZOOM_SPEED })}>+</button>
+        <span className="muted">зум</span>
+        <button className="btn sm secondary ptz-btn" title="Отдалить" {...holdProps({ zoom: -PTZ_ZOOM_SPEED })}>−</button>
+      </div>
+      <div className="ptz-presets">
+        <select disabled={busy || presets.length === 0} value=""
+          onChange={e => { if (e.target.value) goto(e.target.value); }}>
+          <option value="">{presets.length ? "Позиция…" : "Позиций нет"}</option>
+          {presets.map(p => <option key={p.token} value={p.token}>{p.name}</option>)}
+        </select>
+        <button className="btn sm secondary" disabled={busy} onClick={savePreset}
+          title="Запомнить текущее положение камеры">Запомнить</button>
+      </div>
+      {error && <div className="ptz-error">{error}</div>}
+    </div>
+  );
+}
 
 function CameraTile({ cam, boxes, onClick }: any) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -203,6 +344,9 @@ export function LiveGrid() {
   });
   const [page, setPage] = useState(1);
   const [filter, setFilter] = useState("");
+  // §18: наблюдателю матрица прав оставляет только просмотр — поворот камеры
+  // меняет обзор для всех остальных операторов, а не только его картинку.
+  const canPtz = ["admin", "operator"].includes(getRole());
 
   useEffect(() => { localStorage.setItem(LAYOUT_KEY, String(layout)); }, [layout]);
 
@@ -293,6 +437,13 @@ export function LiveGrid() {
           <div className="empty">{cams.length === 0 ? "Камеры не добавлены" : "Нет камер по фильтру"}</div>
         )}
       </div>
+      {/* Пульт PTZ — только у развёрнутой камеры и только для ролей, которым
+          разрешено ею управлять. Кнопка, спрятанная от наблюдателя, не
+          заменяет проверку роли на сервере (она есть в require_role), но
+          показывать орган управления тому, кто получит на него 403, —
+          отдельный вид неудобства. Камера без ONVIF PTZ не поддерживает
+          физически: сам пульт ещё и спрашивает камеру, поворотная ли она. */}
+      {single && single.has_onvif && canPtz && <PtzPad camId={single.id} />}
       {/* Пагинация, а не бесконечная стена: на объекте из 250 камер (§1)
           одновременно живут максимум 16 HLS-плееров. */}
       {!single && (

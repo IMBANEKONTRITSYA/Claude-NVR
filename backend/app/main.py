@@ -3,7 +3,8 @@ import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi import HTTPException
 from sqlalchemy import func, select, text
 from .db import engine, Base, SessionLocal
@@ -228,6 +229,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(AuditMiddleware)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request, exc: RequestValidationError):
+    """Ответ 422 без эхо присланного значения.
+
+    Обработчик FastAPI по умолчанию вкладывает в тело ответа поля `input`
+    (то, что прислал клиент) и `ctx`. Отсюда две неприятности, вторая
+    обнаружилась вместе с первыми float-полями в API (PTZ, SPEC §4):
+
+    1. **500 вместо 422.** `Infinity`/`NaN` в теле запроса `json.loads`
+       принимает, поле их отвергает (`allow_inf_nan=False`) — а вот
+       сериализовать их обратно в JSON-ответ уже нельзя: `json.dumps`
+       по стандарту JSON отказывается, и обработка запроса падает
+       внутренней ошибкой. То есть валидация срабатывала, но клиент
+       получал 500.
+    2. **Эхо присланного.** Значение, не прошедшее валидацию, возвращалось
+       клиенту обратно — для полей, куда попадают учётные данные камеры,
+       это лишнее содержимое в ответе и в логах.
+
+    Остаются `loc`, `msg` и `type`: их достаточно, чтобы форма показала, что
+    именно не так с каким полем, и все они по определению JSON-безопасны.
+    """
+    return JSONResponse(
+        status_code=422,
+        content={"detail": [
+            {"loc": list(e.get("loc", ())), "msg": e.get("msg", ""), "type": e.get("type", "")}
+            for e in exc.errors()
+        ]},
+    )
 
 app.include_router(r_auth.router)
 app.include_router(r_users.router)

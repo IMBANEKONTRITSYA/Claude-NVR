@@ -11,17 +11,23 @@ Runtime — слишком тяжело для CI"), а этот — тольк�
 (чистый stdlib), поэтому тестируется в CI TestClient'ом без полного стека
 воркера, отдельно от /embed, который тестами не покрыт по той же причине."""
 from fastapi import APIRouter, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from onvif_client import (
+    continuous_move,
     discover_devices,
     get_device_information,
     get_osd_texts,
+    get_presets,
     get_profiles,
     get_snapshot_uri,
     get_stream_uri,
+    goto_preset,
+    ptz_stop,
+    select_ptz_profile,
     select_stream_profiles,
+    set_preset,
     inject_credentials,
     scan_subnet,
     suggest_camera_name,
@@ -200,3 +206,159 @@ async def onvif_describe(payload: OnvifDescribeRequest):
         "main_profile_token": main_profile["token"],
         "profiles": profiles,
     }
+
+
+# --- PTZ (SPEC §4: «PTZ-управление (если поддерживается камерой)») ---------
+#
+# Токен PTZ-профиля резолвится через GetProfiles и возвращается клиенту в
+# /onvif/ptz/capabilities, а тот присылает его обратно с каждой командой.
+# Кэша здесь нет намеренно: воркер держит по камере уже достаточно
+# состояния, а кэш профилей пришлось бы инвалидировать при смене учётных
+# данных и при перенастройке камеры. Цена решения — один лишний GetProfiles
+# на команду, пришедшую без токена (клиент, не запросивший capabilities);
+# при нормальной работе интерфейса таких нет.
+
+
+class OnvifPtzRequest(OnvifCredentials):
+    """Профиль необязателен: без него команда сама найдёт PTZ-профиль
+    камеры. Так одиночная команда (например, из скрипта) работает без
+    предварительного запроса capabilities."""
+    profile_token: str | None = None
+
+
+class OnvifPtzMoveRequest(OnvifPtzRequest):
+    # Границы — не декоративная валидация: скорость вне [-1, 1] на части
+    # прошивок трактуется по модулю, и камера уезжает в сторону,
+    # противоположную нажатой стрелке.
+    pan: float = Field(0.0, ge=-1.0, le=1.0)
+    tilt: float = Field(0.0, ge=-1.0, le=1.0)
+    zoom: float = Field(0.0, ge=-1.0, le=1.0)
+
+
+class OnvifPtzPresetRequest(OnvifPtzRequest):
+    preset_token: str
+
+
+class OnvifPtzSavePresetRequest(OnvifPtzRequest):
+    name: str = Field(min_length=1, max_length=64)
+
+
+def _resolve_ptz_profile(payload: OnvifPtzRequest) -> str:
+    """Токен PTZ-профиля: присланный клиентом либо найденный по GetProfiles."""
+    if payload.profile_token:
+        return payload.profile_token
+    profiles = get_profiles(payload.host, payload.port, payload.username, payload.password)
+    profile = select_ptz_profile(profiles)
+    if profile is None:
+        raise OnvifError("камера не сообщила ни одного профиля с PTZ-конфигурацией")
+    return profile["token"]
+
+
+@router.post("/onvif/ptz/capabilities")
+async def onvif_ptz_capabilities(payload: OnvifCredentials):
+    """Поворотная ли камера, и если да — её пресеты.
+
+    `ok: True, supported: False` — нормальный ответ для фиксированной камеры,
+    а не ошибка: интерфейс по нему просто не показывает пульт. Ошибкой
+    (`ok: False`) остаётся недоступность самой камеры.
+
+    Пресеты запрашиваются здесь же, одним походом: интерфейсу они нужны
+    ровно тогда же, когда и сам факт поддержки PTZ. Их отсутствие не делает
+    камеру неповоротной — GetPresets поддерживают не все прошивки.
+    """
+    def _collect():
+        profiles = get_profiles(payload.host, payload.port, payload.username, payload.password)
+        profile = select_ptz_profile(profiles)
+        if profile is None:
+            return None, []
+        try:
+            presets = get_presets(payload.host, payload.port, profile["token"],
+                                  payload.username, payload.password)
+        except OnvifError:
+            presets = []
+        return profile, presets
+
+    try:
+        profile, presets = await run_in_threadpool(_collect)
+    except OnvifError as e:
+        return {"ok": False, "error": str(e), "supported": False, "presets": []}
+    if profile is None:
+        return {"ok": True, "supported": False, "profile_token": None, "presets": []}
+    return {"ok": True, "supported": True, "profile_token": profile["token"],
+            "profile_name": profile.get("name"), "presets": presets}
+
+
+@router.post("/onvif/ptz/move")
+async def onvif_ptz_move(payload: OnvifPtzMoveRequest):
+    """ContinuousMove с ограниченным временем действия.
+
+    Команда не блокирует ответ до конца движения: ContinuousMove по
+    спецификации возвращается сразу, а камера продолжает поворот до Stop
+    либо до истечения таймаута, зашитого в самом запросе (см.
+    PTZ_MOVE_TIMEOUT_SEC в onvif_client).
+    """
+    def _move():
+        token = _resolve_ptz_profile(payload)
+        continuous_move(payload.host, payload.port, token,
+                        payload.pan, payload.tilt, payload.zoom,
+                        payload.username, payload.password)
+        return token
+
+    try:
+        token = await run_in_threadpool(_move)
+    except OnvifError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "profile_token": token}
+
+
+@router.post("/onvif/ptz/stop")
+async def onvif_ptz_stop(payload: OnvifPtzRequest):
+    """Stop: остановка поворота и зума."""
+    def _stop():
+        token = _resolve_ptz_profile(payload)
+        ptz_stop(payload.host, payload.port, token, payload.username, payload.password)
+        return token
+
+    try:
+        token = await run_in_threadpool(_stop)
+    except OnvifError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "profile_token": token}
+
+
+@router.post("/onvif/ptz/preset/goto")
+async def onvif_ptz_goto_preset(payload: OnvifPtzPresetRequest):
+    """GotoPreset: наведение на сохранённую позицию."""
+    def _goto():
+        token = _resolve_ptz_profile(payload)
+        goto_preset(payload.host, payload.port, token, payload.preset_token,
+                    payload.username, payload.password)
+
+    try:
+        await run_in_threadpool(_goto)
+    except OnvifError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
+
+
+@router.post("/onvif/ptz/preset/save")
+async def onvif_ptz_save_preset(payload: OnvifPtzSavePresetRequest):
+    """SetPreset: запоминает текущее положение камеры под именем и
+    возвращает обновлённый список пресетов, чтобы интерфейсу не пришлось
+    делать второй запрос ради только что созданной позиции."""
+    def _save():
+        token = _resolve_ptz_profile(payload)
+        preset_token = set_preset(payload.host, payload.port, token, payload.name,
+                                  payload.username, payload.password)
+        try:
+            presets = get_presets(payload.host, payload.port, token,
+                                  payload.username, payload.password)
+        except OnvifError:
+            presets = []
+        return preset_token, presets
+
+    try:
+        preset_token, presets = await run_in_threadpool(_save)
+    except OnvifError as e:
+        return {"ok": False, "error": str(e), "presets": []}
+    return {"ok": True, "preset_token": preset_token, "presets": presets}

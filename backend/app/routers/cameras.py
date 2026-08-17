@@ -9,7 +9,9 @@ from ..config import settings
 from ..db import get_db
 from ..models import Camera, Setting
 from ..auth import require_role, require_role_query, get_current_user, get_user_from_query_token
-from ..schemas import OnvifBulkAddRequest, OnvifDescribeRequest, CameraIn, CameraOut, OnvifProfilesRequest, OnvifStreamUriRequest, ROIIn, RtspTest
+from ..schemas import (OnvifBulkAddRequest, OnvifDescribeRequest, CameraIn, CameraOut,
+                       OnvifProfilesRequest, OnvifStreamUriRequest, PtzMoveIn,
+                       PtzPresetGotoIn, PtzPresetSaveIn, ROIIn, RtspTest)
 from ..services import camera_config
 from ..services.encryption import encrypt, decrypt
 from ..services.pubsub import get_redis
@@ -294,6 +296,142 @@ async def onvif_stream_uri(payload: OnvifStreamUriRequest, _=Depends(require_rol
     if not data.get("ok"):
         raise HTTPException(502, data.get("error") or "Не удалось получить адрес потока")
     return {"uri": data.get("uri")}
+
+
+# --- PTZ (SPEC §4: «PTZ-управление (если поддерживается камерой)») ---------
+#
+# Роли: admin и operator, наблюдателю запрещено. В матрице §18 отдельной
+# строки для PTZ нет, а из имеющихся ближе всего «Настройка ROI» (Да / Да /
+# Нет) — такое же действие над камерой из живого просмотра. Определяющее
+# соображение: наблюдателю матрица оставляет только чтение, а поворот
+# камеры меняет то, что видят все остальные, и уводит обзор с точки —
+# «Просмотр видео онлайн» (Да / Да / Да) это не покрывает.
+#
+# Учётные данные берутся из БД (расшифровываются), а не приходят от клиента,
+# как в /onvif/profiles: там камера ещё не сохранена и пароль вводится в
+# форме, здесь камера уже заведена. Оператор при этом не получает доступа к
+# самому паролю — только к командам поворота.
+
+
+async def _ptz_camera(cam_id: int, db: AsyncSession) -> Camera:
+    """Камера с настроенным ONVIF — иначе PTZ невозможен физически."""
+    cam = await db.get(Camera, cam_id)
+    if not cam:
+        raise HTTPException(404, "Камера не найдена")
+    if not cam.onvif_host:
+        raise HTTPException(400, "У камеры не настроен ONVIF — PTZ недоступен")
+    return cam
+
+
+def _ptz_payload(cam: Camera, extra: dict | None = None) -> dict:
+    payload = {
+        "host": cam.onvif_host,
+        "port": cam.onvif_port or 80,
+        "username": cam.onvif_username or None,
+        "password": decrypt(cam.onvif_password_enc) if cam.onvif_password_enc else None,
+    }
+    payload.update(extra or {})
+    return payload
+
+
+async def _ptz_call(path: str, payload: dict, *, timeout: float = 15) -> dict:
+    """Запрос к воркеру: он в одной сети с камерами, backend — нет.
+
+    Таймаут на команду поворота короткий (см. вызовы ниже): PTZ — интерактивное
+    действие, оператор держит кнопку, и ответ, пришедший через 15 секунд,
+    бесполезен — за это время он уже отпустил её и нажал снова.
+    """
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            resp = await client.post(f"{settings.WORKER_URL}{path}", json=payload)
+        except httpx.HTTPError as e:
+            raise HTTPException(503, f"Сервис распознавания недоступен: {e}")
+    return resp.json()
+
+
+@router.get("/{cam_id}/ptz")
+async def ptz_capabilities(cam_id: int, _=Depends(require_role("admin", "operator")),
+                           db: AsyncSession = Depends(get_db)):
+    """Поддерживает ли камера PTZ и какие у неё пресеты.
+
+    Ответ `supported: false` — штатный для фиксированной камеры: интерфейс по
+    нему просто не рисует пульт. Недоступность камеры тоже не 502: пульт не
+    должен исчезать из-за того, что камера моргнула сетью, поэтому причина
+    возвращается в `error` вместе с `supported: false`.
+    """
+    cam = await _ptz_camera(cam_id, db)
+    data = await _ptz_call("/onvif/ptz/capabilities", _ptz_payload(cam))
+    if not data.get("ok"):
+        return {"supported": False, "presets": [], "error": data.get("error")}
+    return {
+        "supported": bool(data.get("supported")),
+        "profile_token": data.get("profile_token"),
+        "presets": data.get("presets", []),
+    }
+
+
+@router.post("/{cam_id}/ptz/move")
+async def ptz_move(cam_id: int, payload: PtzMoveIn,
+                   _=Depends(require_role("admin", "operator")),
+                   db: AsyncSession = Depends(get_db)):
+    """Непрерывный поворот/зум с заданной скоростью.
+
+    Движение прекращается по /ptz/stop либо само — по таймауту, зашитому в
+    ONVIF-команду (onvif_client.PTZ_MOVE_TIMEOUT_SEC). Второе важнее первого:
+    если оператор закрыл вкладку, не отпустив кнопку, останавливать камеру
+    будет некому.
+    """
+    cam = await _ptz_camera(cam_id, db)
+    data = await _ptz_call("/onvif/ptz/move", _ptz_payload(cam, {
+        "pan": payload.pan, "tilt": payload.tilt, "zoom": payload.zoom,
+        "profile_token": payload.profile_token,
+    }), timeout=8)
+    if not data.get("ok"):
+        raise HTTPException(502, data.get("error") or "Камера не приняла команду поворота")
+    return {"ok": True, "profile_token": data.get("profile_token")}
+
+
+@router.post("/{cam_id}/ptz/stop")
+async def ptz_stop_move(cam_id: int, payload: PtzMoveIn,
+                        _=Depends(require_role("admin", "operator")),
+                        db: AsyncSession = Depends(get_db)):
+    """Остановка поворота и зума."""
+    cam = await _ptz_camera(cam_id, db)
+    data = await _ptz_call("/onvif/ptz/stop", _ptz_payload(cam, {
+        "profile_token": payload.profile_token,
+    }), timeout=8)
+    if not data.get("ok"):
+        raise HTTPException(502, data.get("error") or "Камера не приняла команду остановки")
+    return {"ok": True}
+
+
+@router.post("/{cam_id}/ptz/preset/goto")
+async def ptz_goto_preset(cam_id: int, payload: PtzPresetGotoIn,
+                          _=Depends(require_role("admin", "operator")),
+                          db: AsyncSession = Depends(get_db)):
+    """Наведение камеры на сохранённую позицию."""
+    cam = await _ptz_camera(cam_id, db)
+    data = await _ptz_call("/onvif/ptz/preset/goto", _ptz_payload(cam, {
+        "preset_token": payload.preset_token, "profile_token": payload.profile_token,
+    }))
+    if not data.get("ok"):
+        raise HTTPException(502, data.get("error") or "Камера не приняла переход на позицию")
+    return {"ok": True}
+
+
+@router.post("/{cam_id}/ptz/preset/save")
+async def ptz_save_preset(cam_id: int, payload: PtzPresetSaveIn,
+                          _=Depends(require_role("admin", "operator")),
+                          db: AsyncSession = Depends(get_db)):
+    """Сохранение текущего положения камеры как именованной позиции."""
+    cam = await _ptz_camera(cam_id, db)
+    data = await _ptz_call("/onvif/ptz/preset/save", _ptz_payload(cam, {
+        "name": payload.name, "profile_token": payload.profile_token,
+    }))
+    if not data.get("ok"):
+        raise HTTPException(502, data.get("error") or "Камера не сохранила позицию")
+    return {"ok": True, "preset_token": data.get("preset_token"),
+            "presets": data.get("presets", [])}
 
 
 @router.post("/test")
