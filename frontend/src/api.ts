@@ -197,6 +197,10 @@ export const api = {
   getSettings: () => req("/api/settings"),
   putSettings: (b: any) => req("/api/settings", { method: "PUT", body: JSON.stringify(b) }),
   testTelegram: () => req("/api/settings/test-telegram", { method: "POST" }),
+  testEmail: () => req("/api/settings/test-email", { method: "POST" }),
+  // Несекретные настройки интерфейса — доступны под любой ролью, в отличие
+  // от getSettings() (admin-only, отдаёт расшифрованные секреты).
+  getClientSettings: () => req("/api/settings/client"),
   listProfiles: () => req("/api/settings/profiles"),
   applyProfile: (name: string) => req(`/api/settings/profile/${name}`, { method: "POST" }),
   sysMetrics: () => req("/api/system/metrics"),

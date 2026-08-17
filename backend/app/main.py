@@ -144,6 +144,18 @@ async def lifespan(app: FastAPI):
             "event_cooldown_sec": "10",
             "telegram_bot_token": "",
             "telegram_chat_id": "",
+            # SPEC §11: почта выключена, пока администратор не заполнит хост.
+            # Порт 587 и starttls — рабочее сочетание для подавляющего
+            # большинства релеев, чтобы из формы осталось заполнить только
+            # хост, логин и пароль.
+            "smtp_host": "",
+            "smtp_port": "587",
+            "smtp_user": "",
+            "smtp_password": "",
+            "smtp_tls": "starttls",
+            "smtp_from": "",
+            "alert_email_to": "",
+            "alert_sound_enabled": "0",
             "alert_cooldown_sec": "300",
             "record_segment_min": "5",
             "performance_profile": DEFAULT_PROFILE,

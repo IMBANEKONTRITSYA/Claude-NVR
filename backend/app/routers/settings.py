@@ -1,4 +1,5 @@
 """Системные настройки (хранятся в БД, читаются воркером на лету)."""
+import anyio
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -6,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from ..db import get_db
 from ..models import Setting
-from ..auth import require_role
+from ..auth import get_current_user, require_role
 from ..profiles import PROFILES, profile_settings
 from .cameras import DEFAULT_ANALYTICS_MAX
 from ..services.encryption import (
@@ -14,6 +15,7 @@ from ..services.encryption import (
     decrypt_setting,
     encrypt_setting,
 )
+from ..services.mailer import TLS_MODES, MailerError, send_email, split_recipients
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -27,6 +29,20 @@ SCHEMA: dict[str, tuple] = {
     "alert_cooldown_sec": (int, 10, 86400),
     "telegram_bot_token": (str,),     # просто строка, может быть пустой
     "telegram_chat_id": (str,),
+    # SPEC §11 «Настройки уведомлений: Telegram, email, звук». Почта нужна
+    # трём разделам сразу: §6 (алерты при детекции), §8 (авто-отправка
+    # отчётов по расписанию) и §11. Пустой smtp_host отключает почту целиком.
+    "smtp_host": (str,),
+    "smtp_port": (int, 1, 65535),
+    "smtp_user": (str,),
+    "smtp_password": (str,),          # секрет, шифруется (см. encryption.py)
+    "smtp_tls": (str,),               # none | starttls | ssl
+    "smtp_from": (str,),              # пусто → берётся smtp_user
+    "alert_email_to": (str,),         # получатели алертов §6, через запятую
+    # §6 «Алерты при детекции (Telegram, email, звук)»: звук — это клиентская
+    # часть (Стена распознавания), но включается он тем же экраном настроек,
+    # что и остальные два канала, поэтому флаг лежит здесь.
+    "alert_sound_enabled": (int, 0, 1),
     # Профиль производительности и его параметры (ТЗ 18)
     "performance_profile": (str,),
     "frame_skip": (int, 0, 20),
@@ -57,7 +73,17 @@ ENUMS = {
     "performance_profile": set(PROFILES),
     "face_model": {"buffalo_s", "buffalo_l"},
     "upscale_mode": {"manual", "avatar", "all"},
+    "smtp_tls": set(TLS_MODES),
 }
+
+
+# Настройки, видимые интерфейсу под любой ролью (см. GET /api/settings/client).
+# Белый список: добавление ключа сюда — осознанное решение «это не секрет».
+CLIENT_SETTING_KEYS = frozenset({"alert_sound_enabled"})
+
+assert not (CLIENT_SETTING_KEYS & SECRET_SETTING_KEYS), (
+    "секретная настройка не может отдаваться через /api/settings/client"
+)
 
 
 class SettingsUpdate(BaseModel):
@@ -76,6 +102,14 @@ class SettingsUpdate(BaseModel):
     alert_cooldown_sec: int | None = None
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
+    smtp_host: str | None = None
+    smtp_port: int | None = None
+    smtp_user: str | None = None
+    smtp_password: str | None = None
+    smtp_tls: str | None = None
+    smtp_from: str | None = None
+    alert_email_to: str | None = None
+    alert_sound_enabled: int | None = None
     frame_skip: int | None = None
     motion_prefilter: int | None = None
     idle_fps: int | None = None
@@ -109,6 +143,21 @@ def _visible(rows) -> dict[str, str]:
 async def get_settings(_=Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(select(Setting))).scalars().all()
     return _visible(rows)
+
+
+@router.get("/client")
+async def client_settings(_=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Настройки, которые нужны интерфейсу любой роли (SPEC §18).
+
+    Отдельный эндпоинт, а не `GET /api/settings`: тот admin-only и отдаёт в
+    том числе расшифрованные секреты (токен бота, пароль SMTP). Звуковой
+    алерт §6 должен работать у оператора и наблюдателя на Стене, поэтому
+    сюда попадает только явно перечисленный набор несекретных флагов —
+    список белый, чтобы новая секретная настройка не утекла сюда сама.
+    """
+    rows = (await db.execute(select(Setting).where(Setting.key.in_(CLIENT_SETTING_KEYS)))).scalars().all()
+    out = {s.key: s.value for s in rows}
+    return {k: out.get(k, "") for k in sorted(CLIENT_SETTING_KEYS)}
 
 
 @router.put("")
@@ -204,6 +253,45 @@ async def apply_profile(name: str, _=Depends(require_role("admin")), db: AsyncSe
     await db.commit()
     rows = (await db.execute(select(Setting))).scalars().all()
     return _visible(rows)
+
+
+@router.post("/test-email")
+async def test_email(_=Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
+    """Пробное письмо на адреса из alert_email_to (SPEC §11).
+
+    Без такой кнопки единственный способ узнать, что почта настроена
+    неправильно, — дождаться реального алерта и не получить его. Ошибки
+    отдаются администратору дословно (класс исключения smtplib), чтобы
+    отличить «не тот пароль» от «порт закрыт».
+    """
+    rows = _visible((await db.execute(select(Setting))).scalars().all())
+    host = rows.get("smtp_host", "")
+    to = rows.get("alert_email_to", "")
+    if not host:
+        raise HTTPException(400, "Не задан smtp_host")
+    if not split_recipients(to):
+        raise HTTPException(400, "Не задан ни один получатель (alert_email_to)")
+    try:
+        port = int(rows.get("smtp_port") or 587)
+    except ValueError:
+        raise HTTPException(400, "Некорректный smtp_port")
+    # SMTP-сессия синхронная и может занять до SMTP_TIMEOUT_SEC: в event loop
+    # это заблокировало бы все остальные запросы бэкенда на 15 секунд.
+    try:
+        sent = await anyio.to_thread.run_sync(
+            lambda: send_email(
+                host, port, rows.get("smtp_user", ""), rows.get("smtp_password", ""),
+                rows.get("smtp_tls", "starttls"), rows.get("smtp_from", ""), to,
+                "FaceWatch: тестовое сообщение",
+                "Это проверка настроек почты FaceWatch. "
+                "Если письмо дошло — алерты и отчёты будут приходить сюда же.",
+            )
+        )
+    except MailerError as e:
+        raise HTTPException(502, str(e))
+    if not sent:
+        raise HTTPException(400, "Почта не настроена")
+    return {"ok": True, "recipients": split_recipients(to)}
 
 
 @router.post("/test-telegram")

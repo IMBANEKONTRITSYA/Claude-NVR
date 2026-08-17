@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { useUI } from "../ui";
+import { settingsPayload } from "../settingsPayload";
 
 // ВАЖНО: Field объявлен вне Settings — компонент, объявленный внутри рендера,
 // пересоздаётся как новый тип на каждый ре-рендер, из-за чего input
@@ -44,29 +45,7 @@ export function Settings() {
   const save = async () => {
     setBusy(true); setMsg(null);
     try {
-      const payload = {
-        retention_days: parseInt(s.retention_days),
-        motion_threshold: parseInt(s.motion_threshold),
-        similarity_threshold: parseFloat(s.similarity_threshold),
-        detection_fps: parseInt(s.detection_fps),
-        event_cooldown_sec: parseInt(s.event_cooldown_sec),
-        alert_cooldown_sec: parseInt(s.alert_cooldown_sec),
-        telegram_bot_token: s.telegram_bot_token || "",
-        telegram_chat_id: s.telegram_chat_id || "",
-        frame_skip: parseInt(s.frame_skip),
-        motion_prefilter: parseInt(s.motion_prefilter),
-        idle_fps: parseInt(s.idle_fps),
-        face_model: s.face_model,
-        upscale_mode: s.upscale_mode,
-        cluster_interval_min: parseInt(s.cluster_interval_min),
-        detect_width: parseInt(s.detect_width),
-        record_segment_min: parseInt(s.record_segment_min) || 5,
-        analytics_cameras_max: parseInt(s.analytics_cameras_max) || 2,
-        disk_min_free_pct: parseInt(s.disk_min_free_pct) || 5,
-        disk_warn_pct: parseInt(s.disk_warn_pct) || 80,
-        disk_crit_pct: parseInt(s.disk_crit_pct) || 90,
-      };
-      const r = await api.putSettings(payload);
+      const r = await api.putSettings(settingsPayload(s));
       setS(r);
       setMsg({ type: "ok", text: "Сохранено. Воркер применит изменения в течение ~10 секунд." });
     } catch (e: any) { setMsg({ type: "err", text: e.message }); }
@@ -77,6 +56,16 @@ export function Settings() {
     try {
       await api.testTelegram();
       toast("Тестовое сообщение отправлено", "ok");
+    } catch (e: any) { toast(e.message, "err"); }
+  };
+
+  // Кнопка шлёт письмо по СОХРАНЁННЫМ настройкам, а не по тому, что сейчас в
+  // форме: проверять несохранённое значило бы «тест прошёл, а алерты не
+  // ходят» после ухода со страницы без нажатия «Сохранить».
+  const testMail = async () => {
+    try {
+      const r: any = await api.testEmail();
+      toast(`Письмо отправлено: ${(r.recipients || []).join(", ")}`, "ok");
     } catch (e: any) { toast(e.message, "err"); }
   };
 
@@ -160,6 +149,43 @@ export function Settings() {
         <Field label="Cooldown между оповещениями (сек)" value={s.alert_cooldown_sec} onChange={upd("alert_cooldown_sec")} hint="Чтобы не спамить, для одной персоны не чаще раза за указанный интервал" />
         <button className="btn secondary" onClick={testTg}>Отправить тестовое сообщение</button>
       </div>
+
+      {/* SPEC §11 «Настройки уведомлений: Telegram, email, звук». Те же
+          настройки использует §8 (авто-отправка отчётов по расписанию). */}
+      <div className="card" style={{ maxWidth: 520, marginBottom: 16 }}>
+        <h3 style={{ marginTop: 0 }}>Почтовые уведомления (SMTP)</h3>
+        <Field type="text" label="SMTP-сервер" value={s.smtp_host} onChange={upd("smtp_host")} hint="Например, smtp.yandex.ru; оставьте пустым, чтобы отключить почту" />
+        <Field label="Порт" value={s.smtp_port} onChange={upd("smtp_port")} hint="587 для STARTTLS, 465 для SSL, 25 для внутреннего релея без шифрования" />
+        <div style={{ marginBottom: 14 }}>
+          <label>Шифрование</label>
+          <select value={s.smtp_tls || "starttls"} onChange={upd("smtp_tls")}>
+            <option value="starttls">STARTTLS (порт 587)</option>
+            <option value="ssl">SSL/TLS (порт 465)</option>
+            <option value="none">Без шифрования (внутренняя сеть)</option>
+          </select>
+        </div>
+        <Field type="text" label="Логин" value={s.smtp_user} onChange={upd("smtp_user")} hint="Оставьте пустым для релея без авторизации" />
+        <Field type="password" label="Пароль" value={s.smtp_password} onChange={upd("smtp_password")} hint="Хранится в БД в зашифрованном виде" />
+        <Field type="text" label="Отправитель (From)" value={s.smtp_from} onChange={upd("smtp_from")} hint="Пусто — будет использован логин" />
+        <Field type="text" label="Получатели алертов" value={s.alert_email_to} onChange={upd("alert_email_to")} hint="Через запятую. Сюда приходят алерты watchlist и переполнения диска" />
+        <button className="btn secondary" onClick={testMail}>Отправить тестовое письмо</button>
+      </div>
+
+      <div className="card" style={{ maxWidth: 520, marginBottom: 16 }}>
+        <h3 style={{ marginTop: 0 }}>Звуковое оповещение</h3>
+        <div style={{ marginBottom: 14 }}>
+          <label>
+            <input type="checkbox" style={{ width: "auto", marginRight: 8 }}
+                   checked={String(s.alert_sound_enabled) === "1"}
+                   onChange={e => setS((p: any) => ({ ...p, alert_sound_enabled: e.target.checked ? 1 : 0 }))} />
+            Звук при обнаружении персоны из watchlist
+          </label>
+          <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+            Сигнал подаётся на открытой вкладке «Стена распознавания» (SPEC §6)
+          </div>
+        </div>
+      </div>
+
       <div style={{ maxWidth: 520 }}>
         {msg && <div style={{ marginBottom: 10, color: msg.type === "ok" ? "var(--green)" : "var(--red)" }}>{msg.text}</div>}
         <button className="btn" onClick={save} disabled={busy}>{busy ? "Сохранение..." : "Сохранить"}</button>

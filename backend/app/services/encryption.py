@@ -46,7 +46,10 @@ def decrypt(token: str) -> str:
 SECRET_SETTING_PREFIX = "enc:v1:"
 
 # Ключи settings, значения которых должны храниться зашифрованными.
-SECRET_SETTING_KEYS = frozenset({"telegram_bot_token"})
+# smtp_password — тот же класс секрета, что и токен бота: пароль от почтового
+# ящика объекта в открытом виде в дампе pg_dump (backup/run.sh держит их 14
+# дней) даёт доступ к переписке, а часто и к учётке целиком.
+SECRET_SETTING_KEYS = frozenset({"telegram_bot_token", "smtp_password"})
 
 
 def encrypt_setting(plain: str) -> str:

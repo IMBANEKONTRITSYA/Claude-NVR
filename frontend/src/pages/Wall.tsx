@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { api, mediaUrl } from "../api";
 import { useWebSocket } from "../useWebSocket";
+import { isAlertEvent, playAlertBeep, shouldBeep } from "../alertSound";
 
 const PAGE = 60;
 
@@ -24,6 +25,16 @@ export function Wall() {
   const hasMoreRef = useRef(true);
   hasMoreRef.current = hasMore;
   const sentinelRef = useRef<HTMLDivElement | null>(null);
+  // Звуковой алерт §6: глобальный флаг настроек читается через
+  // /api/settings/client — сама форма настроек admin-only, а звук нужен
+  // оператору и наблюдателю. Отказ запроса означает «звук выключен».
+  const [soundOn, setSoundOn] = useState(false);
+  const lastBeepRef = useRef(0);
+  useEffect(() => {
+    api.getClientSettings()
+      .then((c: any) => setSoundOn(String(c.alert_sound_enabled) === "1"))
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     api.events(PAGE).then((evs: any[]) => {
@@ -63,6 +74,16 @@ export function Wall() {
   }, [loadMore]);
 
   useWebSocket("/ws/faces", (msg) => {
+    // SPEC §6: звук — третий канал алертов наравне с Telegram и почтой.
+    // Пауза глушит и его: оператор, нажавший «Пауза», просматривает ленту,
+    // а не следит за новыми событиями.
+    if (soundOn && !pausedRef.current && isAlertEvent(msg)) {
+      const now = Date.now();
+      if (shouldBeep(lastBeepRef.current, now)) {
+        lastBeepRef.current = now;
+        playAlertBeep();
+      }
+    }
     if (msg.type === "face") {
       // Дедуп: событие могло уже прийти в начальной странице истории
       setItems(prev => (pausedRef.current || prev.some(i => i.event_id === msg.event_id))
