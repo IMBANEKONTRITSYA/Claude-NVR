@@ -110,6 +110,48 @@ class RtspTest(BaseModel):
 CAMERA_MODES = ("record_only", "analytics")
 
 
+class DetectionWindow(BaseModel):
+    """Окно расписания детекции (SPEC §6).
+
+    `start` больше `end` — окно через полночь (22:00–06:00), а не ошибка:
+    §6 называет режим «день/ночь» прямо, и ночная смена — половина
+    сценария. Проверка «начало раньше конца» здесь была бы ровно тем
+    правилом, которое запрещает половину функции.
+    """
+    # 0 = понедельник, как datetime.weekday() и как расписание отчётов (§8).
+    days: list[int] = Field(default_factory=lambda: list(range(7)))
+    start: str = Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    end: str = Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+
+    @field_validator("days")
+    @classmethod
+    def _check_days(cls, v: list[int]) -> list[int]:
+        if any(d < 0 or d > 6 for d in v):
+            raise ValueError("день недели вне диапазона 0..6")
+        # Дубликаты не ошибка, но и хранить их незачем — порядок сохраняем,
+        # чтобы форма не переставляла отмеченные дни под пользователем.
+        seen, out = set(), []
+        for d in v:
+            if d not in seen:
+                seen.add(d)
+                out.append(d)
+        return out
+
+
+class DetectionScheduleIn(BaseModel):
+    """Расписание детекции камеры (SPEC §6).
+
+    `enabled: false` (и отсутствие расписания вовсе) — «детекция
+    круглосуточно». Трактовка «пусто = выключено» на обновлении разом
+    остановила бы аналитику на всех существующих камерах без единого
+    сообщения; см. worker/detection_schedule.py.
+    """
+    enabled: bool = False
+    # Потолок совпадает с MAX_WINDOWS воркера: расписание правится в
+    # браузере и уезжает в JSON-колонку, разбор которой идёт в цикле кадров.
+    windows: list[DetectionWindow] = Field(default_factory=list, max_length=10)
+
+
 class CameraIn(BaseModel):
     name: str
     rtsp_url: str                      # основной поток: запись и просмотр
@@ -129,6 +171,9 @@ class CameraIn(BaseModel):
     # SPEC §5: глубина хранения по камере. None — следовать за глобальной
     # настройкой (а не «ноль дней»), см. models.Camera.retention_days.
     retention_days: int | None = Field(default=None, ge=1, le=3650)
+    # SPEC §6: расписание детекции (день/ночь, рабочие часы). None —
+    # круглосуточно.
+    detection_schedule: DetectionScheduleIn | None = None
 
     _check_rtsp_url = field_validator("rtsp_url")(_validate_rtsp_url_required)
     _check_sub_rtsp_url = field_validator("sub_rtsp_url")(_validate_rtsp_url_optional)
@@ -154,6 +199,11 @@ class CameraOut(BaseModel):
     onvif_host: str | None = None
     onvif_port: int | None = None
     onvif_username: str | None = None
+    # SPEC §6: расписание отдаётся целиком — форма редактирования должна
+    # вернуть его обратно без изменений, иначе сохранение любой другой
+    # правки камеры стирало бы расписание (ровно та ошибка, что уже была с
+    # ONVIF-полями выше).
+    detection_schedule: dict | None = None
 
     class Config:
         from_attributes = True

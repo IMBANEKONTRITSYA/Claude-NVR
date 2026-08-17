@@ -131,7 +131,7 @@ def test_onvif_thread_stops_when_camera_disabled(harness, monkeypatch):
 
     def state(cam_id):
         calls["n"] += 1
-        return (None, calls["n"] <= 1, None)
+        return (None, calls["n"] <= 1, None, None)
 
     monkeypatch.setattr(worker, "load_cam_state", state)
 

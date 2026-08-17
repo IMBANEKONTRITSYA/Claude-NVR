@@ -87,7 +87,7 @@ def test_camera_worker_starts_onvif_thread_after_capture_opens(monkeypatch):
     started = threading.Event()
     monkeypatch.setattr(worker, "open_capture", lambda url: _OpensThenStallsCapture())
     monkeypatch.setattr(worker, "update_status", lambda *a, **kw: None)
-    monkeypatch.setattr(worker, "load_cam_state", lambda cam_id: (None, True, None))
+    monkeypatch.setattr(worker, "load_cam_state", lambda cam_id: (None, True, None, None))
 
     def fake_onvif_poll_worker(*args, **kwargs):
         started.set()

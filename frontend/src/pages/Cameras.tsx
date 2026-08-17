@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import { api, camerasExportUrl } from "../api";
 import { useUI } from "../ui";
+import {
+  ALL_DAYS, DAY_LABELS, DEFAULT_WINDOW, DetectionSchedule, DetectionWindow,
+  EMPTY_SCHEDULE, MAX_WINDOWS, SCHEDULE_PRESETS,
+  describeWindow, schedulePayload, scheduleFromCamera,
+} from "../detectionSchedule";
 
 const EMPTY_FORM = {
   // Режим по умолчанию — только запись (SPEC §2): аналитика включается явно
@@ -10,7 +15,101 @@ const EMPTY_FORM = {
   // SPEC §5: собственная глубина хранения. Пустая строка — «следовать за
   // глобальной настройкой»; в payload уходит null, а не 0 (см. submit).
   retention_days: "",
+  // SPEC §6: расписание детекции. Выключенное — «детекция круглосуточно»
+  // (в payload уходит null, см. submit).
+  detection_schedule: EMPTY_SCHEDULE as DetectionSchedule,
 };
+
+/** Редактор расписания детекции камеры (SPEC §6: «расписание детекции
+ *  (день/ночь, рабочие часы)»).
+ *
+ *  Показывается только для режима `analytics`: расписание управляет слоем
+ *  аналитики и на запись не влияет (§2), а у камеры `record_only` его не к
+ *  чему применять — поле там только сбивало бы с толку. */
+function DetectionScheduleEditor({ value, onChange }: {
+  value: DetectionSchedule; onChange: (s: DetectionSchedule) => void;
+}) {
+  const setWindow = (i: number, patch: Partial<DetectionWindow>) =>
+    onChange({ ...value, windows: value.windows.map((w, j) => (j === i ? { ...w, ...patch } : w)) });
+
+  const toggleDay = (i: number, day: number) => {
+    const days = value.windows[i].days;
+    setWindow(i, { days: days.includes(day) ? days.filter(d => d !== day) : [...days, day].sort((a, b) => a - b) });
+  };
+
+  return (
+    <div className="field">
+      <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <input type="checkbox" style={{ width: "auto" }} checked={value.enabled}
+          onChange={e => onChange({
+            ...value,
+            enabled: e.target.checked,
+            // Включение с нулём окон означало бы «не детектировать никогда»
+            // (schedulePayload превращает это в null, но пустая форма без
+            // единой строки просто непонятна) — сразу даём первое окно.
+            windows: e.target.checked && value.windows.length === 0 ? [DEFAULT_WINDOW] : value.windows,
+          })} />
+        Детекция по расписанию
+      </label>
+      <div className="hint">
+        Выключено — детекция идёт круглосуточно. Расписание касается только
+        аналитики: запись ведётся всегда. Вне окна камера не декодируется
+        вовсе, поэтому «только ночью» экономит процессор в разы.
+      </div>
+
+      {value.enabled && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+            {SCHEDULE_PRESETS.map(p => (
+              <button key={p.label} type="button" className="btn sm secondary"
+                onClick={() => onChange({ enabled: true, windows: p.windows.map(w => ({ ...w })) })}>
+                {p.label}
+              </button>
+            ))}
+          </div>
+
+          {value.windows.map((w, i) => (
+            <div key={i} className="sched-window">
+              <div className="sched-row">
+                <input type="time" value={w.start} style={{ width: 110 }}
+                  onChange={e => setWindow(i, { start: e.target.value })} />
+                <span className="muted">—</span>
+                <input type="time" value={w.end} style={{ width: 110 }}
+                  onChange={e => setWindow(i, { end: e.target.value })} />
+                <div className="sched-days">
+                  {DAY_LABELS.map((label, d) => (
+                    <button key={d} type="button"
+                      className={`btn sm ${w.days.includes(d) ? "" : "secondary"}`}
+                      onClick={() => toggleDay(i, d)}>{label}</button>
+                  ))}
+                </div>
+                <button type="button" className="btn sm danger" title="Удалить окно"
+                  onClick={() => onChange({ ...value, windows: value.windows.filter((_, j) => j !== i) })}>✕</button>
+              </div>
+              {/* Подпись обязательна для ночных окон: без неё 22:00–06:00
+                  выглядит опечаткой, и его «исправляют» на 06:00–22:00 —
+                  то есть ровно на противоположное. */}
+              <div className="hint">{describeWindow(w)}</div>
+            </div>
+          ))}
+
+          {value.windows.length < MAX_WINDOWS && (
+            <button type="button" className="btn sm secondary"
+              onClick={() => onChange({ ...value, windows: [...value.windows, { ...DEFAULT_WINDOW, days: [...ALL_DAYS] }] })}>
+              + Добавить интервал
+            </button>
+          )}
+          {value.windows.length === 0 && (
+            <div className="hint">
+              Ни одного интервала — расписание не будет сохранено, детекция
+              останется круглосуточной.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function Cameras() {
   const { toast, confirm } = useUI();
@@ -65,6 +164,10 @@ export function Cameras() {
       name: c.name, rtsp_url: "", sub_rtsp_url: "", location: c.location, enabled: c.enabled,
       mode: c.mode || "record_only",
       retention_days: c.retention_days == null ? "" : String(c.retention_days),
+      // Расписание возвращается в форму как есть: иначе сохранение любой
+      // другой правки камеры стирало бы его — та же ошибка, что была с
+      // ONVIF-полями.
+      detection_schedule: scheduleFromCamera(c.detection_schedule),
       onvif_enabled: !!c.onvif_enabled, onvif_host: c.onvif_host || "",
       onvif_port: c.onvif_port || 80, onvif_username: c.onvif_username || "",
       onvif_password: "",
@@ -89,6 +192,10 @@ export function Cameras() {
       const payload = {
         ...form,
         retention_days: form.retention_days === "" ? null : Number(form.retention_days),
+        // Выключенное расписание и расписание без окон — оба null
+        // («круглосуточно»). Пустой список окон означал бы на сервере
+        // «не детектировать никогда».
+        detection_schedule: schedulePayload(form.detection_schedule),
       };
       if (editing) await api.camUpdate(editing, payload);
       else await api.camAdd(payload);
@@ -265,6 +372,12 @@ export function Cameras() {
                   и продолжит следовать за ней при её изменении.
                 </div>
               </div>
+              {/* Только для аналитики: расписание управляет слоем аналитики
+                  и записи не касается (§2). */}
+              {form.mode === "analytics" && (
+                <DetectionScheduleEditor value={form.detection_schedule}
+                  onChange={s => setForm({ ...form, detection_schedule: s })} />
+              )}
               <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
                 <input type="checkbox" style={{ width: "auto" }} checked={form.enabled}
                   onChange={e => setForm({ ...form, enabled: e.target.checked })} />

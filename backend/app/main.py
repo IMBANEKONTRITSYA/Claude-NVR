@@ -80,6 +80,10 @@ async def apply_schema_migrations(conn):
         # здесь нет ни DEFAULT, ни UPDATE: обновление не должно ничего менять
         # в поведении существующих камер.
         "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS retention_days integer",
+        # SPEC §6: расписание детекции. Ни DEFAULT, ни UPDATE — NULL здесь
+        # означает «круглосуточно», то есть поведение существующих камер
+        # после обновления не меняется (см. models.py).
+        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS detection_schedule jsonb",
         # SPEC §21: фактический расход и выбор старейших сегментов под
         # циклическую перезапись. Существующим строкам ставится 0 («размер
         # неизвестен»), а не фактический размер файла: обход архива на 120
