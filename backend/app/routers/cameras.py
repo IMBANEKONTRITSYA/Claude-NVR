@@ -628,12 +628,18 @@ async def export_cameras(
     )
 
 
-def _row_to_camera_in(row: dict, existing: Camera | None) -> CameraIn:
-    """Строка файла → провалидированный CameraIn.
+def _row_to_camera_in(row: dict, existing: Camera | None) -> tuple[CameraIn, dict | None]:
+    """Строка файла → провалидированный CameraIn и зоны детекции.
 
     Валидация RTSP-URL, режима и retention переиспользует ту же модель,
     что и веб-форма: расхождение между «что примет форма» и «что примет
     импорт» рано или поздно даёт камеру, которую воркер не сможет открыть.
+
+    ROI возвращается отдельным значением, а не полем `CameraIn`: зоны
+    правятся собственным эндпоинтом `PUT /{id}/roi` и в теле `PUT /{id}`
+    не приходят. Добавь их в `CameraIn` — и сохранение формы камеры,
+    которая про зоны не знает и не шлёт их, стирало бы нарисованные
+    полигоны (та же мина, что уже была с полями ONVIF и расписанием).
     """
     name = str(row.get("name") or "").strip()
     if not name:
@@ -661,6 +667,23 @@ def _row_to_camera_in(row: dict, existing: Camera | None) -> CameraIn:
         sub = decrypt(existing.sub_rtsp_url_enc) if existing.sub_rtsp_url_enc else ""
 
     mode = str(row.get("mode") or (existing.mode if existing else "record_only")).strip() or "record_only"
+
+    # Колонки нет в файле — сохранённое значение остаётся как есть; колонка
+    # есть и пуста — значение снимается. См. модуль services/camera_config.
+    if "detection_schedule" in row:
+        schedule = camera_config.parse_json_object(row.get("detection_schedule"), "detection_schedule")
+    else:
+        schedule = existing.detection_schedule if existing else None
+    if "roi" in row:
+        roi = camera_config.parse_json_object(row.get("roi"), "roi")
+    else:
+        roi = existing.roi if existing else None
+    if roi is not None:
+        try:
+            roi = ROIIn(**roi).model_dump()
+        except ValidationError as e:
+            raise ValueError("; ".join(_pydantic_messages(e))) from None
+
     try:
         return CameraIn(
             name=name,
@@ -675,7 +698,8 @@ def _row_to_camera_in(row: dict, existing: Camera | None) -> CameraIn:
             onvif_host=str(row.get("onvif_host") or "").strip() or None,
             onvif_port=camera_config.parse_int(row.get("onvif_port"), "onvif_port"),
             onvif_username=str(row.get("onvif_username") or "").strip() or None,
-        )
+            detection_schedule=schedule,
+        ), roi
     except ValidationError as e:
         raise ValueError("; ".join(_pydantic_messages(e))) from None
 
@@ -722,7 +746,7 @@ async def import_cameras(
     existing = {c.name: c for c in (await db.execute(select(Camera).order_by(Camera.id))).scalars().all()}
 
     errors: list[dict] = []
-    planned: list[tuple[str, CameraIn, Camera | None]] = []
+    planned: list[tuple[str, CameraIn, Camera | None, dict | None]] = []
     seen: set[str] = set()
     # Предел камер аналитики считается по итоговому состоянию всего файла,
     # а не по каждой строке отдельно: файл может и снимать режим analytics
@@ -736,7 +760,7 @@ async def import_cameras(
         try:
             if name and name in seen:
                 raise ValueError(f"имя «{name}» встречается в файле дважды")
-            payload = _row_to_camera_in(row, prior)
+            payload, roi = _row_to_camera_in(row, prior)
         except ValueError as e:
             errors.append({"row": idx, "name": name, "error": str(e)})
             continue
@@ -745,7 +769,7 @@ async def import_cameras(
             analytics_after.add(name)
         else:
             analytics_after.discard(name)
-        planned.append(("update" if prior else "create", payload, prior))
+        planned.append(("update" if prior else "create", payload, prior, roi))
 
     limit = await _analytics_limit(db)
     analytics_before = sum(1 for c in existing.values() if (c.mode or "record_only") == "analytics")
@@ -764,7 +788,7 @@ async def import_cameras(
             ),
         })
 
-    created = sum(1 for a, _, _ in planned if a == "create")
+    created = sum(1 for a, *_ in planned if a == "create")
     updated = len(planned) - created
     result = {
         "ok": not errors,
@@ -779,7 +803,7 @@ async def import_cameras(
             result["created"] = result["updated"] = 0
         return result
 
-    for action, payload, prior in planned:
+    for action, payload, prior, roi in planned:
         cam = prior if action == "update" else Camera(status="offline")
         cam.name = payload.name
         cam.rtsp_url_enc = encrypt(payload.rtsp_url)
@@ -793,6 +817,9 @@ async def import_cameras(
         cam.onvif_host = payload.onvif_host
         cam.onvif_port = payload.onvif_port
         cam.onvif_username = payload.onvif_username
+        cam.detection_schedule = (payload.detection_schedule.model_dump()
+                                  if payload.detection_schedule else None)
+        cam.roi = roi
         if action == "create":
             db.add(cam)
     await db.commit()
