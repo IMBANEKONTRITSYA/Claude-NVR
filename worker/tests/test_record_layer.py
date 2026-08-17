@@ -25,6 +25,7 @@ import pytest
 
 from record_layer import (
     MediaMTXClient,
+    _duration_ns,
     MediaMTXError,
     camera_id_from_path,
     collect_complete_segments,
@@ -38,6 +39,43 @@ from record_layer import (
 
 # --------------------------------------------------------------------------
 # Настоящий HTTP-сервер, повторяющий контракт Control API MediaMTX
+
+
+# Длительности MediaMTX хранит разобранными и отдаёт в своей форме: `5m`,
+# принятый на входе, возвращается из `/v3/config/paths/list` как `5m0s`.
+#
+# Двойник обязан это повторять. Пока он возвращал ровно то, что мы прислали,
+# `test_sync_is_idempotent` ниже проходил, а на настоящем MediaMTX
+# синхронизация патчила **каждый** путь на каждом тике — то есть тест
+# подтверждал свойство, которого в реальности не было. Проверено запуском
+# настоящего MediaMTX v1.9.3 (цикл 30).
+_MTX_DURATION_KEYS = ("recordSegmentDuration", "recordDeleteAfter")
+
+
+def _normalize_duration(value: str) -> str:
+    """`5m` -> `5m0s`, `1h` -> `1h0m0s` — форма вывода time.Duration в Go."""
+    ns = _duration_ns(value)
+    if ns is None:
+        return value
+    if ns == 0:
+        return "0s"
+    h, rem = divmod(ns, 3_600_000_000_000)
+    m, rem = divmod(rem, 60_000_000_000)
+    sec = rem / 1_000_000_000
+    sec_text = f"{sec:g}s"
+    if h:
+        return f"{h}h{m}m{sec_text}"
+    if m:
+        return f"{m}m{sec_text}"
+    return sec_text
+
+
+def _normalize_like_mediamtx(conf: dict) -> dict:
+    out = dict(conf)
+    for key in _MTX_DURATION_KEYS:
+        if isinstance(out.get(key), str):
+            out[key] = _normalize_duration(out[key])
+    return out
 
 
 class _FakeMediaMTX(BaseHTTPRequestHandler):
@@ -67,7 +105,7 @@ class _FakeMediaMTX(BaseHTTPRequestHandler):
 
     def _body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
-        return json.loads(self.rfile.read(length)) if length else {}
+        return _normalize_like_mediamtx(json.loads(self.rfile.read(length)) if length else {})
 
     def do_POST(self):
         name = self.path.rsplit("/", 1)[-1]
@@ -330,3 +368,58 @@ def test_segments_of_different_cameras_do_not_bound_each_other(tmp_path):
 
     assert set(found) == {1, 2}
     assert found[1]["ended_ts"] != 1100
+
+
+# --------------------------------------------------------------------------
+# Нормализация длительностей MediaMTX (цикл 30)
+
+
+@pytest.mark.parametrize("sent,returned", [
+    ("5m", "5m0s"),          # ровно то, что делает MediaMTX с нашим конфигом
+    ("0s", "0s"),
+    ("1h", "1h0m0s"),
+    ("90s", "1m30s"),
+    ("1m30s", "90s"),
+])
+def test_durations_compare_by_value_not_by_spelling(sent, returned):
+    """MediaMTX хранит длительности разобранными и отдаёт в своей форме.
+
+    Пока сравнение шло по строке, `diff_paths()` считала изменившимся каждый
+    уже заведённый путь, и синхронизация патчила все 120 путей каждые 10 с —
+    вечно. Найдено запуском настоящего MediaMTX v1.9.3 (цикл 30); двойник в
+    этом файле возвращал ровно присланное и потому ничего не замечал.
+    """
+    conf = path_conf("rtsp://cam/main")
+    conf["recordSegmentDuration"] = sent
+    current = {"cam1": {**conf, "recordSegmentDuration": returned}}
+
+    _add, to_update, _del = diff_paths(current, {"cam1": conf})
+
+    assert to_update == {}, (
+        f"{sent!r} и {returned!r} — одна и та же длительность, "
+        "но путь считается изменившимся"
+    )
+
+
+def test_real_change_of_duration_is_still_detected():
+    """Обратная сторона: «нормализация» не должна проглатывать настоящую
+    правку. Иначе смена длительности сегмента в настройках не доезжала бы
+    до MediaMTX вовсе."""
+    conf = path_conf("rtsp://cam/main", segment_duration_min=10)
+    current = {"cam1": {**conf, "recordSegmentDuration": "5m0s"}}
+
+    _add, to_update, _del = diff_paths(current, {"cam1": conf})
+
+    assert list(to_update) == ["cam1"]
+
+
+@pytest.mark.parametrize("garbage", ["", "5 минут", "abc", None, 300, "5m мусор"])
+def test_unparseable_duration_falls_back_to_string_comparison(garbage):
+    """Строка, которую разобрать нельзя, не должна считаться равной чему
+    угодно: неизвестное значение — повод обновить путь, а не пропустить."""
+    conf = path_conf("rtsp://cam/main")
+    current = {"cam1": {**conf, "recordSegmentDuration": garbage}}
+
+    _add, to_update, _del = diff_paths(current, {"cam1": conf})
+
+    assert list(to_update) == ["cam1"]

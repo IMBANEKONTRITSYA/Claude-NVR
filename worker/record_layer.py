@@ -151,6 +151,60 @@ class MediaMTXClient:
         self._request("DELETE", f"/v3/config/paths/delete/{urllib.parse.quote(name)}")
 
 
+# Поля PathConf, значения которых MediaMTX нормализует у себя, прежде чем
+# вернуть в `/v3/config/paths/list`.
+_DURATION_KEYS = ("recordSegmentDuration", "recordDeleteAfter")
+
+_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(h|m|s|ms|us|ns)")
+
+_DURATION_UNITS = {
+    "h": 3_600_000_000_000, "m": 60_000_000_000, "s": 1_000_000_000,
+    "ms": 1_000_000, "us": 1_000, "ns": 1,
+}
+
+
+def _duration_ns(value) -> int | None:
+    """Длительность Go («5m», «5m0s», «1h30m») в наносекундах.
+
+    Нужна для сравнения, а не для вычислений: MediaMTX принимает `5m`, но
+    возвращает его как `5m0s`. Пока сравнение шло по строкам, `diff_paths()`
+    считала изменившимся **каждый** уже заведённый путь — и `sync_paths()`,
+    которая по своему же описанию «на неизменившемся списке камер не делает
+    ни одного пишущего запроса», на деле слала PATCH на все 120 путей каждые
+    10 секунд, вечно. Запись при этом не прерывалась (проверено на живом
+    MediaMTX: PATCH не перезапускает ни источник, ни рекордер), поэтому
+    архив был цел, а симптом сводился к постоянной нагрузке на Control API
+    и к бесполезному «updated: 120» в статистике.
+
+    None — если строку разобрать нельзя; тогда сравнение падает обратно на
+    строковое, то есть на прежнее поведение, а не на «значения равны».
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    sign = -1 if text.startswith("-") else 1
+    text = text.lstrip("+-")
+    matches = _DURATION_RE.findall(text)
+    # Разбор обязан покрыть строку целиком: «5m мусор» не должен молча
+    # стать пятью минутами.
+    if not matches or "".join(n + u for n, u in matches) != text.replace(" ", ""):
+        return None
+    return sign * int(sum(float(n) * _DURATION_UNITS[u] for n, u in matches))
+
+
+def _values_differ(key: str, have, want) -> bool:
+    """Отличается ли значение поля пути от желаемого."""
+    if have == want:
+        return False
+    if key in _DURATION_KEYS:
+        a, b = _duration_ns(have), _duration_ns(want)
+        if a is not None and b is not None:
+            return a != b
+    return True
+
+
 def diff_paths(current: dict[str, dict], desired: dict[str, dict]) -> tuple[dict, dict, list[str]]:
     """(добавить, обновить, удалить) — чистая функция, чтобы решение о том,
     что именно делать с чужими путями, было проверяемо отдельно от сети.
@@ -158,6 +212,9 @@ def diff_paths(current: dict[str, dict], desired: dict[str, dict]) -> tuple[dict
     Удаляются только пути вида `cam{N}`: MediaMTX может обслуживать и другие
     (ручная публикация при диагностике), и слой записи не имеет права их
     сносить.
+
+    Длительности сравниваются по значению, а не по строке, — см.
+    `_duration_ns()`: MediaMTX возвращает их в своей нормализованной форме.
     """
     to_add = {n: c for n, c in desired.items() if n not in current}
     to_update = {}
@@ -165,7 +222,7 @@ def diff_paths(current: dict[str, dict], desired: dict[str, dict]) -> tuple[dict
         if name not in current:
             continue
         have = current[name]
-        if any(have.get(k) != v for k, v in conf.items()):
+        if any(_values_differ(k, have.get(k), v) for k, v in conf.items()):
             to_update[name] = conf
     to_delete = [
         n for n in current

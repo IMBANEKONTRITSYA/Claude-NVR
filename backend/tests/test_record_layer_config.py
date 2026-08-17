@@ -32,6 +32,32 @@ def test_mediamtx_control_api_enabled():
     assert MEDIAMTX.get("api") is True
 
 
+def test_hls_segment_count_satisfies_low_latency_minimum():
+    """§4 «просмотр видео в реальном времени» держится на HLS из MediaMTX.
+
+    `hlsVariant` не задан, то есть действует значение по умолчанию —
+    `lowLatency`, а Low-Latency HLS требует **минимум 7 сегментов**. При
+    меньшем числе муксер не поднимается вовсе: в лог идёт «Low-Latency HLS
+    requires at least 7 segments», а `GET /cam{N}/index.m3u8` отвечает 404,
+    то есть живого просмотра нет ни на одной камере.
+
+    Найдено в цикле 30 запуском настоящего MediaMTX v1.9.3 с этим самым
+    файлом (бинарник статический, Docker для него не нужен — 13 циклов
+    подряд пробел числился как «нет Docker в песочнице»). При 5 сегментах —
+    404 и ошибка в логе, при 7 — 200 и валидный плейлист.
+
+    Проверка на минимум, а не на равенство: увеличить число сегментов
+    можно, уменьшить ниже семи — нельзя.
+    """
+    variant = MEDIAMTX.get("hlsVariant", "lowLatency")
+    if variant != "lowLatency":
+        pytest.skip(f"hlsVariant={variant}: ограничение LL-HLS не применяется")
+    assert MEDIAMTX.get("hlsSegmentCount", 0) >= 7, (
+        "с hlsVariant=lowLatency и менее чем 7 сегментами HLS-муксер не "
+        "стартует, и живой просмотр (§4) не работает ни на одной камере"
+    )
+
+
 def test_mediamtx_writes_to_the_shared_media_volume():
     """Сегменты обязаны лечь в тот же том, который читает архив бэкенда и
     чистит ротация воркера, — иначе запись идёт «в никуда» внутрь
