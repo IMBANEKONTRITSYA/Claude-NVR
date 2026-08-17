@@ -18,24 +18,9 @@ import pytest
 from app.services import camera_config
 
 
-@pytest.fixture()
-def cam_residue(client, admin_headers):
-    """Убирает камеры, появившиеся за время теста.
-
-    Фикстура `make_camera` из conftest.py тут не помогает: камеры заводит
-    сам импорт, и их id тест заранее не знает. Снимок «что было до» и
-    удаление всего нового покрывает и этот случай, и случай, когда импорт
-    неожиданно применился вопреки ожиданию теста, — иначе упавший тест
-    оставит камеры в БД и уронит следующий прогон (сторож
-    test_zz_suite_leaves_no_residue.py и урок цикла 21).
-    """
-    def _ids():
-        return {c["id"] for c in client.get("/api/cameras", headers=admin_headers).json()}
-
-    before = _ids()
-    yield
-    for cam_id in _ids() - before:
-        client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
+# Фикстура `cam_residue` (уборка камер, id которых тест заранее не знает)
+# с цикла 36 живёт в conftest.py: она понадобилась и тестам режима записи
+# по движению (test_record_on_motion_api.py).
 
 
 # --- разбор и маскирование (чистые функции, БД не нужна) --------------------
@@ -300,6 +285,7 @@ def test_camera_without_schedule_exports_empty_cell():
         onvif_enabled = False
         onvif_host = onvif_username = None
         detection_schedule = roi = None
+        record_on_motion = False   # SPEC §6, добавлено циклом 36
 
     row = camera_config.camera_row(_Cam(), "rtsp://10.0.0.2/s", None, include_secrets=True)
     assert row["detection_schedule"] is None and row["roi"] is None

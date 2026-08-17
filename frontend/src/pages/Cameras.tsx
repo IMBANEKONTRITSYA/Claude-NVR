@@ -18,6 +18,9 @@ const EMPTY_FORM = {
   // SPEC §6: расписание детекции. Выключенное — «детекция круглосуточно»
   // (в payload уходит null, см. submit).
   detection_schedule: EMPTY_SCHEDULE as DetectionSchedule,
+  // SPEC §6: «запись только при движении (опционально)». Выключено по
+  // умолчанию: режим удаляет уже записанное, и включаться должен явно.
+  record_on_motion: false,
 };
 
 /** Редактор расписания детекции камеры (SPEC §6: «расписание детекции
@@ -168,6 +171,9 @@ export function Cameras() {
       // другой правки камеры стирало бы его — та же ошибка, что была с
       // ONVIF-полями.
       detection_schedule: scheduleFromCamera(c.detection_schedule),
+      // По той же причине, что и расписание: не вернув флаг в форму,
+      // сохранение любой другой правки выключало бы режим.
+      record_on_motion: !!c.record_on_motion,
       onvif_enabled: !!c.onvif_enabled, onvif_host: c.onvif_host || "",
       onvif_port: c.onvif_port || 80, onvif_username: c.onvif_username || "",
       onvif_password: "",
@@ -352,7 +358,14 @@ export function Cameras() {
               </div>
               <div className="field">
                 <label>Режим камеры</label>
-                <select value={form.mode} onChange={e => setForm({ ...form, mode: e.target.value })}>
+                <select value={form.mode} onChange={e => setForm({
+                  ...form,
+                  mode: e.target.value,
+                  // Перевод в «только запись» снимает и запись по движению:
+                  // без источника движения бэкенд её не примет (400), и
+                  // форма падала бы с ошибкой на несвязанной правке.
+                  record_on_motion: e.target.value === "analytics" && form.record_on_motion,
+                })}>
                   <option value="record_only">Только запись — непрерывный архив, без распознавания</option>
                   <option value="analytics">Аналитика — запись плюс детекция и распознавание лиц</option>
                 </select>
@@ -377,6 +390,28 @@ export function Cameras() {
               {form.mode === "analytics" && (
                 <DetectionScheduleEditor value={form.detection_schedule}
                   onChange={s => setForm({ ...form, detection_schedule: s })} />
+              )}
+              {/* SPEC §6 «запись только при движении». Показывается только
+                  для аналитики: источник движения есть лишь у камер,
+                  которые кто-то декодирует. */}
+              {form.mode === "analytics" && (
+                <div className="field">
+                  <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <input type="checkbox" style={{ width: "auto" }}
+                      checked={form.record_on_motion}
+                      onChange={e => setForm({ ...form, record_on_motion: e.target.checked })} />
+                    Хранить только запись с движением
+                  </label>
+                  <div className="hint">
+                    Камера пишется непрерывно (остановить запись по движению нельзя —
+                    слой записи независим от аналитики), но фрагменты, в которых
+                    аналитика движения не видела, удаляются из архива досрочно, не
+                    дожидаясь глубины хранения. Промежутки, когда аналитика не
+                    работала — перезапуск, пауза по расписанию, отвал потока, —
+                    сохраняются целиком: «не смотрели» не то же самое, что
+                    «движения не было».
+                  </div>
+                </div>
               )}
               <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
                 <input type="checkbox" style={{ width: "auto" }} checked={form.enabled}
@@ -618,8 +653,9 @@ export function Cameras() {
           <code> name</code>: известное имя — обновление, новое — добавление.
           Файл применяется целиком: если хоть в одной строке ошибка, не
           применяется ни одна. Колонки, которой в файле нет, изменение не
-          коснётся: файл прежней версии без <code>detection_schedule</code> и
-          <code> roi</code> не снимет расписание и зоны с уже заведённых камер.
+          коснётся: файл прежней версии без <code>detection_schedule</code>,
+          <code> roi</code> и <code>record_on_motion</code> не снимет расписание,
+          зоны и режим записи по движению с уже заведённых камер.
           Пустая ячейка в этих колонках — наоборот, снимает настройку.
         </p>
         <div className="row">
@@ -688,6 +724,10 @@ export function Cameras() {
                     {c.name}
                     {c.has_substream && <span className="muted" style={{ fontSize: 10, marginLeft: 6 }} title="У камеры есть субпоток для детекции">SUB</span>}
                     {c.onvif_enabled && <span className="muted" style={{ fontSize: 10, marginLeft: 6 }} title="Движение — по событиям ONVIF">ONVIF</span>}
+                    {/* SPEC §6: режим удаляет записанное, и по списку камер
+                        должно быть видно, на каких он включён, без захода
+                        в форму каждой. */}
+                    {c.record_on_motion && <span className="muted" style={{ fontSize: 10, marginLeft: 6 }} title="В архиве остаются только фрагменты с движением">ДВИЖ</span>}
                   </td>
                   <td className="muted">{c.location || "—"}</td>
                   <td>{c.mode === "analytics" ? "Аналитика" : "Только запись"}</td>

@@ -174,6 +174,10 @@ class CameraIn(BaseModel):
     # SPEC §6: расписание детекции (день/ночь, рабочие часы). None —
     # круглосуточно.
     detection_schedule: DetectionScheduleIn | None = None
+    # SPEC §6: «запись только при движении (опционально)». Дефолт False —
+    # и в форме камеры, и при импорте конфигурации: режим удаляет записанное,
+    # и включаться он должен только явным действием администратора.
+    record_on_motion: bool = False
 
     _check_rtsp_url = field_validator("rtsp_url")(_validate_rtsp_url_required)
     _check_sub_rtsp_url = field_validator("sub_rtsp_url")(_validate_rtsp_url_optional)
@@ -204,6 +208,10 @@ class CameraOut(BaseModel):
     # правки камеры стирало бы расписание (ровно та ошибка, что уже была с
     # ONVIF-полями выше).
     detection_schedule: dict | None = None
+    # SPEC §6: та же причина, что и у расписания выше — форма обязана
+    # вернуть флаг обратно без изменений, иначе правка любого другого поля
+    # камеры молча выключала бы режим.
+    record_on_motion: bool = False
 
     class Config:
         from_attributes = True

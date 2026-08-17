@@ -85,6 +85,14 @@ async def apply_schema_migrations(conn):
         # означает «круглосуточно», то есть поведение существующих камер
         # после обновления не меняется (см. models.py).
         "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS detection_schedule jsonb",
+        # SPEC §6: «запись только при движении (опционально)». Опция —
+        # значит выключена у всех существующих камер: включение задним
+        # числом означало бы удаление уже записанного архива на объекте,
+        # который об этой функции ещё не знает.
+        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS record_on_motion boolean DEFAULT false",
+        "UPDATE cameras SET record_on_motion = false WHERE record_on_motion IS NULL",
+        "ALTER TABLE cameras ALTER COLUMN record_on_motion SET DEFAULT false",
+        "ALTER TABLE cameras ALTER COLUMN record_on_motion SET NOT NULL",
         # SPEC §21: фактический расход и выбор старейших сегментов под
         # циклическую перезапись. Существующим строкам ставится 0 («размер
         # неизвестен»), а не фактический размер файла: обход архива на 120

@@ -1,6 +1,6 @@
 from datetime import datetime
-from sqlalchemy import (String, Integer, BigInteger, DateTime, ForeignKey, Boolean, JSON,
-                        Text, func, text)
+from sqlalchemy import (String, Integer, BigInteger, DateTime, ForeignKey, Boolean, Index,
+                        JSON, Text, func, text)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 from .db import Base
@@ -75,6 +75,13 @@ class Camera(Base):
     # на обновлении остановила бы аналитику на объекте молча.
     # Окно с start > end — через полночь; см. worker/detection_schedule.py.
     detection_schedule: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # SPEC §6: «запись только при движении (опционально)». Флаг не
+    # останавливает запись — слой записи по §2 независим и о движении не
+    # знает; он включает досрочное удаление сегментов, в которых аналитика
+    # движения не наблюдала (см. worker/motion_windows.py). Требует режима
+    # analytics: источник движения есть только у декодируемых камер.
+    record_on_motion: Mapped[bool] = mapped_column(Boolean, default=False,
+                                                   server_default=text("false"))
 
 
 class Person(Base):
@@ -122,6 +129,33 @@ class VideoSegment(Base):
     # 120 камерах × 14 дней (~36 ТБ) на int4 было бы реальным.
     size_bytes: Mapped[int] = mapped_column(BigInteger, default=0,
                                             server_default=text("0"))
+
+
+class MotionWindow(Base):
+    """Промежуток, в который слой аналитики наблюдал камеру (SPEC §6).
+
+    Пишется воркером, читается уборкой архива в режиме «запись только при
+    движении». Хранится именно наблюдение, а не движение: без отметки
+    «мы смотрели» отсутствие движения неотличимо от неработающей
+    аналитики, и режим удалял бы архив камеры, у которой упал воркер.
+    Подробнее — в docstring `worker/motion_windows.py`.
+    """
+
+    __tablename__ = "motion_windows"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="CASCADE"),
+                                           index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    ended_at: Mapped[datetime] = mapped_column(DateTime)
+    motion: Mapped[bool] = mapped_column(Boolean, default=False,
+                                         server_default=text("false"))
+
+    # Уборка всегда спрашивает окна одной камеры за отрезок времени, а на
+    # объекте это 1440 строк в сутки на камеру аналитики: составной индекс
+    # превращает выборку в диапазонный скан вместо фильтра по всей таблице.
+    __table_args__ = (
+        Index("idx_motion_windows_camera_started", "camera_id", "started_at"),
+    )
 
 
 class Setting(Base):

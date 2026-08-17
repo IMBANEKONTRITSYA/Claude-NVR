@@ -42,7 +42,31 @@ def _camera_out(c: Camera) -> CameraOut:
         onvif_host=c.onvif_host, onvif_port=c.onvif_port,
         onvif_username=c.onvif_username,
         detection_schedule=c.detection_schedule,
+        record_on_motion=bool(c.record_on_motion),
     )
+
+
+def _check_motion_recording(payload) -> None:
+    """SPEC §6: «запись только при движении» требует режима analytics.
+
+    Источник движения есть только у камеры, которую кто-то декодирует:
+    MOG2-префильтр и события ONVIF читает нить аналитики, а `record_only`
+    камеру не открывает никто (§2 — слой записи идёт remux'ом, без
+    декодирования). Флаг на такой камере не ошибочен по данным, он просто
+    никогда ничего не сделает: наблюдения не будет, покрытия не будет, ни
+    один сегмент не удалится.
+
+    Молча принять его хуже, чем отказать: администратор считает, что диск
+    экономится, и обнаружит обратное по заполнению тома. Поэтому отказ с
+    объяснением, а не тихое сохранение мёртвой настройки.
+    """
+    if payload.record_on_motion and payload.mode != "analytics":
+        raise HTTPException(
+            400,
+            "«Запись только при движении» доступна камерам в режиме "
+            "«аналитика»: движение определяет слой аналитики, а камера "
+            "в режиме «только запись» не декодируется вовсе.",
+        )
 
 
 async def _analytics_limit(db: AsyncSession) -> int:
@@ -85,6 +109,7 @@ async def list_cameras(_=Depends(get_current_user), db: AsyncSession = Depends(g
 
 @router.post("", response_model=CameraOut)
 async def add_camera(payload: CameraIn, _=Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
+    _check_motion_recording(payload)
     if payload.mode == "analytics":
         await _ensure_analytics_slot(db)
     cam = Camera(
@@ -107,6 +132,7 @@ async def add_camera(payload: CameraIn, _=Depends(require_role("admin")), db: As
         # но NULL честнее показывает, что расписание не задавали.
         detection_schedule=(payload.detection_schedule.model_dump()
                             if payload.detection_schedule else None),
+        record_on_motion=payload.record_on_motion,
     )
     db.add(cam)
     await db.commit()
@@ -120,6 +146,7 @@ async def update_camera(cam_id: int, payload: CameraIn, _=Depends(require_role("
     cam = await db.get(Camera, cam_id)
     if not cam:
         raise HTTPException(404, "Камера не найдена")
+    _check_motion_recording(payload)
     cam.name = payload.name
     cam.rtsp_url_enc = encrypt(payload.rtsp_url)
     # Пустое поле субпотока очищает его, отсутствующее — оставляет прежнее значение
@@ -149,6 +176,7 @@ async def update_camera(cam_id: int, payload: CameraIn, _=Depends(require_role("
     # «снять расписание, вернуть круглосуточную детекцию».
     cam.detection_schedule = (payload.detection_schedule.model_dump()
                               if payload.detection_schedule else None)
+    cam.record_on_motion = payload.record_on_motion
     await db.commit()
     await db.refresh(cam)
     await get_redis().publish("cameras:changed", str(cam.id))
@@ -684,6 +712,19 @@ def _row_to_camera_in(row: dict, existing: Camera | None) -> tuple[CameraIn, dic
         except ValidationError as e:
             raise ValueError("; ".join(_pydantic_messages(e))) from None
 
+    # SPEC §6. Как и у расписания выше: колонки нет — сохранённое значение
+    # не трогаем (файл прежней версии не должен выключать режим на всём
+    # парке), колонка есть и пуста — режим снимается.
+    record_on_motion = camera_config.parse_bool(
+        row.get("record_on_motion"),
+        False if existing is None else bool(existing.record_on_motion),
+    )
+    if record_on_motion and mode != "analytics":
+        raise ValueError(
+            "record_on_motion=1 требует mode=analytics: движение определяет "
+            "слой аналитики, камера в режиме record_only не декодируется"
+        )
+
     try:
         return CameraIn(
             name=name,
@@ -699,6 +740,7 @@ def _row_to_camera_in(row: dict, existing: Camera | None) -> tuple[CameraIn, dic
             onvif_port=camera_config.parse_int(row.get("onvif_port"), "onvif_port"),
             onvif_username=str(row.get("onvif_username") or "").strip() or None,
             detection_schedule=schedule,
+            record_on_motion=record_on_motion,
         ), roi
     except ValidationError as e:
         raise ValueError("; ".join(_pydantic_messages(e))) from None
@@ -819,6 +861,7 @@ async def import_cameras(
         cam.onvif_username = payload.onvif_username
         cam.detection_schedule = (payload.detection_schedule.model_dump()
                                   if payload.detection_schedule else None)
+        cam.record_on_motion = payload.record_on_motion
         cam.roi = roi
         if action == "create":
             db.add(cam)
