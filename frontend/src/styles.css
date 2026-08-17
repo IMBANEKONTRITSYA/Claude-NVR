@@ -146,6 +146,16 @@ table tbody tr { border-top: 1px solid var(--border); }
 table tbody tr:hover { background: var(--bg2); }
 .table-scroll { max-height: 60vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
 
+/* Плеер архива с покадровым просмотром (SPEC §5). Контейнер получает
+   фокус ради стрелок, но рамку фокуса браузера убираем — она обводила бы
+   всё видео целиком. */
+.seg-player:focus { outline: none; }
+.seg-player:focus-visible { outline: 1px solid var(--border); }
+.seg-player-bar {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 8px; flex-wrap: wrap;
+}
+
 /* Миниатюра кадра сегмента в выдаче архива (SPEC §7). Размер задан в CSS,
    а не атрибутами img: строка таблицы не должна прыгать, пока картинка
    догружается ленивой загрузкой. */
