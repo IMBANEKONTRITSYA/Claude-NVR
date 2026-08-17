@@ -60,6 +60,13 @@ SCHEMA: dict[str, tuple] = {
     # Верхняя граница 16 — предел, при котором §23 (2-3 ядра на аналитику)
     # ещё выполним на целевом сервере без GPU.
     "analytics_cameras_max": (int, 1, 16),
+    # SPEC §16, §19: потолок CPU слоя аналитики — сколько потоков отдать
+    # пулу ONNX Runtime. 0 — считать автоматически из числа ядер сервера и
+    # `analytics_cameras_max` (worker/ort_threads.py). Верхняя граница 128 —
+    # с запасом над §20 (2× CPU, 64 потока); пул больше числа ядер не
+    # ускоряет ничего, поэтому воркер дополнительно режет значение по
+    # фактическому числу ядер.
+    "analytics_threads": (int, 0, 128),
     # SPEC §5, §21: циклическая перезапись и алерты по заполнению диска.
     # Верхняя граница 50% у порога перезаписи — выше него «свободное место»
     # перестаёт быть аварийным запасом и превращается в способ выбросить
@@ -119,6 +126,7 @@ class SettingsUpdate(BaseModel):
     detect_width: int | None = None
     record_segment_min: int | None = None
     analytics_cameras_max: int | None = None
+    analytics_threads: int | None = None
     disk_min_free_pct: int | None = None
     disk_warn_pct: int | None = None
     disk_crit_pct: int | None = None

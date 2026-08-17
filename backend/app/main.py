@@ -177,6 +177,11 @@ async def lifespan(app: FastAPI):
             "alert_sound_enabled": "0",
             "alert_cooldown_sec": "300",
             "record_segment_min": "5",
+            # SPEC §16, §19: потолок CPU слоя аналитики. Ноль — «подобрать
+            # автоматически по числу ядер сервера»: значение в БД не может
+            # быть верным для всех объектов, а сервер воркер видит сам
+            # (worker/ort_threads.py).
+            "analytics_threads": "0",
             "performance_profile": DEFAULT_PROFILE,
             # detection_fps, frame_skip, face_model, upscale_mode и т.д.
             **profile_settings(DEFAULT_PROFILE),

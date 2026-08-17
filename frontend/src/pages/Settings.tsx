@@ -129,6 +129,7 @@ export function Settings() {
         <Field label="Интервал кластеризации (мин)" value={s.cluster_interval_min} onChange={upd("cluster_interval_min")} hint="Пакетное объединение дублей неизвестных персон" />
         <Field label="Длительность сегмента записи (мин)" value={s.record_segment_min} onChange={upd("record_segment_min")} hint="5–10 минут. Архив пишется как есть, без перекодирования, поэтому кодек и битрейт задаются на самой камере" />
         <Field label="Камер в режиме аналитики, максимум" value={s.analytics_cameras_max} onChange={upd("analytics_cameras_max")} hint="Запись идёт по всем камерам; распознавание лиц — только на этом числе выбранных, оно и определяет нагрузку на процессор" />
+        <Field label="Потоков CPU на камеру аналитики" value={s.analytics_threads} onChange={upd("analytics_threads")} hint="0 — подобрать автоматически: половина ядер сервера делится между камерами аналитики, но не больше 2 потоков на камеру. Больше потоков ускоряет одну камеру и замедляет остальные: замер даёт 9.7 FPS на канал при одном потоке и 4.6 при неограниченном пуле на четырёх камерах. Применяется после перезагрузки модели (~10 с)" />
       </div>
 
       <div className="card" style={{ maxWidth: 520, marginBottom: 16 }}>

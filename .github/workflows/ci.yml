@@ -184,14 +184,26 @@ jobs:
       - name: Install ffmpeg
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
       - name: Install bench deps
-        run: pip install opencv-python-headless numpy onnxruntime onnx
+        # insightface — ради группы `chain`: она единственная отвечает на
+        # §19 «детекция ≥ 5 FPS/канал» и §16 «0.5-1.5 ядра на камеру»
+        # целиком, на настоящей модели. До цикла 36 группа в CI не гонялась
+        # вовсе, и оба норматива отслеживались только замерами вручную из
+        # песочницы — то есть между циклами не сравнивались никак.
+        run: pip install opencv-python-headless numpy onnxruntime onnx insightface scikit-image
       - name: Run benchmarks
         run: python perf/bench.py --json | tee perf-results.json
+      - name: Run analytics chain benchmark
+        # Отдельным шагом, потому что тянет модель `buffalo_s` (~125 МБ) из
+        # сети: отказ скачивания помечается в результате как `skipped` и не
+        # должен уносить остальные группы, уже сложенные в артефакт выше.
+        run: python perf/bench.py --only chain --json | tee perf-chain.json
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
           name: perf-results
-          path: perf-results.json
+          path: |
+            perf-results.json
+            perf-chain.json
 
   frontend:
     runs-on: ubuntu-latest
