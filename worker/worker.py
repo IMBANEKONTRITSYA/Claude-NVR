@@ -45,6 +45,7 @@ from backoff import reconnect_delay
 from detection_schedule import schedule_active
 from face_select import pick_matching_face
 from fileage import prune_media
+from ort_threads import analytics_thread_budget, limit_threads as limit_ort_threads
 from motion_windows import (DEFAULT_GUARD_SEC, MotionWindowTracker,
                             SETTLE_SEC as MOTION_SETTLE_SEC,
                             segments_without_motion)
@@ -110,6 +111,14 @@ CONFIG = {
     "motion_prefilter": 1,     # детектор лиц только по движению
     "idle_fps": 2,             # частота при длительном отсутствии движения
     "face_model": "buffalo_s",
+    # SPEC §16, §19: потолок CPU слоя аналитики. 0 — считать автоматически
+    # из числа ядер и `analytics_cameras_max` (см. ort_threads.py). Читается
+    # воркером, потому что применяется к сессиям ONNX Runtime при загрузке
+    # модели, а не запросом к БД.
+    "analytics_threads": 0,
+    # Разрешённое число камер analytics (то же значение, что у бэкенда в
+    # routers/cameras.py). Воркеру нужно как делитель бюджета потоков.
+    "analytics_cameras_max": 2,
     "upscale_mode": "avatar",  # manual | avatar | all
     "cluster_interval_min": 15,
     "detect_width": 640,
@@ -138,6 +147,7 @@ _CONFIG_TYPES = {
     "alert_email_to": str,
     "frame_skip": int, "motion_prefilter": int, "idle_fps": int,
     "face_model": str, "upscale_mode": str, "cluster_interval_min": int,
+    "analytics_threads": int, "analytics_cameras_max": int,
     "detect_width": int, "record_segment_min": int,
     "disk_min_free_pct": int, "disk_warn_pct": int, "disk_crit_pct": int,
 }
@@ -424,15 +434,36 @@ FACE_APP = None
 FACE_MODULES = ["detection", "recognition"]
 
 
+def analytics_threads() -> int:
+    """Потоков ORT на камеру analytics (SPEC §16, §19).
+
+    Считается из числа ядер машины и разрешённого числа камер analytics —
+    см. ort_threads.py о том, почему без этого потолка одна камера
+    занимала машину целиком, мешала слою записи (§2) и на четырёх камерах
+    роняла канал ниже норматива §19 «≥ 5 FPS».
+    """
+    return analytics_thread_budget(
+        os.cpu_count() or 1,
+        int(CONFIG["analytics_cameras_max"]),
+        int(CONFIG["analytics_threads"]),
+    )
+
+
 def load_face_app(model_name: str | None = None):
     """Загружает модель детекции/распознавания с учётом профиля (ТЗ 18.5)."""
     global ACCELERATOR, FACE_APP
+    # Потолок CPU ставится ДО создания сессий: опции читаются в момент
+    # создания, у существующей сессии пул уже свой.
+    threads = analytics_threads()
+    limited = limit_ort_threads(threads)
     from insightface.app import FaceAnalysis
     name = model_name or CONFIG["face_model"]
     providers = detect_providers()
     ACCELERATOR = providers[0].replace("ExecutionProvider", "")
     size = int(CONFIG["detect_width"])
-    logger.info("модель загружена", extra={"model": name, "accelerator": ACCELERATOR, "det_size": size})
+    logger.info("модель загружена", extra={"model": name, "accelerator": ACCELERATOR,
+                                           "det_size": size, "ort_threads": threads,
+                                           "ort_threads_applied": limited})
     app = FaceAnalysis(name=name, providers=providers, allowed_modules=FACE_MODULES)
     app.prepare(ctx_id=0, det_size=(size, size))
     FACE_APP = app
@@ -1911,7 +1942,7 @@ def manager():
     loaded_model = None
     _try_load_model()
     if FACE_APP is not None:
-        loaded_model = (CONFIG["face_model"], CONFIG["detect_width"])
+        loaded_model = (CONFIG["face_model"], CONFIG["detect_width"], analytics_threads())
 
     threads: dict[int, threading.Thread] = {}
     last_cleanup = 0.0
@@ -1924,7 +1955,11 @@ def manager():
     while not shutdown_event.is_set():
         try:
             refresh_config()
-            want_model = (CONFIG["face_model"], CONFIG["detect_width"])
+            # Бюджет потоков ORT — часть параметров модели: он применяется
+            # к сессиям при создании, и смена настройки без перезагрузки
+            # модели ничего бы не изменила (SPEC §16).
+            want_model = (CONFIG["face_model"], CONFIG["detect_width"],
+                          analytics_threads())
             # Смена модели/разрешения в профиле применяется без перезапуска
             if FACE_APP is not None and want_model != loaded_model:
                 logger.info("параметры модели изменились, перезагружаю")

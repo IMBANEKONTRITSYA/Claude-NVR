@@ -260,6 +260,15 @@ def bench_inference() -> dict:
 # SPEC §19: «Детекция ≥ 5 FPS/канал на камерах analytics».
 DETECTION_FPS_TARGET = 5.0
 
+# SPEC §16 «Слой аналитики»: «MobileFaceNet CPU: ~0.5-1.5 ядра на камеру
+# (5 FPS)». Верх вилки — то самое число, по которому автоконфигурация (§16)
+# решает, сколько камер analytics предложить администратору
+# (`ANALYTICS_CORES_PER_CAMERA` в backend/app/services/autoconfig.py).
+# До цикла 36 оно ни разу не измерялось: циклы 29 и 34 мерили FPS цепочки,
+# а не её стоимость в ядрах, — а именно вторая величина определяет, сколько
+# камер влезет в сервер, и она же входит в §19 «CPU ≤ 80 %».
+ANALYTICS_CORES_PER_CAMERA_SPEC = 1.5
+
 
 def _sample_face_image():
     """Кадр с настоящими лицами из состава insightface.
@@ -358,14 +367,32 @@ def bench_analytics_chain(path: str, single_thread: bool = True) -> dict:
     * `.get()` считает и эмбеддинг, поэтому отдельного шага для него нет.
 
     `single_thread=True` — честное число НА КАНАЛ: §16 отводит аналитике
-    0.5–1.5 ядра на камеру, то есть камеры идут своими процессами и делят
-    ядра, а не забирают все 64 каждая. Прогон в несколько потоков ORT
-    показал бы FPS одной камеры на пустом сервере — величину, которой на
-    объекте не существует.
+    0.5–1.5 ядра на камеру, то есть камеры делят ядра, а не забирают все 64
+    каждая. Прогон без ограничения показал бы FPS одной камеры на пустом
+    сервере — величину, которой на объекте не существует.
+
+    **Как это ограничение ставится и почему не так, как раньше.** До цикла
+    36 здесь выставлялись `OMP_NUM_THREADS=1` и подобные, и замер считался
+    однопоточным. Он им не был: сборки ONNX Runtime с 1.16 используют
+    собственный пул потоков вместо OpenMP, и эти переменные на него не
+    влияют. Фактически при «одном потоке» было занято 3.97 ядра из 4, то
+    есть числа циклов 29 и 34 (8.39 и 9.48 FPS/канал) сняты на четырёх
+    ядрах, а не на одном. Теперь используется тот же ограничитель, что и в
+    production (`worker/ort_threads.py`), и `cores_per_camera_at_target`
+    показывает, сколько ядер канал занимает на самом деле.
     """
     if single_thread:
-        # Должно быть выставлено ДО импорта onnxruntime: число потоков
-        # OpenMP читается при загрузке рантайма, а не при создании сессии.
+        # Тот же механизм, что в worker.load_face_app(): бенчмарк обязан
+        # мерить production-путь, иначе его числа не про систему.
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "worker"))
+        try:
+            import ort_threads
+            ort_threads.limit_threads(1)
+        except ImportError:
+            # Каталог воркера рядом обычно есть; если нет — замер идёт без
+            # ограничения, и это видно по cores_per_camera_at_target.
+            pass
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             os.environ[var] = "1"
     try:
@@ -398,6 +425,13 @@ def bench_analytics_chain(path: str, single_thread: bool = True) -> dict:
 
     t_decode, t_prefilter, t_detect = [], [], []
     frames = faces_total = detector_runs = 0
+    # Процессорное время, а не только настенное: стоимость канала в ЯДРАХ
+    # (§16) — это CPU-секунды на кадр, помноженные на целевой FPS. Настенное
+    # время дало бы ту же величину лишь при строго одном занятом потоке, а
+    # ORT и OpenCV способны занять больше даже с OMP_NUM_THREADS=1 (свои
+    # пулы). `process_time()` считает по всем нитям процесса, поэтому такая
+    # утечка параллелизма попадёт в число, а не спрячется в нём.
+    cpu_start = time.process_time()
     t_start = time.perf_counter()
     while True:
         t0 = time.perf_counter()
@@ -424,16 +458,30 @@ def bench_analytics_chain(path: str, single_thread: bool = True) -> dict:
         if motion:
             t_detect.append((t3 - t2) * 1000)
     wall = time.perf_counter() - t_start
+    cpu_sec = time.process_time() - cpu_start
     cap.release()
 
     if not frames:
         return {"error": "клип не содержит кадров"}
 
     chain_fps = frames / wall
+    # Стоимость одного канала аналитики в ядрах при целевых 5 FPS (§16).
+    # Считается по CPU-времени: сколько ядер занимает камера, а не как
+    # быстро она идёт на свободном сервере.
+    cores_per_camera = cpu_sec / frames * DETECTION_FPS_TARGET
     return {
         "frames": frames,
         "wall_sec": round(wall, 2),
+        "cpu_sec": round(cpu_sec, 2),
         "chain_fps": round(chain_fps, 2),
+        "ms_cpu_per_frame": round(cpu_sec / frames * 1000, 2),
+        "cores_per_camera_at_target": round(cores_per_camera, 3),
+        "cores_per_camera_spec": ANALYTICS_CORES_PER_CAMERA_SPEC,
+        "meets_cores_budget": cores_per_camera <= ANALYTICS_CORES_PER_CAMERA_SPEC,
+        # Доля кадров, на которых сработал префильтр и запускался детектор.
+        # Без неё стоимость канала не читается: на пустом коридоре детектор
+        # почти не запускается, и та же цепочка стоит в разы меньше.
+        "detector_duty": round(detector_runs / frames, 3),
         "target_fps": DETECTION_FPS_TARGET,
         "meets_target": chain_fps >= DETECTION_FPS_TARGET,
         "detector_runs": detector_runs,
@@ -1122,6 +1170,16 @@ def main() -> int:
             verdict = "укладывается" if ch["meets_target"] else "НЕ УКЛАДЫВАЕТСЯ"
             print(f"  ИТОГО цепочка: {ch['chain_fps']:.2f} FPS/канал — {verdict} "
                   f"в норматив {ch['target_fps']:.0f} FPS")
+            # Второй норматив того же замера: стоимость канала в ядрах
+            # (§16). Именно по ней автоконфигурация считает, сколько камер
+            # analytics предложить, и она же входит в §19 «CPU ≤ 80 %».
+            cores_verdict = ("укладывается" if ch["meets_cores_budget"]
+                             else "НЕ УКЛАДЫВАЕТСЯ")
+            print(f"  {'CPU на кадр':28} {ch['ms_cpu_per_frame']:8.2f} мс "
+                  f"(детектор на {ch['detector_duty'] * 100:.0f}% кадров)")
+            print(f"  ИТОГО стоимость канала: {ch['cores_per_camera_at_target']:.3f} "
+                  f"ядра при {ch['target_fps']:.0f} FPS — {cores_verdict} "
+                  f"в вилку §16 (≤ {ch['cores_per_camera_spec']} ядра/камера)")
 
     if "archive" in res:
         ar = res["archive"]
