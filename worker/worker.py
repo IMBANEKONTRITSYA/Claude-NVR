@@ -52,6 +52,7 @@ from segment_index import index_new_segments
 from snapshot_http import fetch_snapshot_bytes
 from storage import (BYTES_PER_GB, bytes_to_free, disk_alert_level,
                      expired_segments, oldest_segments_to_free)
+from thumbs import drop_thumb
 from shutdown import shutdown_event, handle_shutdown_signal
 from logging_utils import configure_logging
 from hwaccel import hw_decode_requested, detect_hw_accelerator_name
@@ -1398,6 +1399,12 @@ def _drop_segments(s, segments) -> int:
                 os.remove(seg.file_path)
         except Exception:
             pass
+        # Миниатюра (SPEC §7) живёт отдельным файлом в `thumbs/` и под
+        # `prune_media`, который чистит `segments/` по возрасту файла, не
+        # попадает. Без этой строки она пережила бы свой сегмент навсегда:
+        # id сегмента больше никогда не повторится, значит никто её и не
+        # перезапишет.
+        drop_thumb(MEDIA_PATH, seg.id)
         s.delete(seg)
         dropped += 1
     return dropped
@@ -1913,6 +1920,6 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, handle_shutdown_signal)
     time.sleep(5)
     # Не полагаемся на то, что backend уже создал структуру каталогов
-    for sub in ("snapshots", "segments", "avatars", "uploads"):
+    for sub in ("snapshots", "segments", "avatars", "uploads", "thumbs"):
         os.makedirs(os.path.join(MEDIA_PATH, sub), exist_ok=True)
     manager()

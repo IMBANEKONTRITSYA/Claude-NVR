@@ -19,6 +19,7 @@ from .routers import search as r_search
 from .routers import settings as r_settings
 from .routers import audit as r_audit
 from .routers import system as r_system
+from .services import thumbs as thumbs_svc
 from .audit import AuditMiddleware
 from .logging_utils import configure_logging
 
@@ -134,6 +135,10 @@ async def lifespan(app: FastAPI):
     os.makedirs(os.path.join(settings.MEDIA_PATH, "segments"), exist_ok=True)
     os.makedirs(os.path.join(settings.MEDIA_PATH, "avatars"), exist_ok=True)
     os.makedirs(os.path.join(settings.MEDIA_PATH, "uploads"), exist_ok=True)
+    # Миниатюры архива (§7). Каталог создаётся и при генерации, но заведён
+    # здесь наравне с остальными: администратор, размечающий диски под §26,
+    # должен видеть полный состав медиа-каталога на пустой системе.
+    os.makedirs(os.path.join(settings.MEDIA_PATH, thumbs_svc.THUMB_DIR), exist_ok=True)
     async with engine.begin() as conn:
         await apply_schema_migrations(conn)
     async with SessionLocal() as db:

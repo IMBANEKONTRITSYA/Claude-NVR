@@ -1,5 +1,30 @@
 import { useEffect, useState } from "react";
-import { api, getToken } from "../api";
+import { api, getToken, segmentThumbUrl } from "../api";
+
+/** Миниатюра кадра сегмента (ТЗ §7).
+ *
+ * Битый или пустой сегмент — штатное состояние архива (обрыв RTSP на
+ * первой секунде файла), эндпоинт отвечает на такой 404. Показываем
+ * прочерк вместо иконки сломанной картинки браузера: строка остаётся
+ * читаемой, а оператор видит, что кадра нет, а не что «сломался архив».
+ *
+ * `loading="lazy"` обязателен: выдача — до 200 строк, и без него браузер
+ * запросил бы все миниатюры разом, а каждая непрогретая — это вызов
+ * ffmpeg на сервере.
+ */
+function SegThumb({ id }: { id: number }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <span className="empty">—</span>;
+  return (
+    <img
+      src={segmentThumbUrl(id)}
+      loading="lazy"
+      alt=""
+      className="seg-thumb"
+      onError={() => setFailed(true)}
+    />
+  );
+}
 
 export function Archive() {
   const [cams, setCams] = useState<any[]>([]);
@@ -81,17 +106,18 @@ export function Archive() {
         <div className="card">
           <h3>Найдено: {segs.length}</h3>
           <table>
-            <thead><tr><th>Время</th><th>Камера</th><th>Тип</th><th>Длит.</th></tr></thead>
+            <thead><tr><th>Кадр</th><th>Время</th><th>Камера</th><th>Тип</th><th>Длит.</th></tr></thead>
             <tbody>
               {segs.map(s => (
                 <tr key={s.id} style={{ cursor: "pointer", background: sel?.id === s.id ? "#222" : undefined }} onClick={() => setSel(s)}>
+                  <td><SegThumb id={s.id} /></td>
                   <td>{new Date(s.started_at).toLocaleString("ru-RU")}</td>
                   <td>#{s.camera_id}</td>
                   <td>{s.event_type}</td>
                   <td>{s.duration_sec}с</td>
                 </tr>
               ))}
-              {segs.length === 0 && <tr><td colSpan={4} className="empty">Ничего не найдено</td></tr>}
+              {segs.length === 0 && <tr><td colSpan={5} className="empty">Ничего не найдено</td></tr>}
             </tbody>
           </table>
         </div>

@@ -271,6 +271,83 @@ def test_unreadable_disk_does_not_delete_anything(archive, monkeypatch):
     assert kept.exists()
 
 
+# --- миниатюры архива (SPEC §7) -------------------------------------------
+
+def _thumb_for(archive, path, media_root):
+    """Положить миниатюру для сегмента с файлом `path` и вернуть её путь."""
+    import thumbs
+
+    with archive.Session() as s:
+        seg = s.query(worker.VideoSegment).filter_by(file_path=str(path)).one()
+        seg_id = seg.id
+    thumb = thumbs.thumb_path(str(media_root), seg_id)
+    os.makedirs(os.path.dirname(thumb), exist_ok=True)
+    with open(thumb, "wb") as fh:
+        fh.write(b"\xff\xd8jpeg")
+    return thumb
+
+
+def test_retention_removes_thumbnail_with_segment(archive, monkeypatch, tmp_path):
+    """Миниатюра (§7) уходит с диска вместе со своим сегментом.
+
+    Она лежит в `thumbs/`, а не в `segments/`, поэтому под `prune_media`
+    (чистит каталог сегментов по возрасту файла) не попадает вовсе. Без
+    явного удаления миниатюра пережила бы сегмент **навсегда**: id сегмента
+    больше никогда не повторится, значит и перезаписать её некому. На
+    объекте это выглядело бы как медленно растущий диск без единой ошибки
+    в логах — то есть нашлось бы не раньше, чем закончилось бы место.
+    """
+    _freeze_now(monkeypatch)
+    monkeypatch.setitem(worker.CONFIG, "retention_days", 3)
+    archive.camera(1)
+    expired = archive.segment(1, days_ago=7)
+    thumb = _thumb_for(archive, expired, tmp_path)
+
+    worker.cleanup_old()
+
+    assert not expired.exists(), "сам сегмент должен быть удалён"
+    assert not os.path.exists(thumb), "миниатюра пережила свой сегмент"
+
+
+def test_eviction_removes_thumbnail_too(archive, monkeypatch, tmp_path):
+    """Циклическая перезапись (§5) тоже уносит миниатюру.
+
+    Отдельная проверка, а не дубль предыдущей: у ротации по сроку и у
+    перезаписи по месту разные точки входа (`cleanup_old` и
+    `enforce_disk_quota`), и удаление файлов у них общее только пока
+    `_drop_segments` один на обе.
+    """
+    monkeypatch.setattr(worker.shutil, "disk_usage", lambda _p: _Usage(1000, 0))
+    monkeypatch.setitem(worker.CONFIG, "disk_min_free_pct", 5)
+    monkeypatch.setitem(worker.CONFIG, "retention_days", 3650)
+    archive.camera(1, retention_days=3650)
+    fresh = archive.segment(1, days_ago=0, size=100)
+    thumb = _thumb_for(archive, fresh, tmp_path)
+
+    assert worker.enforce_disk_quota() == 1
+
+    assert not fresh.exists()
+    assert not os.path.exists(thumb), "миниатюра пережила вытесненный сегмент"
+
+
+def test_retention_keeps_thumbnail_of_live_segment(archive, monkeypatch, tmp_path):
+    """Позитивный контроль: миниатюра непросроченного сегмента остаётся.
+
+    Без него предыдущие две проверки прошли бы и на коде, который сносит
+    каталог миниатюр целиком.
+    """
+    _freeze_now(monkeypatch)
+    monkeypatch.setitem(worker.CONFIG, "retention_days", 30)
+    archive.camera(1)
+    kept = archive.segment(1, days_ago=1)
+    thumb = _thumb_for(archive, kept, tmp_path)
+
+    worker.cleanup_old()
+
+    assert kept.exists()
+    assert os.path.exists(thumb), "миниатюра живого сегмента удалена"
+
+
 # --- алерты (SPEC §14) ----------------------------------------------------
 
 def test_disk_alert_levels_follow_configured_thresholds(archive, monkeypatch):

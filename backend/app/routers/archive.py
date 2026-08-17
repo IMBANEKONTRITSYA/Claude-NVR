@@ -12,6 +12,7 @@ from ..auth import require_role, require_role_query
 from ..params import limit_param
 from ..schemas import SegmentOut
 from ..services import export as export_svc
+from ..services import thumbs as thumbs_svc
 from ..services.archive_query import segments_query
 
 router = APIRouter(prefix="/api/archive", tags=["archive"])
@@ -55,6 +56,45 @@ async def download_segment(
     if not seg or not os.path.exists(seg.file_path):
         raise HTTPException(404, "Файл не найден")
     return FileResponse(seg.file_path, media_type="video/mp4", filename=os.path.basename(seg.file_path))
+
+
+@router.get("/thumb/{seg_id}")
+async def segment_thumb(
+    seg_id: int,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_role_query("admin", "operator")),
+):
+    """Миниатюра кадра сегмента архива (ТЗ §7).
+
+    Токен в query string и роль из БД — по той же причине, что и у
+    скачивания сегмента: адрес подставляется в `<img src>`, заголовок к
+    нему не прикрепить, а кадр записи по матрице прав §18 наблюдателю
+    закрыт так же, как сама запись.
+
+    Ответ кэшируется браузером на сутки: закрытый сегмент иммутабелен, а
+    выдача архива — это до 200 миниатюр, которые иначе перезапрашивались
+    бы при каждом уточнении фильтра.
+    """
+    seg = await db.get(VideoSegment, seg_id)
+    if not seg:
+        raise HTTPException(404, "Сегмент не найден")
+    # within_media_root — та же проверка, что и у экспорта: путь берётся из
+    # БД, но именно он уходит аргументом в ffmpeg, и строка, указывающая за
+    # пределы медиа-каталога, означает повреждение данных, а не запись.
+    if not export_svc.within_media_root(seg.file_path, settings.MEDIA_PATH) \
+            or not os.path.exists(seg.file_path):
+        raise HTTPException(404, "Файл не найден")
+
+    dst = thumbs_svc.thumb_path(settings.MEDIA_PATH, seg_id)
+    try:
+        await thumbs_svc.ensure(seg.file_path, dst, seg.duration_sec)
+    except thumbs_svc.ThumbError as exc:
+        # 404, а не 500: битый или пустой сегмент — штатное состояние архива
+        # (обрыв RTSP на первой секунде файла), и выдача должна показать
+        # строку без картинки, а не ошибку на всю страницу.
+        raise HTTPException(404, str(exc)) from exc
+    return FileResponse(dst, media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=86400"})
 
 
 @router.get("/export")
