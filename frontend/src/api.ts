@@ -258,6 +258,18 @@ export function camerasExportUrl(format: "csv" | "json", includeSecrets: boolean
   return `/api/cameras/export?format=${format}&include_secrets=${includeSecrets ? "1" : "0"}&token=${getToken()}`;
 }
 
+// SPEC §7 «миниатюры кадров для быстрого просмотра». Адрес идёт в
+// <img src>, заголовок к нему не прикрепить — токен в query string, как у
+// скачивания сегмента и экспорта.
+//
+// Без метки времени в адресе, в отличие от camSnapshotUrl: снимок камеры
+// живой и обязан перезапрашиваться, а кадр закрытого сегмента иммутабелен.
+// Метка сбивала бы кэш браузера, и выдача из 200 строк тянула бы двести
+// картинок заново при каждом уточнении фильтра.
+export function segmentThumbUrl(id: number): string {
+  return `/api/archive/thumb/${id}?token=${getToken()}`;
+}
+
 export function camSnapshotUrl(id: number): string {
   return `/api/cameras/${id}/snapshot?token=${getToken()}&t=${Date.now()}`;
 }

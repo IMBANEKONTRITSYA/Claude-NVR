@@ -145,6 +145,14 @@ table td, table th { padding: 7px 10px; }
 table tbody tr { border-top: 1px solid var(--border); }
 table tbody tr:hover { background: var(--bg2); }
 .table-scroll { max-height: 60vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+
+/* Миниатюра кадра сегмента в выдаче архива (SPEC §7). Размер задан в CSS,
+   а не атрибутами img: строка таблицы не должна прыгать, пока картинка
+   догружается ленивой загрузкой. */
+.seg-thumb {
+  width: 96px; height: 54px; object-fit: cover;
+  border-radius: 4px; background: #000; display: block;
+}
 .btn.sm { padding: 3px 9px; font-size: 12px; }
 
 /* Пульт PTZ (SPEC §4). Показывается под развёрнутой камерой. */
