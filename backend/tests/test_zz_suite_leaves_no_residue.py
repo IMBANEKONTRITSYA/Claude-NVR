@@ -57,3 +57,41 @@ def test_suite_leaves_no_test_cameras_behind(client, admin_headers):
         f"после прогона в БД остались камеры, заведённые тестами: {leftovers}. "
         "Используйте фикстуру make_camera из conftest.py — она убирает за собой."
     )
+
+
+def test_suite_leaves_settings_as_it_found_them(pg_conn, settings_baseline):
+    """Таблица `settings` после прогона совпадает со снимком на старте.
+
+    Третий сторож того же класса, что два выше, и добавлен по той же
+    причине — но повод конкретный, из цикла 32: замер показал, что
+    `test_integration_routes.py` оставляет после себя
+    `performance_profile = economy` (и вместе с ним весь набор параметров
+    профиля), а `test_camera_modes.py` — `analytics_cameras_max = 1`.
+
+    В CI это не видно: свежий сервис-контейнер Postgres на каждый прогон.
+    Ломается повторный локальный прогон по той же базе, причём падает не
+    тот тест, который протёк. Хуже того, протёкшая настройка делает
+    проверки **ложно-зелёными**: тест, который применяет профиль и
+    проверяет, что параметры на месте, проходит и на сломанной
+    реализации, если нужные значения уже лежали в базе от прошлого раза.
+
+    Тестам, меняющим настройки, полагается фикстура `restore_settings`
+    из `conftest.py` — она возвращает таблицу как было, включая ключи,
+    которых нет в `SCHEMA` роутера настроек.
+    """
+    from tests.conftest import _settings_snapshot
+
+    after = _settings_snapshot(pg_conn)
+    changed = {
+        key: (settings_baseline.get(key), after[key])
+        for key in after
+        if settings_baseline.get(key) != after[key]
+    }
+    removed = sorted(set(settings_baseline) - set(after))
+    assert not changed and not removed, (
+        f"после прогона настройки отличаются от снимка на старте.\n"
+        f"изменены (было → стало): {changed}\n"
+        f"удалены: {removed}\n"
+        "Используйте фикстуру restore_settings из conftest.py в тестах, "
+        "которые меняют настройки."
+    )

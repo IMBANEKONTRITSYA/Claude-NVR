@@ -5,41 +5,13 @@
 существует, закрыт по матрице прав §18, читает ресурсы настоящей машины,
 пишет настройки в настоящую БД и что записанное переживает чтение —
 то есть что функция §16 работает, а не только считается.
+
+Фикстура `restore_settings` (возврат таблицы настроек в исходное
+состояние) переехала в `conftest.py`: с цикла 32 ею пользуются ещё два
+файла, а сторож остатка настроек в `test_zz_suite_leaves_no_residue.py`
+роняет прогон, если её забыли.
 """
 import pytest
-
-from tests.conftest import TEST_USER_PASSWORD
-
-
-@pytest.fixture()
-def restore_settings(client, admin_headers, pg_conn):
-    """Возвращает таблицу настроек ровно в то состояние, что была до теста.
-
-    `POST /autoconfig/apply` переписывает профиль целиком и предел камер
-    аналитики, а настройки общие на весь прогон: оставленный `economy`
-    меняет поведение тестов профилей, а изменённый `analytics_cameras_max`
-    — тестов режима камеры (см. `test_zz_suite_leaves_no_residue.py` про
-    то, почему падает при этом не тот тест, который протёк).
-
-    Восстановление идёт сырым SQL, а не через API, по двум причинам.
-    Первая: `POST /api/settings/profile/{prof}` не умеет вернуть состояние
-    `custom` (профиль, подправленный руками) — он его затирает. Вторая:
-    отметку `autoconfig_applied_at` через API не удалить вовсе, а
-    оставленная, она навсегда гасит `first_run`, и проверка этого флага
-    на следующем прогоне по той же базе становится ложно-зелёной —
-    первая версия этой фикстуры именно так и протекла.
-    """
-    with pg_conn.cursor() as cur:
-        cur.execute("SELECT key, value FROM settings")
-        before = dict(cur.fetchall())
-    yield
-    with pg_conn.cursor() as cur:
-        cur.execute("SELECT key FROM settings")
-        after_keys = {row[0] for row in cur.fetchall()}
-        for key, value in before.items():
-            cur.execute("UPDATE settings SET value = %s WHERE key = %s", (value, key))
-        for key in after_keys - set(before):
-            cur.execute("DELETE FROM settings WHERE key = %s", (key,))
 
 
 def test_autoconfig_is_admin_only(client, make_user_headers):

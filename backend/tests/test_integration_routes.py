@@ -502,7 +502,7 @@ def test_audit_log_labels_onvif_describe_separately_from_camera_creation(client,
     assert not mislabelled, "ONVIF-дамп записан в журнал как добавление камеры"
 
 
-def test_settings_update_persists_and_validates_range(client, admin_headers):
+def test_settings_update_persists_and_validates_range(client, admin_headers, restore_settings):
     r = client.put("/api/settings", json={"retention_days": 45}, headers=admin_headers)
     assert r.status_code == 200
     assert r.json()["retention_days"] == "45"
@@ -515,7 +515,7 @@ def test_settings_update_persists_and_validates_range(client, admin_headers):
     assert r.status_code == 400
 
 
-def test_record_segment_min_persists_and_validates(client, admin_headers):
+def test_record_segment_min_persists_and_validates(client, admin_headers, restore_settings):
     """SPEC §20: «Сегменты 5-10 минут». Кодек/битрейт/GOP записи убраны из
     настроек в цикле 24 — архив пишется remux'ом как есть, перекодирование
     запрещено §24, — а вместо них появилась единственная настройка слоя
@@ -543,7 +543,7 @@ def test_record_segment_min_persists_and_validates(client, admin_headers):
     assert r.json()["record_segment_min"] == "5"
 
 
-def test_apply_performance_profile_rewrites_tunables(client, admin_headers):
+def test_apply_performance_profile_rewrites_tunables(client, admin_headers, restore_settings):
     r = client.post("/api/settings/profile/economy", headers=admin_headers)
     assert r.status_code == 200
     body = r.json()

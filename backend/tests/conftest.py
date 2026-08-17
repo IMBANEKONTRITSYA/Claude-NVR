@@ -13,6 +13,13 @@ import os
 import pytest
 
 os.environ.setdefault("ALLOW_INSECURE_DEFAULT_SECRETS", "true")
+# Фоновый цикл планировщика отчётов тикает по стенным часам и закрывает
+# расписания с наступившим слотом (по умолчанию 8:00). В прогоне после
+# 8 утра это гонка с тестами, которые заводят включённое расписание и
+# проверяют его слот. Логика прохода покрыта явными `run_due_now()`
+# (test_integration_report_schedules.py), поэтому фоновый цикл в тестах
+# гасится — прогон становится детерминированным. См. main.py:lifespan.
+os.environ.setdefault("FACEWATCH_DISABLE_REPORT_SCHEDULER", "true")
 
 from app.config import settings  # noqa: E402  (после setdefault выше)
 
@@ -226,3 +233,68 @@ def make_user_headers(make_user):
         _, token = make_user(username, role)
         return {"Authorization": f"Bearer {token}"}
     return _make
+
+
+def _settings_snapshot(conn) -> dict[str, str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT key, value FROM settings")
+        return dict(cur.fetchall())
+
+
+@pytest.fixture()
+def restore_settings(pg_conn):
+    """Возвращает таблицу `settings` ровно в то состояние, что была до теста.
+
+    Настройки — единственное общее изменяемое состояние, которое переживает
+    тест и при этом не является ни пользователем, ни камерой, то есть не
+    покрыто сторожами `test_zz_suite_leaves_no_residue.py`. Протекают они
+    так же неприятно: оставленный `performance_profile = economy` меняет
+    поведение тестов профилей, а `analytics_cameras_max = 1` — тестов
+    режима камеры (падает при этом не тот тест, который протёк).
+
+    Восстановление идёт сырым SQL, а не через API, по двум причинам.
+    Первая: `POST /api/settings/profile/{name}` не умеет вернуть состояние
+    `custom` — профиль, подправленный руками, он затирает. Вторая: ключи,
+    которых нет в `SCHEMA` роутера настроек (например, отметка
+    `autoconfig_applied_at`), через API не удаляются вовсе.
+    """
+    before = _settings_snapshot(pg_conn)
+    yield
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT key FROM settings")
+        after_keys = {row[0] for row in cur.fetchall()}
+        for key, value in before.items():
+            cur.execute("UPDATE settings SET value = %s WHERE key = %s", (value, key))
+        for key in after_keys - set(before):
+            cur.execute("DELETE FROM settings WHERE key = %s", (key,))
+
+
+@pytest.fixture(scope="session")
+def settings_baseline(client) -> dict[str, str]:
+    """Снимок настроек на старте прогона — база для сторожа остатка.
+
+    Session-scoped и зависит от `client`, поэтому снимается после сида
+    `main.py:lifespan`, но до тела первого теста. Именно этот снимок
+    сравнивает `test_zz_suite_leaves_no_residue.py`.
+    """
+    import psycopg2
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(settings.DATABASE_URL.replace("+asyncpg", ""))
+    conn = psycopg2.connect(
+        host=parsed.hostname, port=parsed.port or 5432,
+        user=parsed.username, password=parsed.password,
+        dbname=parsed.path.lstrip("/"), connect_timeout=5,
+    )
+    conn.autocommit = True
+    try:
+        return _settings_snapshot(conn)
+    finally:
+        conn.close()
+
+
+@pytest.fixture(autouse=True)
+def _pin_settings_baseline(settings_baseline):
+    """Снимок обязан сниматься на первом же тесте, а не на том, который
+    первым его запросил, — иначе базой станут уже испорченные настройки."""
+    return settings_baseline
