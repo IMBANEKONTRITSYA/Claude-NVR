@@ -168,6 +168,22 @@ export const api = {
   camRoiPut: (id: number, polygons: number[][][]) =>
     req(`/api/cameras/${id}/roi`, { method: "PUT", body: JSON.stringify({ polygons }) }),
   camHls: (id: number) => req(`/api/cameras/${id}/hls`),
+  // SPEC §4: PTZ. profile_token берётся из camPtz() и передаётся с каждой
+  // командой — иначе воркер резолвит профиль камеры заново на каждое
+  // нажатие стрелки (лишний GetProfiles к камере в интерактивном пути).
+  camPtz: (id: number) => req(`/api/cameras/${id}/ptz`),
+  camPtzMove: (id: number, v: { pan?: number; tilt?: number; zoom?: number; profile_token?: string | null }) =>
+    req(`/api/cameras/${id}/ptz/move`, { method: "POST", body: JSON.stringify(v) }),
+  camPtzStop: (id: number, profile_token?: string | null) =>
+    req(`/api/cameras/${id}/ptz/stop`, { method: "POST", body: JSON.stringify({ profile_token }) }),
+  camPtzGoto: (id: number, preset_token: string, profile_token?: string | null) =>
+    req(`/api/cameras/${id}/ptz/preset/goto`, {
+      method: "POST", body: JSON.stringify({ preset_token, profile_token }),
+    }),
+  camPtzSavePreset: (id: number, name: string, profile_token?: string | null) =>
+    req(`/api/cameras/${id}/ptz/preset/save`, {
+      method: "POST", body: JSON.stringify({ name, profile_token }),
+    }),
   persons: (params: { status?: string; q?: string; page?: number; page_size?: number } = {}) => {
     const usp = new URLSearchParams();
     Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== "") usp.set(k, String(v)); });

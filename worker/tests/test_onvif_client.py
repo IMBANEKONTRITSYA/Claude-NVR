@@ -256,9 +256,12 @@ def test_get_profiles_parses_token_and_name(monkeypatch):
     # субпоток по разрешению, а не по порядку в списке: ТЗ 18.1 требует, чтобы
     # детекция шла на низкоразрешающем субпотоке, а порядок профилей прошивки
     # не гарантируют. В этом фикстурном ответе разрешения нет — отсюда None.
+    # ptz — признак наличия PTZConfiguration у профиля: PTZ-команды
+    # принимает только он (см. select_ptz_profile), а из GetProfiles это
+    # видно без отдельного запроса к PTZ-сервису. В фикстуре его нет.
     assert profiles == [
-        {"token": "profile_1", "name": "MainStream", "width": None, "height": None},
-        {"token": "profile_2", "name": "SubStream", "width": None, "height": None},
+        {"token": "profile_1", "name": "MainStream", "width": None, "height": None, "ptz": False},
+        {"token": "profile_2", "name": "SubStream", "width": None, "height": None, "ptz": False},
     ]
     assert capture["url"] == "http://192.168.1.64:80/onvif/Media"
     assert "UsernameToken" in capture["body"]
@@ -270,7 +273,7 @@ def test_get_profiles_falls_back_to_token_when_name_missing(monkeypatch):
     <trt:Profiles token="profile_x"/></trt:GetProfilesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>"""
     _mock_urlopen(monkeypatch, response_bytes=no_name.encode())
     assert oc.get_profiles("192.168.1.64", 80, None, None) == [
-        {"token": "profile_x", "name": "profile_x", "width": None, "height": None}
+        {"token": "profile_x", "name": "profile_x", "width": None, "height": None, "ptz": False}
     ]
 
 
