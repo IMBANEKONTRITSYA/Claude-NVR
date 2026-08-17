@@ -543,7 +543,7 @@ def test_record_segment_min_persists_and_validates(client, admin_headers):
     assert r.json()["record_segment_min"] == "5"
 
 
-def test_apply_performance_profile_rewrites_tunables(client, admin_headers):
+def test_apply_performance_profile_rewrites_tunables(client, admin_headers, restore_settings):
     r = client.post("/api/settings/profile/economy", headers=admin_headers)
     assert r.status_code == 200
     body = r.json()

@@ -58,7 +58,7 @@ def test_new_camera_defaults_to_record_only(client, admin_headers, make_camera):
     assert listed[cam["id"]]["mode"] == "record_only"
 
 
-def test_camera_can_be_switched_between_modes(client, admin_headers, make_camera):
+def test_camera_can_be_switched_between_modes(client, admin_headers, make_camera, restore_settings):
     """SPEC §2: «Переключение режима — через веб-интерфейс, без перезапуска
     слоёв»."""
     cam = make_camera("switch-mode")
@@ -84,7 +84,7 @@ def test_unknown_mode_is_rejected(client, admin_headers, make_camera):
     assert r.status_code == 422
 
 
-def test_analytics_camera_count_is_capped(client, admin_headers, make_camera):
+def test_analytics_camera_count_is_capped(client, admin_headers, make_camera, restore_settings):
     """SPEC §1: аналитика — «только на N выбранных камерах (по умолчанию 2)».
 
     Без предела администратор включает аналитику на всех камерах, слой
@@ -106,7 +106,7 @@ def test_analytics_camera_count_is_capped(client, admin_headers, make_camera):
     assert make_camera("cap-over")["mode"] == "record_only"
 
 
-def test_saving_analytics_camera_again_does_not_consume_a_slot(client, admin_headers, make_camera):
+def test_saving_analytics_camera_again_does_not_consume_a_slot(client, admin_headers, make_camera, restore_settings):
     """Редактирование камеры, которая уже в analytics, не должно упираться в
     предел из-за самой себя: иначе при пределе 1 её нельзя было бы даже
     переименовать."""
@@ -128,7 +128,7 @@ def test_saving_analytics_camera_again_does_not_consume_a_slot(client, admin_hea
     assert r.json()["name"] == "self-slot-renamed"
 
 
-def test_roi_is_rejected_for_record_only_camera(client, admin_headers, make_camera):
+def test_roi_is_rejected_for_record_only_camera(client, admin_headers, make_camera, restore_settings):
     """SPEC §11: «доступно только для камер в режиме analytics».
 
     Сохранённые зоны детекции у камеры, которая только пишется, ни на что не
