@@ -21,6 +21,7 @@
 логика здесь проверяется в CI против настоящего HTTP-сервера и настоящих
 файлов, а не моков (см. `.github/workflows/ci.yml`).
 """
+import base64
 import json
 import logging
 import os
@@ -86,16 +87,58 @@ class MediaMTXError(RuntimeError):
     pass
 
 
+def split_credentials(url: str) -> tuple[str, tuple[str, str] | None]:
+    """`http://user:pass@host:9997` → (`http://host:9997`, (user, pass)).
+
+    Учётка Control API едет внутри `MEDIAMTX_API_URL`, а не отдельной
+    переменной: адрес и права на него — одно и то же знание, и
+    рассогласовать их двумя переменными проще, чем одной.
+
+    Пароль обязан быть отделён от адреса до любого логирования: строка с
+    ним попадала в сообщение «нет связи с медиасервером» на странице
+    мониторинга, то есть пароль слоя записи показывался оператору.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if not parts.username:
+        return url.rstrip("/"), None
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    clean = urllib.parse.urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+    return clean.rstrip("/"), (urllib.parse.unquote(parts.username),
+                               urllib.parse.unquote(parts.password or ""))
+
+
+def redact_url(url: str) -> str:
+    """Тот же адрес без пароля — для логов и для интерфейса."""
+    clean, creds = split_credentials(url)
+    if not creds:
+        return clean
+    scheme, rest = clean.split("://", 1)
+    return f"{scheme}://{creds[0]}:***@{rest}"
+
+
 class MediaMTXClient:
     """Тонкий клиент Control API MediaMTX (`api: yes` в mediamtx.yml).
 
     Ровно четыре нужных вызова из `/v3/config/paths/*` плюс рантайм-список
     `/v3/paths/list` для мониторинга состояния потоков записи (SPEC §14:
     «статус каждого RTSP-потока слоя записи»).
+
+    **Аутентификация обязательна.** MediaMTX по умолчанию пускает в
+    Control API только с loopback, а воркер приходит из соседнего
+    контейнера и получает `HTTP 401 authentication error` — см. шапку
+    `mediamtx/mediamtx.yml`. Учётка берётся из самого адреса
+    (`http://facewatch:пароль@mediamtx:9997`) и уходит заголовком
+    `Authorization: Basic`; query-параметры `?user=&pass=`, работающие для
+    HLS и WebRTC, Control API **не принимает** (проверено на v1.16.0).
+    Заголовок ставится сразу, а не после 401: `HTTPBasicAuthHandler`
+    отвечал бы на вызов только после отказа, то есть удваивал бы каждый
+    запрос синхронизации путей.
     """
 
     def __init__(self, base_url: str, timeout: float = 10.0, opener=None):
-        self.base_url = base_url.rstrip("/")
+        self.base_url, self._credentials = split_credentials(base_url)
         self.timeout = timeout
         self._opener = opener or urllib.request.build_opener()
 
@@ -103,6 +146,10 @@ class MediaMTXClient:
         url = f"{self.base_url}{path}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)
+        if self._credentials:
+            token = base64.b64encode(
+                ":".join(self._credentials).encode("utf-8")).decode("ascii")
+            req.add_header("Authorization", f"Basic {token}")
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
@@ -110,6 +157,19 @@ class MediaMTXClient:
                 raw = resp.read()
         except urllib.error.HTTPError as e:
             detail = e.read()[:200].decode("utf-8", "replace")
+            if e.code == 401:
+                # Голое «authentication error» от MediaMTX не подсказывает
+                # ни причину, ни место починки, а видит его оператор на
+                # странице мониторинга. Причина при этом всегда одна и та
+                # же — права `api` в mediamtx.yml не выданы адресу, с
+                # которого пришёл воркер.
+                raise MediaMTXError(
+                    f"{method} {path} -> HTTP 401: MediaMTX не принял учётные данные "
+                    f"Control API ({'логин ' + self._credentials[0] if self._credentials else 'логин не задан'}). "
+                    "Проверьте секцию authInternalUsers в mediamtx/mediamtx.yml "
+                    "(нужно право action: api) и переменную MEDIAMTX_API_URL воркера. "
+                    f"Ответ сервера: {detail}"
+                ) from e
             raise MediaMTXError(f"{method} {path} -> HTTP {e.code}: {detail}") from e
         except (urllib.error.URLError, OSError) as e:
             raise MediaMTXError(f"{method} {path} -> {e}") from e
@@ -176,6 +236,14 @@ def _duration_ns(value) -> int | None:
     архив был цел, а симптом сводился к постоянной нагрузке на Control API
     и к бесполезному «updated: 120» в статистике.
 
+    Пустая строка — это ноль, а не «не разобрали». MediaMTX v1.9.3
+    возвращал нулевую длительность как `0s`, а v1.16.0 — как `''`, и на
+    новой версии сравнение `'0s' != ''` снова считало изменившимся каждый
+    путь: `recordDeleteAfter: 0s` мы задаём всем путям, то есть
+    `sync_paths()` слала PATCH на все 120 путей каждые 10 секунд, вечно —
+    ровно тот дефект, который цикл 30 закрыл для v1.9.3 и который вернулся
+    с обновлением версии. Замерено на обоих бинарниках.
+
     None — если строку разобрать нельзя; тогда сравнение падает обратно на
     строковое, то есть на прежнее поведение, а не на «значения равны».
     """
@@ -183,7 +251,7 @@ def _duration_ns(value) -> int | None:
         return None
     text = value.strip()
     if not text:
-        return None
+        return 0
     sign = -1 if text.startswith("-") else 1
     text = text.lstrip("+-")
     matches = _DURATION_RE.findall(text)

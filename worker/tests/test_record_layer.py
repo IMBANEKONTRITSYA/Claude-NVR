@@ -53,12 +53,20 @@ _MTX_DURATION_KEYS = ("recordSegmentDuration", "recordDeleteAfter")
 
 
 def _normalize_duration(value: str) -> str:
-    """`5m` -> `5m0s`, `1h` -> `1h0m0s` — форма вывода time.Duration в Go."""
+    """`5m` -> `5m0s`, `1h` -> `1h0m0s` — форма вывода time.Duration в Go.
+
+    Нулевую длительность v1.16.0 отдаёт **пустой строкой**, а не `0s`, как
+    v1.9.3. Двойник обязан повторять новую версию — ту, что зафиксирована в
+    docker-compose.yml: пока он возвращал `0s`, `test_sync_is_idempotent`
+    проходил, а на настоящем MediaMTX v1.16.0 синхронизация патчила все
+    пути на каждом тике из-за `recordDeleteAfter: 0s`. Проверено запуском
+    обоих бинарников (цикл 34).
+    """
     ns = _duration_ns(value)
     if ns is None:
         return value
     if ns == 0:
-        return "0s"
+        return ""
     h, rem = divmod(ns, 3_600_000_000_000)
     m, rem = divmod(rem, 60_000_000_000)
     sec = rem / 1_000_000_000

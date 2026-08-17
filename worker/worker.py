@@ -45,7 +45,8 @@ from backoff import reconnect_delay
 from detection_schedule import schedule_active
 from face_select import pick_matching_face
 from fileage import prune_media
-from record_layer import MediaMTXClient, path_conf, path_name, sync_paths
+from record_layer import (MediaMTXClient, path_conf, path_name, redact_url,
+                          sync_paths)
 from record_status import (UNKNOWN, newly_lost, newly_restored, segment_gaps,
                            stream_states, summarize)
 from segment_index import index_new_segments
@@ -69,8 +70,13 @@ FERNET_KEY = os.environ.get("RTSP_ENCRYPTION_KEY", "ZmFjZXdhdGNoLWRldi1rZXktMzJi
 MEDIAMTX_HOST = os.environ.get("MEDIAMTX_HOST", "mediamtx")
 MEDIAMTX_PORT = int(os.environ.get("MEDIAMTX_PORT", "8554"))
 # Control API MediaMTX — им синхронизируются пути слоя записи (SPEC §20).
+# Учётка Control API едет внутри адреса (`http://facewatch:пароль@...`):
+# MediaMTX не отдаёт `api` анонимно никому, кроме loopback, а воркер — в
+# соседнем контейнере. Дефолт совпадает с паролем из mediamtx/mediamtx.yml,
+# чтобы `docker compose up` работал без правки .env; в production оба
+# значения задаются переменными окружения (см. .env.example).
 MEDIAMTX_API_URL = os.environ.get(
-    "MEDIAMTX_API_URL", f"http://{MEDIAMTX_HOST}:9997"
+    "MEDIAMTX_API_URL", f"http://facewatch:facewatch-mediamtx-api@{MEDIAMTX_HOST}:9997"
 )
 
 DBSCAN_EPS = 0.35
@@ -1601,7 +1607,7 @@ def publish_record_layer_status(cam_names) -> dict:
             logger.warning(
                 "Control API MediaMTX недоступен — статусы потоков записи "
                 "неизвестны, синхронизация путей не идёт",
-                extra={"url": MEDIAMTX_API_URL, "reason": reason},
+                extra={"url": redact_url(MEDIAMTX_API_URL), "reason": reason},
             )
         _record_api_error = reason
         runtime = None
