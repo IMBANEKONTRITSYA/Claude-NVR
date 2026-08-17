@@ -75,6 +75,11 @@ FIELDS = [
     # потребовалось бы переменное число.
     "detection_schedule",
     "roi",
+    # SPEC §6 «запись только при движении». Как расписание и зоны — часть
+    # конфигурации камеры: перенос парка на боевой сервер без него
+    # молча возвращает все камеры к непрерывному хранению, и разницу
+    # видно только по заполнению диска через неделю.
+    "record_on_motion",
 ]
 
 # Чем заменяется пароль в выгрузке без секретов.
@@ -137,6 +142,7 @@ def camera_row(cam, main_url: str | None, sub_url: str | None, *, include_secret
         # и выгрузка не должна выдумывать для него объект.
         "detection_schedule": cam.detection_schedule or None,
         "roi": cam.roi or None,
+        "record_on_motion": bool(cam.record_on_motion),
     }
 
 

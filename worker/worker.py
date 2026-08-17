@@ -45,6 +45,9 @@ from backoff import reconnect_delay
 from detection_schedule import schedule_active
 from face_select import pick_matching_face
 from fileage import prune_media
+from motion_windows import (DEFAULT_GUARD_SEC, MotionWindowTracker,
+                            SETTLE_SEC as MOTION_SETTLE_SEC,
+                            segments_without_motion)
 from record_layer import (MediaMTXClient, path_conf, path_name, redact_url,
                           sync_paths)
 from record_status import (UNKNOWN, newly_lost, newly_restored, segment_gaps,
@@ -321,6 +324,25 @@ class Camera(Base):
     # круглосуточно; см. detection_schedule.py о формате и о том, почему
     # «пусто» это «всегда», а не «никогда».
     detection_schedule = Column(JSON)
+    # SPEC §6: «запись только при движении (опционально)». Флаг не касается
+    # слоя записи (§2), он включает досрочную уборку сегментов без
+    # движения — см. motion_windows.py и prune_motionless_segments().
+    record_on_motion = Column(Boolean, default=False)
+
+
+class MotionWindow(Base):
+    """Промежуток наблюдения камеры слоем аналитики (SPEC §6).
+
+    Схему создаёт бэкенд (`models.MotionWindow`); здесь объявлены только
+    те колонки, которые нужны воркеру на запись и на уборку.
+    """
+
+    __tablename__ = "motion_windows"
+    id = Column(Integer, primary_key=True)
+    camera_id = Column(Integer, ForeignKey("cameras.id"))
+    started_at = Column(DateTime)
+    ended_at = Column(DateTime)
+    motion = Column(Boolean, default=False)
 
 
 class Person(Base):
@@ -736,6 +758,32 @@ def onvif_motion_recent(cam_id: int) -> bool:
     return (time.time() - last) < ONVIF_MOTION_FRESH_SEC
 
 
+def _flush_motion_windows(cam_id: int, windows) -> None:
+    """Записать закрывшиеся окна наблюдения камеры (SPEC §6).
+
+    Вызывается из цикла кадров, поэтому обязана быть немой: отказ БД не
+    должен уносить нить камеры (цикл 23 — обращения к БД в цикле кадров
+    как источник падений). Потерянное окно — это дыра в покрытии, то есть
+    сегменты за этот промежуток просто останутся в архиве; ошибка в
+    безопасную сторону, в отличие от остановки детекции.
+    """
+    if not windows:
+        return
+    try:
+        with Session() as s:
+            for w in windows:
+                s.add(MotionWindow(
+                    camera_id=cam_id,
+                    started_at=datetime.utcfromtimestamp(w.started_ts),
+                    ended_at=datetime.utcfromtimestamp(w.ended_ts),
+                    motion=bool(w.motion),
+                ))
+            s.commit()
+    except Exception:
+        logger.warning("не удалось записать окно наблюдения движения",
+                       exc_info=True, extra={"camera_id": cam_id})
+
+
 def onvif_poll_worker(cam_id: int, host: str, port: int, username: str | None, password: str | None,
                       stop_event: threading.Event | None = None):
     """Фоновая нить на камеру с onvif_enabled: держит PullPoint-подписку и
@@ -850,6 +898,11 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
     # любом выходе из camera_worker() — штатном, по отключению камеры и по
     # необработанному исключению (цикл 23).
     onvif_stop = threading.Event()
+    # SPEC §6: отметки «аналитика смотрела камеру и видела/не видела в ней
+    # движение». Накапливаются в памяти нити и уходят в БД готовым окном
+    # раз в минуту (motion_windows.py). Создаётся до try/finally, чтобы
+    # незакрытое окно дописывалось и при аварийном выходе из нити.
+    motion_tracker = MotionWindowTracker()
     if onvif_config and onvif_config.get("host"):
         threading.Thread(
             target=onvif_poll_worker,
@@ -1058,6 +1111,13 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
             if motion or faces:
                 last_motion = now
 
+            # SPEC §6: отметка наблюдения этого кадра. Лицо считается
+            # движением независимо от префильтра: в «максимальном» профиле
+            # MOG2 выключен вовсе (motion_prefilter=0), и без этого условия
+            # сегмент с человеком в кадре, но без сработки префильтра,
+            # уехал бы в удаление как «пустой».
+            _flush_motion_windows(cam_id, motion_tracker.observe(now, motion or bool(faces)))
+
             if not faces:
                 continue
 
@@ -1082,6 +1142,10 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         # Сегмента и ffmpeg-репабликации здесь больше нет: с цикла 24 запись
         # ведёт MediaMTX, и остановка аналитики её не касается (SPEC §2).
         onvif_stop.set()
+        # Незакрытое окно наблюдения — до минуты. Без этой строки каждый
+        # перезапуск нити оставлял бы дыру в покрытии, а manager()
+        # пересоздаёт нить каждые ~10 с при проблемах с потоком.
+        _flush_motion_windows(cam_id, motion_tracker.close())
         # cap is None — камера остановлена в паузе по расписанию (§6),
         # захват уже отпущен.
         if cap is not None:
@@ -1444,6 +1508,13 @@ def cleanup_old():
         # analytics, но карточка персоны собирается из событий всех камер, и
         # разная глубина по камерам рвала бы её непредсказуемо.
         s.execute(delete(FaceEvent).where(FaceEvent.ts < now - timedelta(days=global_days)))
+        # Окна наблюдения (SPEC §6) переживать архив не должны: они нужны
+        # ровно до того момента, когда сегмент осуждён или сохранён.
+        # Глубина — глобальная, как у событий лиц: строка окна весит
+        # десятки байт, а привязка к покамерным срокам добавила бы второй
+        # запрос ради экономии мегабайта.
+        s.execute(delete(MotionWindow).where(
+            MotionWindow.ended_at < now - timedelta(days=global_days)))
         s.commit()
     if dropped:
         logger.info("ротация архива по сроку хранения",
@@ -1457,6 +1528,79 @@ def cleanup_old():
                           now - timedelta(hours=1))
     if any(removed.values()):
         logger.info("уборка медиа-файлов", extra={"removed": removed})
+
+
+def prune_motionless_segments() -> int:
+    """«Запись только при движении»: сносит сегменты без движения (SPEC §6).
+
+    Третий механизм удаления рядом с retention и циклической перезаписью
+    (см. storage.py), и единственный, который смотрит на содержимое
+    записи, а не на её возраст и не на место на диске. Включается
+    покамерно флагом `record_on_motion` и работает только по камерам
+    аналитики: у остальных нет источника движения (см. проверку в
+    routers/cameras.py бэкенда).
+
+    Порядок такой же осторожный, как в остальной уборке: сначала
+    отбираются сегменты **старше** `MOTION_SETTLE_SEC` (у свежих ещё не
+    все окна наблюдения записаны, и «покрытия нет» означало бы «не успели
+    записать», а не «не смотрели»), затем к ним подтягиваются окна за тот
+    же промежуток, и только полностью покрытые наблюдением и не задетые
+    движением уходят в удаление.
+    """
+    with Session() as s:
+        cam_ids = [
+            cid for (cid,) in s.execute(
+                select(Camera.id).where(
+                    Camera.record_on_motion.is_(True),
+                    Camera.mode == "analytics",
+                )
+            ).all()
+        ]
+        if not cam_ids:
+            return 0
+
+        cutoff = datetime.utcnow() - timedelta(seconds=MOTION_SETTLE_SEC)
+        # LIMIT по той же причине, что и в циклической перезаписи: на
+        # камере, у которой режим включили после недели непрерывной
+        # записи, кандидатов сразу тысячи. Не хватит одного прохода —
+        # добьёт следующий.
+        segments = s.execute(
+            select(VideoSegment)
+            .where(VideoSegment.camera_id.in_(cam_ids),
+                   VideoSegment.ended_at < cutoff)
+            .order_by(VideoSegment.started_at)
+            .limit(1000)
+        ).scalars().all()
+        if not segments:
+            return 0
+
+        # Окна тянутся одним запросом на весь пакет и только за нужный
+        # отрезок: за 14 дней на камеру их 20 000, и выбирать всё подряд
+        # ради сотни сегментов незачем. Границы расширены на запас
+        # (guard + слияние соседних окон), иначе окно, начавшееся до
+        # первого сегмента, не попало бы в выборку и разорвало покрытие.
+        margin = timedelta(seconds=DEFAULT_GUARD_SEC + 120)
+        first = min(seg.started_at for seg in segments) - margin
+        last = max(seg.ended_at for seg in segments) + margin
+        windows = s.execute(
+            select(MotionWindow).where(
+                MotionWindow.camera_id.in_(cam_ids),
+                MotionWindow.ended_at >= first,
+                MotionWindow.started_at <= last,
+            )
+        ).scalars().all()
+
+        victims = segments_without_motion(segments, windows,
+                                          guard_sec=DEFAULT_GUARD_SEC)
+        dropped = _drop_segments(s, victims)
+        s.commit()
+
+    if dropped:
+        logger.info("удалены сегменты без движения (запись по движению)",
+                    extra={"segments_removed": dropped,
+                           "cameras": len(cam_ids),
+                           "considered": len(segments)})
+    return dropped
 
 
 def enforce_disk_quota() -> int:
@@ -1772,6 +1916,7 @@ def manager():
     threads: dict[int, threading.Thread] = {}
     last_cleanup = 0.0
     last_recluster = 0.0
+    last_motion_prune = 0.0
     last_model_retry = time.time()
 
     logger.info("конфиг воркера", extra={"config": CONFIG})
@@ -1870,6 +2015,19 @@ def manager():
                     cleanup_old()
                 except Exception:
                     logger.error("ошибка очистки (cleanup)", exc_info=True)
+
+            # SPEC §6: уборка сегментов без движения идёт чаще retention —
+            # раз в 5 минут. Смысл режима в том, чтобы не занимать диск
+            # пустой записью, и час задержки означал бы, что на камере с
+            # редким движением архив всё равно растёт часовыми ступенями.
+            # Проход дешёвый: на выключенном режиме это один запрос,
+            # возвращающий ноль камер.
+            if now - last_motion_prune > 300:
+                last_motion_prune = now
+                try:
+                    prune_motionless_segments()
+                except Exception:
+                    logger.error("ошибка уборки сегментов без движения", exc_info=True)
 
             # Заполнение диска проверяется на каждом проходе (~10 с), а не
             # раз в час вместе с retention: между часовыми проходами 120

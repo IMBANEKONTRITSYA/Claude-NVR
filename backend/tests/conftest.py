@@ -226,6 +226,29 @@ def make_camera(client, admin_headers):
 
 
 @pytest.fixture()
+def cam_residue(client, admin_headers):
+    """Убирает камеры, появившиеся за время теста.
+
+    Парная к `make_camera`, но для камер, id которых тест заранее не
+    знает: их заводит импорт конфигурации (SPEC §3) или запрос, от
+    которого ожидался отказ. Снимок «что было до» и удаление всего нового
+    покрывает оба случая — иначе упавший тест оставляет камеры в БД и
+    роняет следующий прогон (сторож test_zz_suite_leaves_no_residue.py,
+    урок цикла 21).
+
+    Жила в test_camera_config_io.py до цикла 36; поднята в conftest, когда
+    понадобилась второму файлу.
+    """
+    def _ids():
+        return {c["id"] for c in client.get("/api/cameras", headers=admin_headers).json()}
+
+    before = _ids()
+    yield
+    for cam_id in _ids() - before:
+        client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
+
+
+@pytest.fixture()
 def make_user_headers(make_user):
     """`(username, role) -> {"Authorization": "Bearer ..."}` — самый частый
     способ использования `make_user` в тестах матрицы прав."""

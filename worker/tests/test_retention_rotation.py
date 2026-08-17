@@ -64,7 +64,11 @@ def archive(tmp_path, monkeypatch):
             admin.execute(_sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
             admin.execute(_sql(f"CREATE SCHEMA {schema}"))
 
-    tables = [worker.Camera.__table__, worker.VideoSegment.__table__]
+    # MotionWindow — с цикла 36: `cleanup_old()` чистит и окна наблюдения
+    # (SPEC §6), и без таблицы ротация падает на UndefinedTable. На
+    # развёртывании таблицу создаёт бэкенд (models.MotionWindow).
+    tables = [worker.Camera.__table__, worker.VideoSegment.__table__,
+              worker.MotionWindow.__table__]
     for t in tables:
         t.drop(engine, checkfirst=True)
         t.create(engine, checkfirst=True)
