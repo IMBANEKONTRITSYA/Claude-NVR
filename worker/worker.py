@@ -42,6 +42,7 @@ from sqlalchemy import (Column, Integer, BigInteger, String, DateTime, Boolean,
 from pgvector.sqlalchemy import Vector
 
 from backoff import reconnect_delay
+from detection_schedule import schedule_active
 from face_select import pick_matching_face
 from fileage import prune_media
 from record_layer import MediaMTXClient, path_conf, path_name, sync_paths
@@ -309,6 +310,10 @@ class Camera(Base):
     # SPEC §5: собственная глубина хранения камеры; NULL — следовать за
     # глобальной настройкой (см. models.py бэкенда).
     retention_days = Column(Integer)
+    # SPEC §6: расписание детекции (день/ночь, рабочие часы). NULL — детекция
+    # круглосуточно; см. detection_schedule.py о формате и о том, почему
+    # «пусто» это «всегда», а не «никогда».
+    detection_schedule = Column(JSON)
 
 
 class Person(Base):
@@ -496,6 +501,13 @@ _DECODE_ACCEL_LOGGED = False
 # (слишком короткий тайм-аут даёт ложные переподключения при кратковременных
 # заторах) и временем восстановления (ТЗ: RTO ≤ 5 минут для всей системы,
 # здесь — на один поток из до 16).
+# Как часто спящая по расписанию камера проверяет, не открылось ли окно.
+# 30 с: граница окна размывается максимум на полминуты (для «рабочих часов»
+# это незаметно), а спящая камера при этом ходит в БД вдвое реже, чем
+# работающая (load_cam_state раз в 10 с), — на 120 камерах, стоящих ночью,
+# разница заметна.
+SCHEDULE_POLL_SEC = 30.0
+
 RTSP_OPEN_TIMEOUT_MSEC = 10_000
 RTSP_READ_TIMEOUT_MSEC = 15_000
 
@@ -675,8 +687,8 @@ def save_latest_frame(frame, cam_id: int):
     cv2.imwrite(fpath, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
 
 
-def load_cam_state(cam_id: int) -> tuple[dict | None, bool, int | None]:
-    """(roi, active, motion_sensitivity).
+def load_cam_state(cam_id: int) -> tuple[dict | None, bool, int | None, dict | None]:
+    """(roi, active, motion_sensitivity, detection_schedule).
 
     `active=False` — нить аналитики должна завершиться: камера удалена,
     отключена **или переведена в режим record_only**. Последнее — то же
@@ -688,10 +700,11 @@ def load_cam_state(cam_id: int) -> tuple[dict | None, bool, int | None]:
     with Session() as s:
         cam = s.get(Camera, cam_id)
         if cam is None or not cam.enabled:
-            return None, False, None
+            return None, False, None, None
         if (getattr(cam, "mode", None) or "record_only") != "analytics":
-            return None, False, None
-        return cam.roi, True, getattr(cam, "motion_sensitivity", None)
+            return None, False, None, None
+        return (cam.roi, True, getattr(cam, "motion_sensitivity", None),
+                getattr(cam, "detection_schedule", None))
 
 
 # ТЗ 18.7: события движения/присутствия от ONVIF-камеры вместо постоянного
@@ -843,7 +856,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         last_proc = 0.0
         last_latest_save = 0.0
         last_state_reload = 0.0
-        roi, active, motion_sens = load_cam_state(cam_id)
+        roi, active, motion_sens, det_schedule = load_cam_state(cam_id)
         roi_mask = None
         roi_mask_shape = None
         frame_counter = 0            # для пропуска кадров (ТЗ 18.3)
@@ -864,11 +877,66 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         # исключений — не распознавание (оно и так под try), а обращения к БД
         # в цикле: load_cam_state() ходит в Postgres каждые 10 с, и обычная для
         # 24/7 перезагрузка БД роняла бы все 16 нитей разом (цикл 23).
+        # SPEC §6: расписание детекции. Вне окна камера не обрабатывается
+        # вовсе — захват отпускается, то есть уходит не только детектор, но
+        # и декодирование. Это и есть смысл функции на целевом сервере: без
+        # GPU декод идёт постоянно, независимо от частоты детекции
+        # (cap.read() в цикле ниже не throttl'ится), и «детекция только
+        # ночью» без освобождения захвата экономила бы гораздо меньше.
+        #
+        # Статус камеры при этом НЕ меняется. Соблазн выставить "offline"
+        # велик, но §9 требует алерта на потерю потока — дежурный получал бы
+        # его каждый вечер по расписанию. Камера в это время действительно
+        # онлайн: слой записи (MediaMTX) продолжает писать её, пауза
+        # касается только аналитики (§2 — слои независимы).
+        paused = False
         while True:
             if shutdown_event.is_set():
                 logger.info("остановка (shutdown), освобождаю ресурсы", extra={"camera_id": cam_id})
                 update_status(cam_id, "offline")
                 return
+
+            if not schedule_active(det_schedule, datetime.now()):
+                if not paused:
+                    logger.info("вне окна расписания детекции, аналитика приостановлена",
+                                extra={"camera_id": cam_id})
+                    paused = True
+                    if cap is not None:
+                        cap.release()
+                        cap = None
+                    # Честный ноль в мониторинге вместо последнего значения:
+                    # иначе панель показывала бы «5 FPS» на камере, которая
+                    # сейчас не обрабатывается вообще.
+                    try:
+                        r.hset("worker:fps", str(cam_id), 0)
+                    except Exception:
+                        pass
+                # Прерываемое ожидание: на shutdown уходим сразу, не досыпая.
+                if shutdown_event.wait(SCHEDULE_POLL_SEC):
+                    continue
+                roi, active, motion_sens, det_schedule = load_cam_state(cam_id)
+                roi_mask = None
+                if not active:
+                    logger.info("камера отключена, останавливаю обработку", extra={"camera_id": cam_id})
+                    update_status(cam_id, "disabled")
+                    return
+                continue
+
+            if paused or cap is None:
+                logger.info("окно расписания открылось, возобновляю аналитику",
+                            extra={"camera_id": cam_id})
+                paused = False
+                cap = open_capture(analyze_url)
+                if not cap.isOpened():
+                    # Тот же путь, что и при обычной потере потока ниже:
+                    # ждём с backoff, а не крутим переоткрытие в цикле.
+                    cap.release()
+                    cap = None
+                    if shutdown_event.wait(reconnect_delay(reconnect_attempt)):
+                        continue
+                    reconnect_attempt += 1
+                    continue
+                reconnect_attempt = 0
 
             ok, frame = cap.read()
             if not ok:
@@ -926,7 +994,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
                 last_latest_save = now
 
             if now - last_state_reload > 10.0:
-                roi, active, motion_sens = load_cam_state(cam_id)
+                roi, active, motion_sens, det_schedule = load_cam_state(cam_id)
                 roi_mask = None
                 last_state_reload = now
                 if not active:
@@ -1007,7 +1075,10 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         # Сегмента и ffmpeg-репабликации здесь больше нет: с цикла 24 запись
         # ведёт MediaMTX, и остановка аналитики её не касается (SPEC §2).
         onvif_stop.set()
-        cap.release()
+        # cap is None — камера остановлена в паузе по расписанию (§6),
+        # захват уже отпущен.
+        if cap is not None:
+            cap.release()
 
 
 

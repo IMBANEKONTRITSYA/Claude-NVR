@@ -41,6 +41,7 @@ def _camera_out(c: Camera) -> CameraOut:
         retention_days=c.retention_days,
         onvif_host=c.onvif_host, onvif_port=c.onvif_port,
         onvif_username=c.onvif_username,
+        detection_schedule=c.detection_schedule,
     )
 
 
@@ -101,6 +102,11 @@ async def add_camera(payload: CameraIn, _=Depends(require_role("admin")), db: As
         onvif_username=payload.onvif_username or None,
         onvif_password_enc=encrypt(payload.onvif_password) if payload.onvif_password else None,
         retention_days=payload.retention_days,
+        # SPEC §6. None остаётся None («круглосуточно»), а не пустым
+        # расписанием: у колонки эти два значения означают одно и то же,
+        # но NULL честнее показывает, что расписание не задавали.
+        detection_schedule=(payload.detection_schedule.model_dump()
+                            if payload.detection_schedule else None),
     )
     db.add(cam)
     await db.commit()
@@ -139,6 +145,10 @@ async def update_camera(cam_id: int, payload: CameraIn, _=Depends(require_role("
     # выбрана в пользу той, что выражается формой, — иначе снять
     # собственный срок было бы нечем.
     cam.retention_days = payload.retention_days
+    # То же правило, что и у retention_days: пустое значение значимо —
+    # «снять расписание, вернуть круглосуточную детекцию».
+    cam.detection_schedule = (payload.detection_schedule.model_dump()
+                              if payload.detection_schedule else None)
     await db.commit()
     await db.refresh(cam)
     await get_redis().publish("cameras:changed", str(cam.id))

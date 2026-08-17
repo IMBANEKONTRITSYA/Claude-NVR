@@ -64,13 +64,13 @@ def test_record_only_camera_is_not_active_for_analytics(monkeypatch):
     как флаг «камера отключена».
     """
     monkeypatch.setattr(worker, "Session", _session_factory(_FakeCamera(mode="record_only")))
-    _roi, active, _sens = worker.load_cam_state(1)
+    _roi, active, _sens, _sched = worker.load_cam_state(1)
     assert active is False
 
 
 def test_analytics_camera_is_active(monkeypatch):
     monkeypatch.setattr(worker, "Session", _session_factory(_FakeCamera(mode="analytics")))
-    _roi, active, _sens = worker.load_cam_state(1)
+    _roi, active, _sens, _sched = worker.load_cam_state(1)
     assert active is True
 
 
@@ -81,7 +81,7 @@ def test_camera_without_mode_column_is_treated_as_record_only(monkeypatch):
     cam = _FakeCamera()
     del cam.mode
     monkeypatch.setattr(worker, "Session", _session_factory(cam))
-    _roi, active, _sens = worker.load_cam_state(1)
+    _roi, active, _sens, _sched = worker.load_cam_state(1)
     assert active is False
 
 

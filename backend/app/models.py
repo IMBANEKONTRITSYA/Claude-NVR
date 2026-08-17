@@ -68,6 +68,13 @@ class Camera(Base):
     # без собственного срока продолжает следовать за ней и после её
     # изменения, чего копия значения в момент создания камеры не дала бы.
     retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # SPEC §6: «расписание детекции (день/ночь, рабочие часы)».
+    # {"enabled": bool, "windows": [{"days": [0..6], "start": "HH:MM", "end": "HH:MM"}]}
+    # NULL и enabled=false — «детекция круглосуточно», а не «никогда»:
+    # расписания нет ни у одной существующей камеры, и обратная трактовка
+    # на обновлении остановила бы аналитику на объекте молча.
+    # Окно с start > end — через полночь; см. worker/detection_schedule.py.
+    detection_schedule: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class Person(Base):
