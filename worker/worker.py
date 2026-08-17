@@ -373,6 +373,23 @@ ACCELERATOR = "CPU"
 FACE_APP = None
 
 
+# Модули insightface, которые системе действительно нужны.
+#
+# FaceAnalysis по умолчанию поднимает ПЯТЬ моделей: detection,
+# landmark_3d_68, landmark_2d_106, genderage, recognition — и прогоняет
+# последние четыре НА КАЖДОЕ ЛИЦО КАЖДОГО кадра. FaceWatch из результата
+# читает ровно два поля: `bbox` (детекция) и `normed_embedding`
+# (распознавание); возраст, пол и лицевые точки не использует нигде — ни
+# в событиях, ни в поиске, ни в кластеризации.
+#
+# Замерено на цепочке §19 (buffalo_s, det_size 640, один поток, кадр с
+# шестью лицами): 723 мс/кадр со всеми модулями против 112 мс/кадр с
+# этими двумя — **6.5×**, при побитово том же наборе bbox и эмбеддингов.
+# Это самый дорогой шаг слоя аналитики, и три четверти его стоимости
+# уходили на данные, которые никто не читает.
+FACE_MODULES = ["detection", "recognition"]
+
+
 def load_face_app(model_name: str | None = None):
     """Загружает модель детекции/распознавания с учётом профиля (ТЗ 18.5)."""
     global ACCELERATOR, FACE_APP
@@ -382,7 +399,7 @@ def load_face_app(model_name: str | None = None):
     ACCELERATOR = providers[0].replace("ExecutionProvider", "")
     size = int(CONFIG["detect_width"])
     logger.info("модель загружена", extra={"model": name, "accelerator": ACCELERATOR, "det_size": size})
-    app = FaceAnalysis(name=name, providers=providers)
+    app = FaceAnalysis(name=name, providers=providers, allowed_modules=FACE_MODULES)
     app.prepare(ctx_id=0, det_size=(size, size))
     FACE_APP = app
     return app

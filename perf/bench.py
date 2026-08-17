@@ -15,12 +15,22 @@
   целиком.
 * **inference** — миллисекунд на лицо на CPU (§21: ONNX Runtime CPU /
   OpenVINO как рекомендованный рантайм).
+* **chain** — вся цепочка аналитики одним прогоном на РЕАЛЬНОЙ модели
+  (`buffalo_s`): decode → префильтр → детектор → эмбеддинг, в том же
+  порядке и с теми же параметрами, что в `worker.camera_worker()`. Это
+  единственная группа, которая отвечает на вопрос §19 «детекция ≥ 5
+  FPS/канал» целиком, а не по частям: сумма отдельно измеренных шагов не
+  учитывает ни повторный ресайз, ни то, что детектор получает полный кадр.
 
 Запуск:
 
-    python perf/bench.py                # всё, человекочитаемо
+    python perf/bench.py                # набор по умолчанию, человекочитаемо
     python perf/bench.py --json         # машиночитаемо, для CI
     python perf/bench.py --only decode  # одна группа
+    python perf/bench.py --only chain   # полная цепочка (тянет модель из сети)
+
+`chain`, `facesearch` и `archive` в набор по умолчанию не входят: первая
+качает модель (~125 МБ), две другие засевают сотни тысяч строк в Postgres.
 
 Осознанные ограничения, которые нельзя лечить в песочнице:
 
@@ -242,6 +252,202 @@ def bench_inference() -> dict:
         "ms_per_face_p95": round(sorted(times)[int(len(times) * 0.95)], 2),
         "faces_per_sec": round(1000.0 / statistics.mean(times), 1),
         "note": "синтетическая сеть, не buffalo_s — см. докстринг",
+    }
+
+
+# --- полная цепочка аналитики (SPEC §15, §19) -----------------------------
+
+# SPEC §19: «Детекция ≥ 5 FPS/канал на камерах analytics».
+DETECTION_FPS_TARGET = 5.0
+
+
+def _sample_face_image():
+    """Кадр с настоящими лицами из состава insightface.
+
+    Синтетический `testsrc2` для этой цепочки не годится: детектор не
+    найдёт на нём ни одного лица, эмбеддинг не посчитается ни разу, и
+    «полная цепочка» выродилась бы в decode + префильтр + детектор
+    вхолостую — то есть в число заметно ЛУЧШЕ реального. Картинка идёт в
+    составе пакета (Apache 2.0, §24), сеть для неё не нужна.
+    """
+    import os.path
+
+    import cv2
+    import insightface
+
+    for name in ("t1.jpg", "Tom_Hanks_54745.png"):
+        path = os.path.join(os.path.dirname(insightface.__file__), "data", "images", name)
+        img = cv2.imread(path)
+        if img is not None:
+            return img, name
+    return None, None
+
+
+def make_face_clip(path: str, seconds: int = CLIP_SECONDS) -> dict:
+    """H.265-клип параметров §1, в кадре которого есть реальные лица.
+
+    Лица медленно едут по кадру: неподвижная картинка не даёт сработать
+    префильтру движения, и MOG2 отсекал бы каждый кадр — детектор не
+    запускался бы вовсе, а именно он самый дорогой шаг цепочки.
+    """
+    import cv2
+    import numpy as np
+
+    face_img, source = _sample_face_image()
+    if face_img is None:
+        return {"error": "в составе insightface нет образца с лицами"}
+
+    # Лица занимают примерно половину высоты кадра — типичный план
+    # проходной, где распознавание вообще имеет смысл.
+    scale = (CLIP_H * 0.5) / face_img.shape[0]
+    face = cv2.resize(face_img, (int(face_img.shape[1] * scale), int(CLIP_H * 0.5)))
+    fh, fw = face.shape[:2]
+
+    frames = seconds * CLIP_FPS
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{CLIP_W}x{CLIP_H}", "-r", str(CLIP_FPS), "-i", "-",
+        "-c:v", "libx265", "-b:v", f"{CLIP_KBPS}k",
+        "-x265-params", "log-level=none", "-pix_fmt", "yuv420p", path,
+    ]
+    rnd = np.random.RandomState(20260817)
+    t0 = time.perf_counter()
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE)
+    try:
+        for i in range(frames):
+            # Слабый шум на фоне: сплошная заливка сжимается почти в ничто,
+            # и декодер простаивал бы (та же оговорка, что у make_clip).
+            frame = rnd.randint(0, 40, (CLIP_H, CLIP_W, 3), dtype=np.uint8)
+            x = int((CLIP_W - fw) * (0.5 + 0.45 * np.sin(i / 12.0)))
+            y = int((CLIP_H - fh) * (0.5 + 0.35 * np.cos(i / 17.0)))
+            frame[y:y + fh, x:x + fw] = face
+            proc.stdin.write(frame.tobytes())
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    rc = proc.wait()
+    if rc != 0 or not os.path.exists(path):
+        return {"error": f"ffmpeg вернул {rc}: {proc.stderr.read().decode()[:200]}"}
+    return {
+        "encode_sec": round(time.perf_counter() - t0, 2),
+        "size_bytes": os.path.getsize(path),
+        "frames": frames,
+        "face_source": source,
+    }
+
+
+def bench_analytics_chain(path: str, single_thread: bool = True) -> dict:
+    """Полная цепочка аналитики одним прогоном (SPEC §19: ≥ 5 FPS/канал).
+
+    Это тот самый замер, который прошлые циклы держали в known gaps как
+    «нужна реальная ONNX-модель»: `buffalo_s` тянется из сети, и вместо
+    неё мерилась синтетическая сеть по частям. Здесь цепочка идёт целиком
+    и **в том же порядке, что в worker.camera_worker()**:
+
+        cap.read() → cv2.resize(frame, (640,360)) → MOG2.apply()
+                   → FACE_APP.get(frame)  # детектор + эмбеддинг
+
+    Важные детали соответствия production'у:
+
+    * детектор получает ПОЛНЫЙ кадр (720p), а не уменьшенный: ужимает его
+      сам insightface до `det_size`, и мерить на заранее уменьшенном
+      кадре значило бы выбросить эту работу из бюджета;
+    * `det_size` берётся из `detect_width` (640) — как в load_face_app();
+    * `.get()` считает и эмбеддинг, поэтому отдельного шага для него нет.
+
+    `single_thread=True` — честное число НА КАНАЛ: §16 отводит аналитике
+    0.5–1.5 ядра на камеру, то есть камеры идут своими процессами и делят
+    ядра, а не забирают все 64 каждая. Прогон в несколько потоков ORT
+    показал бы FPS одной камеры на пустом сервере — величину, которой на
+    объекте не существует.
+    """
+    if single_thread:
+        # Должно быть выставлено ДО импорта onnxruntime: число потоков
+        # OpenMP читается при загрузке рантайма, а не при создании сессии.
+        for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ[var] = "1"
+    try:
+        import cv2
+        import numpy as np
+        from insightface.app import FaceAnalysis
+    except ImportError as exc:
+        return {"skipped": f"нет зависимости: {exc.name}"}
+
+    if single_thread:
+        cv2.setNumThreads(1)
+
+    try:
+        # Тот же набор модулей, что в worker.load_face_app(): бенчмарк
+        # должен мерить production-путь, а не FaceAnalysis по умолчанию —
+        # разница между ними шестикратная (см. worker.FACE_MODULES).
+        app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"],
+                           allowed_modules=["detection", "recognition"])
+        app.prepare(ctx_id=0, det_size=(DETECT_W, DETECT_W))
+    except Exception as exc:
+        # Модель качается с GitHub при первом вызове. На раннере без сети
+        # это не повод ронять весь бенчмарк — остальные группы полезны и
+        # без неё, а пропуск виден в отчёте.
+        return {"skipped": f"модель buffalo_s недоступна: {type(exc).__name__}: {exc}"}
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return {"error": "VideoCapture не открыл клип"}
+    bg = cv2.createBackgroundSubtractorMOG2()
+
+    t_decode, t_prefilter, t_detect = [], [], []
+    frames = faces_total = detector_runs = 0
+    t_start = time.perf_counter()
+    while True:
+        t0 = time.perf_counter()
+        ok, frame = cap.read()
+        t1 = time.perf_counter()
+        if not ok:
+            break
+        frames += 1
+
+        small = cv2.resize(frame, (640, 360))
+        fg = bg.apply(small)
+        motion = int(np.count_nonzero(fg)) > 1500   # CONFIG["motion_threshold"]
+        t2 = time.perf_counter()
+
+        n_faces = 0
+        if motion:
+            detector_runs += 1
+            n_faces = len(app.get(frame))
+            faces_total += n_faces
+        t3 = time.perf_counter()
+
+        t_decode.append((t1 - t0) * 1000)
+        t_prefilter.append((t2 - t1) * 1000)
+        if motion:
+            t_detect.append((t3 - t2) * 1000)
+    wall = time.perf_counter() - t_start
+    cap.release()
+
+    if not frames:
+        return {"error": "клип не содержит кадров"}
+
+    chain_fps = frames / wall
+    return {
+        "frames": frames,
+        "wall_sec": round(wall, 2),
+        "chain_fps": round(chain_fps, 2),
+        "target_fps": DETECTION_FPS_TARGET,
+        "meets_target": chain_fps >= DETECTION_FPS_TARGET,
+        "detector_runs": detector_runs,
+        "faces_detected": faces_total,
+        # Средние по шагам: сумма меньше wall на накладные расходы цикла,
+        # это ожидаемо и не сводится «в ноль» специально.
+        "ms_decode": round(statistics.mean(t_decode), 2),
+        "ms_prefilter": round(statistics.mean(t_prefilter), 2),
+        "ms_detect_embed": round(statistics.mean(t_detect), 2) if t_detect else None,
+        "ms_detect_embed_p95": (round(sorted(t_detect)[int(len(t_detect) * 0.95)], 2)
+                                if t_detect else None),
+        "single_thread": single_thread,
+        "model": "buffalo_s",
+        "det_size": DETECT_W,
     }
 
 
@@ -790,6 +996,17 @@ def run(groups: set[str]) -> dict:
             result["prefilter"] = bench_motion_prefilter(clip)
         if "inference" in groups:
             result["inference"] = bench_inference()
+        if "chain" in groups:
+            if not _have("ffmpeg"):
+                result["chain"] = {"skipped": "ffmpeg не найден"}
+            else:
+                face_clip = os.path.join(tmpdir, "faces.mp4")
+                made = make_face_clip(face_clip)
+                if "error" in made:
+                    result["chain"] = {"skipped": made["error"]}
+                else:
+                    result["chain"] = bench_analytics_chain(face_clip)
+                    result["chain"]["clip"] = made
         if "archive" in groups:
             result["archive"] = bench_archive(
                 log=(None if os.environ.get("BENCH_QUIET")
@@ -836,8 +1053,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--json", action="store_true", help="машиночитаемый вывод")
     ap.add_argument("--only", action="append", default=None,
-                    choices=["decode", "prefilter", "inference", "facesearch",
-                             "archive"],
+                    choices=["decode", "prefilter", "inference", "chain",
+                             "facesearch", "archive"],
                     help="выполнить только указанные группы (можно повторять)")
     args = ap.parse_args()
 
@@ -845,6 +1062,9 @@ def main() -> int:
     # сотни тысяч строк и требуют живого Postgres — это минуты, а не
     # секунды. Запускаются явно (`--only facesearch`, `--only archive`),
     # в том числе из отдельной CI-джобы.
+    # chain не входит в набор по умолчанию: он тянет модель buffalo_s из
+    # сети (~125 МБ) и идёт минуты, а не секунды. Запускается явно
+    # (`--only chain`) — как facesearch и archive.
     groups = set(args.only) if args.only else {"decode", "prefilter", "inference"}
     res = run(groups)
 
@@ -882,6 +1102,27 @@ def main() -> int:
             print(f"  {'ms/лицо (p95)':28} {inf['ms_per_face_p95']:8.2f}")
             print(f"  {'лиц/с':28} {inf['faces_per_sec']:8.1f}")
             print(f"  провайдеры: {', '.join(inf['providers'])}")
+    if "chain" in res:
+        ch = res["chain"]
+        print("\nПолная цепочка аналитики (SPEC §19: детекция ≥ 5 FPS/канал):")
+        if "skipped" in ch:
+            print(f"  пропущено: {ch['skipped']}")
+        elif "error" in ch:
+            print(f"  ОШИБКА: {ch['error']}")
+        else:
+            print(f"  модель {ch['model']}, det_size {ch['det_size']}, "
+                  f"{'один поток' if ch['single_thread'] else 'все потоки'}")
+            print(f"  {'decode':28} {ch['ms_decode']:8.2f} мс/кадр")
+            print(f"  {'префильтр MOG2':28} {ch['ms_prefilter']:8.2f} мс/кадр")
+            if ch["ms_detect_embed"] is not None:
+                print(f"  {'детектор + эмбеддинг':28} {ch['ms_detect_embed']:8.2f} мс "
+                      f"(p95 {ch['ms_detect_embed_p95']:.2f})")
+            print(f"  найдено лиц: {ch['faces_detected']} за {ch['detector_runs']} "
+                  f"прогонов детектора из {ch['frames']} кадров")
+            verdict = "укладывается" if ch["meets_target"] else "НЕ УКЛАДЫВАЕТСЯ"
+            print(f"  ИТОГО цепочка: {ch['chain_fps']:.2f} FPS/канал — {verdict} "
+                  f"в норматив {ch['target_fps']:.0f} FPS")
+
     if "archive" in res:
         ar = res["archive"]
         print("\nПоиск по архиву (SPEC §7: ≤ 5 с на 500 000 сегментов):")
