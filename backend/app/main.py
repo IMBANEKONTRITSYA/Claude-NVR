@@ -1,3 +1,4 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends
@@ -195,7 +196,22 @@ async def lifespan(app: FastAPI):
                 s.value = encrypt_setting(s.value)
                 logger.info("секрет настроек зашифрован при миграции", extra={"key": s.key})
         await db.commit()
-    yield
+
+    # Планировщик отчётов (SPEC §8). Отдельная задача в том же процессе, а
+    # не сервис: три расписания на объекте не стоят пятого systemd-юнита
+    # (§26). Остановка через Event и ожидание задачи — иначе §13
+    # «graceful shutdown» нарушался бы отменой посреди отправки письма.
+    from .services.report_scheduler import scheduler_loop
+    reports_stop = asyncio.Event()
+    reports_task = asyncio.create_task(scheduler_loop(reports_stop))
+    try:
+        yield
+    finally:
+        reports_stop.set()
+        try:
+            await asyncio.wait_for(reports_task, timeout=20)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            reports_task.cancel()
 
 
 app = FastAPI(title="FaceWatch API", lifespan=lifespan)

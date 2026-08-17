@@ -198,6 +198,18 @@ export const api = {
   putSettings: (b: any) => req("/api/settings", { method: "PUT", body: JSON.stringify(b) }),
   testTelegram: () => req("/api/settings/test-telegram", { method: "POST" }),
   testEmail: () => req("/api/settings/test-email", { method: "POST" }),
+
+  // Шаблоны отчётов и расписание (SPEC §8)
+  reportKinds: () => req("/api/reports/kinds"),
+  reportSchedules: () => req("/api/reports/schedules"),
+  createReportSchedule: (body: any) =>
+    req("/api/reports/schedules", { method: "POST", body: JSON.stringify(body) }),
+  updateReportSchedule: (id: number, body: any) =>
+    req(`/api/reports/schedules/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteReportSchedule: (id: number) =>
+    req(`/api/reports/schedules/${id}`, { method: "DELETE" }),
+  sendReportSchedule: (id: number) =>
+    req(`/api/reports/schedules/${id}/send`, { method: "POST" }),
   // Несекретные настройки интерфейса — доступны под любой ролью, в отличие
   // от getSettings() (admin-only, отдаёт расшифрованные секреты).
   getClientSettings: () => req("/api/settings/client"),

@@ -123,6 +123,46 @@ class Setting(Base):
     value: Mapped[str] = mapped_column(String(255))
 
 
+class ReportSchedule(Base):
+    """Шаблон отчёта и (необязательно) расписание его отправки — SPEC §8.
+
+    Одна сущность на «настраиваемые шаблоны отчётов» и «автоматическую
+    отправку по расписанию», а не две: шаблон без расписания — это просто
+    сохранённый набор параметров, который оператор запускает кнопкой, а
+    расписание без шаблона бессмысленно. Разделение на две таблицы дало бы
+    осиротевшие расписания при удалении шаблона и ничего не упростило бы.
+    """
+
+    __tablename__ = "report_schedules"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    kind: Mapped[str] = mapped_column(String(32))            # services/reports.py: KINDS
+    fmt: Mapped[str] = mapped_column(String(8), default="xlsx")
+    days: Mapped[int] = mapped_column(Integer, default=7)    # период выборки
+    recipients: Mapped[str] = mapped_column(String(500), default="")
+
+    # Расписание. `period`: daily | weekly | monthly. Часы/минуты — по
+    # локальному времени сервера: администратор объекта думает в нём же,
+    # а не в UTC, и «отчёт в 8 утра» должен приходить к открытию, а не со
+    # сдвигом на часовой пояс.
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False,
+                                          server_default=text("false"))
+    period: Mapped[str] = mapped_column(String(16), default="daily")
+    hour: Mapped[int] = mapped_column(Integer, default=8)
+    minute: Mapped[int] = mapped_column(Integer, default=0)
+    # Для weekly — день недели 0..6 (0 = понедельник), для monthly — число
+    # 1..28. Верхняя граница 28, а не 31: расписание «31-го числа» молча
+    # не сработало бы в феврале, и заметили бы это через месяцы.
+    day_of_week: Mapped[int] = mapped_column(Integer, default=0)
+    day_of_month: Mapped[int] = mapped_column(Integer, default=1)
+
+    # Момент последней УСПЕШНОЙ отправки. Он же — защита от дублей: слот
+    # считается закрытым, если last_sent_at не раньше его начала.
+    last_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class AuditLog(Base):
     __tablename__ = "audit_log"
     id: Mapped[int] = mapped_column(primary_key=True)
