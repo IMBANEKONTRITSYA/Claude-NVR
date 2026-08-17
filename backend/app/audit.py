@@ -156,6 +156,34 @@ NOT_AUDITED: dict[tuple[str, str], str] = {
         "кнопки. Отдельного смысла в журнале не несёт: остановка следует "
         "за каждым поворотом, а сам поворот не аудируется."
     ),
+    # ONVIF Profile G (SPEC §12): четыре SOAP-эндпоинта внешнего VMS. Их
+    # субъект — не пользователь FaceWatch из таблицы users, а отдельная
+    # ONVIF-учётка (WS-Security UsernameToken), поэтому запись в общий
+    # журнал аудита, привязанный к username/role пользователя, для них
+    # бессмысленна: колонки username/role заполнить нечем. VMS вдобавок
+    # опрашивает GetRecordingSummary/GetSystemDateAndTime периодически —
+    # тот же довод «частый автоматический опрос вытеснит реальные
+    # действия», что и у автопродления сессии выше. Доступ к самой точке
+    # ограничивается сетью/nginx и WS-Security (см. DEPLOY_CHECKLIST 7.2),
+    # а не журналом. Если объекту понадобится след обращений VMS — это
+    # отдельный журнал интеграций, не общий audit_log.
+    ("POST", "/onvif/device_service"): (
+        "ONVIF Profile G (SPEC §12): субъект — отдельная ONVIF-учётка, не "
+        "пользователь FaceWatch, поэтому username/role в audit_log заполнить "
+        "нечем; VMS вдобавок опрашивает эндпоинт периодически. См. блок выше."
+    ),
+    ("POST", "/onvif/recording_service"): (
+        "ONVIF Profile G (SPEC §12): subject — ONVIF-учётка, не пользователь "
+        "FaceWatch; частый автоматический опрос VMS. См. блок выше."
+    ),
+    ("POST", "/onvif/search_service"): (
+        "ONVIF Profile G (SPEC §12): subject — ONVIF-учётка, не пользователь "
+        "FaceWatch; частый автоматический опрос VMS. См. блок выше."
+    ),
+    ("POST", "/onvif/replay_service"): (
+        "ONVIF Profile G (SPEC §12): subject — ONVIF-учётка, не пользователь "
+        "FaceWatch; запрос replay-ссылки внешним VMS. См. блок выше."
+    ),
 }
 
 

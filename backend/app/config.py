@@ -46,6 +46,25 @@ class Settings(BaseSettings):
     # В обычной эксплуатации не должен выставляться.
     ALLOW_INSECURE_DEFAULT_SECRETS: bool = False
 
+    # SPEC §12: ONVIF Profile G (хранение) — сервер поиска и воспроизведения
+    # записей для внешних VMS. Выключен по умолчанию: это внешняя SOAP-точка,
+    # раздающая метаданные архива, и включаться она должна осознанно, с
+    # заведённой ONVIF-учёткой и, желательно, за сетевой изоляцией/nginx.
+    ONVIF_G_ENABLED: bool = False
+    # Отдельная учётка Profile G (WS-Security UsernameToken). НЕ из таблицы
+    # users: пароли пользователей — bcrypt-хэши, а UsernameToken Digest
+    # требует пароль в открытом виде. Пустой пароль при включённом ONVIF_G
+    # означает «фича включена, но не сконфигурирована» — сервер отвечает
+    # отказом (fail-closed), а не пускает без пароля.
+    ONVIF_G_USERNAME: str = "onvif"
+    ONVIF_G_PASSWORD: str = ""
+    # База RTSP-URI для GetReplayUri. FaceWatch пишет через MediaMTX, который
+    # НЕ отдаёт ONVIF-совместимый RTSP-replay по времени, поэтому адрес
+    # replay-источника задаёт оператор явно (напр. rtsp://mediamtx:8554).
+    # Пусто — GetReplayUri отвечает ter:NotSupported, а не выдаёт ссылку,
+    # которую нечем воспроизвести (см. DEPLOY_CHECKLIST, known gaps).
+    ONVIF_G_REPLAY_URI_BASE: str = ""
+
     class Config:
         env_file = ".env"
 
