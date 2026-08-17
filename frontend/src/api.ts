@@ -238,6 +238,13 @@ export const api = {
   recordLayer: () => req("/api/system/record-layer"),
   storageCalc: (bitrate_kbps: number, cameras: number, days: number) =>
     req(`/api/system/storage/calculator?bitrate_kbps=${bitrate_kbps}&cameras=${cameras}&days=${days}`),
+  // SPEC §16 «Автоконфигурация при первом запуске»: ресурсы сервера →
+  // предложение по числу камер записи, камер аналитики и профилю.
+  autoconfig: (bitrate_kbps: number, retention_days: number) =>
+    req(`/api/system/autoconfig?bitrate_kbps=${bitrate_kbps}&retention_days=${retention_days}`),
+  autoconfigApply: (bitrate_kbps: number, retention_days: number) =>
+    req(`/api/system/autoconfig/apply?bitrate_kbps=${bitrate_kbps}&retention_days=${retention_days}`,
+        { method: "POST" }),
   health: async () => {
     const r = await fetch("/api/health");
     try { return await r.json(); } catch { return { ok: false, db: "?", redis: "?" }; }

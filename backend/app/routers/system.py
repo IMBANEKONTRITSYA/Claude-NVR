@@ -13,10 +13,13 @@ from ..config import settings
 from ..db import SessionLocal, get_db
 from ..models import Camera, FaceEvent, Setting, VideoSegment
 from ..auth import require_role, require_role_query
+from ..profiles import profile_settings
+from ..services import autoconfig
 from ..services.pubsub import get_redis
 from ..services.storage import (BYTES_PER_GB, DISK_CRIT_PCT, DISK_WARN_PCT,
                                 calibration, days_left, disk_alert_level,
                                 nominal_gb_per_day, required_gb)
+from .cameras import DEFAULT_ANALYTICS_MAX
 
 # SPEC §1: «Основной поток: H.265, 1280×720 @ 15 fps, 2048 kbps» — базовая
 # фактическая конфигурация камер объекта. Номинальный расход считается от
@@ -325,4 +328,130 @@ async def storage_calculator(
         "gb_per_day_total": round(nominal_gb_per_day(bitrate_kbps, cameras), 1),
         "required_gb": round(gb, 1),
         "required_tb": round(gb / 1024, 2),
+    }
+
+
+# --- Автоконфигурация при первом запуске (SPEC §16) ---------------------
+
+# Отметка о применённой автоконфигурации. Ключ живёт в той же таблице
+# settings, но сознательно не входит в SCHEMA роутера настроек: это не
+# параметр, который администратор правит формой, а след действия. Через
+# PUT /api/settings он неизменяем именно поэтому.
+AUTOCONFIG_APPLIED_KEY = "autoconfig_applied_at"
+
+
+async def _autoconfig_context(db: AsyncSession, bitrate_kbps: int,
+                              retention_days: int | None) -> dict:
+    """Ресурсы хоста + предложение + то, что настроено сейчас (SPEC §16)."""
+    res = autoconfig.detect_resources(settings.MEDIA_PATH)
+    days = retention_days or await _setting_int(db, "retention_days", 14)
+
+    # Ядра берутся физические, а не логические. Вилки §16 («0.02-0.04 ядра
+    # на камеру») сняты для ядер; принять за ядро поток HT/SMT значит
+    # удвоить предложение на ровном месте — на целевом сервере §20 (2× Xeon)
+    # это 64 потока против 32 ядер, то есть вдвое больше обещанных камер
+    # аналитики, чем сервер вывезет.
+    plan = autoconfig.plan(
+        res["cores_physical"], res["ram_mb"], res["disk_free_gb"],
+        bitrate_kbps=bitrate_kbps, retention_days=days, gpu=res["gpu"],
+    )
+
+    cams = (await db.execute(select(Camera))).scalars().all()
+    applied = await db.get(Setting, AUTOCONFIG_APPLIED_KEY)
+    profile_row = await db.get(Setting, "performance_profile")
+
+    return {
+        "resources": res,
+        "plan": plan,
+        "current": {
+            "cameras_total": len(cams),
+            "cameras_enabled": sum(1 for c in cams if c.enabled),
+            "cameras_analytics": sum(1 for c in cams if (c.mode or "record_only") == "analytics"),
+            "analytics_cameras_max": await _setting_int(
+                db, "analytics_cameras_max", DEFAULT_ANALYTICS_MAX),
+            "performance_profile": profile_row.value if profile_row else None,
+        },
+        # «Первый запуск» — это не только «система только что развёрнута»:
+        # смысл в том, что предложение ещё ни разу не применяли и ни одной
+        # камеры не завели. Ровно в этом состоянии экран стоит показывать
+        # самому, а не ждать, пока администратор его найдёт.
+        "first_run": applied is None and not cams,
+        "applied_at": applied.value if applied else None,
+    }
+
+
+@router.get("/autoconfig")
+async def autoconfig_report(
+    bitrate_kbps: int = Query(MAIN_STREAM_KBPS, ge=64, le=100_000),
+    retention_days: int | None = Query(None, ge=1, le=3650),
+    _=Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Что сервер потянет и что предлагается настроить (SPEC §16).
+
+    Только считает и показывает — ничего не меняет. Применение вынесено в
+    отдельный POST ниже: §16 говорит «предлагает», и молча переписанные
+    настройки на первом же открытии экрана мониторинга были бы совсем
+    другим поведением, чем предложение.
+
+    `bitrate_kbps` и `retention_days` — параметры «что если»: предел по
+    диску целиком определяется ими, и администратор объекта, который знает
+    свои камеры лучше константы §1, должен иметь возможность подставить
+    свои числа, не трогая настройки системы.
+    """
+    return await _autoconfig_context(db, bitrate_kbps, retention_days)
+
+
+@router.post("/autoconfig/apply")
+async def autoconfig_apply(
+    bitrate_kbps: int = Query(MAIN_STREAM_KBPS, ge=64, le=100_000),
+    retention_days: int | None = Query(None, ge=1, le=3650),
+    _=Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Применяет предложение §16: предел камер аналитики и профиль.
+
+    Записываются ровно две вещи, и обе — про слой аналитики: предел
+    `analytics_cameras_max` и профиль производительности со всеми его
+    параметрами. Число камер записи не настройка, а следствие того,
+    сколько камер завели, — его автоконфигурация показывает, но применять
+    ей нечего.
+
+    Retention не трогается сознательно, хотя предел по диску считается
+    именно от него: уменьшить глубину архива — это выбросить записи, и
+    такое решение не принимают за администратора кнопкой «применить
+    рекомендацию».
+    """
+    ctx = await _autoconfig_context(db, bitrate_kbps, retention_days)
+    plan = ctx["plan"]
+
+    # Схема настройки не допускает нуля (нижняя граница 1), а рекомендация
+    # его допускает — это разные вопросы: «сколько камер потянет сервер» и
+    # «какой потолок выставить». При нуле пишется 1 и возвращается
+    # предупреждение из плана: тихо записать единицу и промолчать значило
+    # бы выдать «одна камера аналитики допустима» за рекомендацию системы.
+    analytics_max = max(autoconfig.ANALYTICS_SETTING_MIN, plan["analytics_max"])
+
+    values = profile_settings(plan["profile"])
+    values["performance_profile"] = plan["profile"]
+    values["analytics_cameras_max"] = str(analytics_max)
+    values[AUTOCONFIG_APPLIED_KEY] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    for key, val in values.items():
+        existing = await db.get(Setting, key)
+        if existing:
+            existing.value = val
+        else:
+            db.add(Setting(key=key, value=val))
+    await db.commit()
+
+    return {
+        "applied": {
+            "analytics_cameras_max": analytics_max,
+            "performance_profile": plan["profile"],
+        },
+        "recommended_analytics_max": plan["analytics_max"],
+        "recording_max": plan["recording_max"],
+        "warnings": plan["warnings"],
+        "applied_at": values[AUTOCONFIG_APPLIED_KEY],
     }

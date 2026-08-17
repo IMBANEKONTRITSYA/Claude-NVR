@@ -180,6 +180,122 @@ function RecordLayerPanel() {
   );
 }
 
+/**
+ * Автоконфигурация при первом запуске (SPEC §16).
+ *
+ * Отличие от калькулятора хранения ниже: тот отвечает на вопрос «сколько
+ * диска под столько-то камер», то есть требует, чтобы администратор уже
+ * знал число камер. Этот отвечает на обратный и более ранний вопрос —
+ * «сколько камер потянет вот этот сервер», — который встаёт до того, как
+ * заведена первая камера, и на который §16 требует ответа от системы.
+ *
+ * Предел по каждому ресурсу показывается рядом с итогом намеренно: «132
+ * камеры» без «упирается в диск» не подсказывает, что менять, чтобы стало
+ * больше. Именно за этим администратор и открывает экран планирования.
+ */
+function AutoConfigPanel() {
+  const [f, setF] = useState({ bitrate_kbps: 2048, retention_days: 14 });
+  const [d, setD] = useState<any>(null);
+  const [err, setErr] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = (bitrate = f.bitrate_kbps, days = f.retention_days) =>
+    api.autoconfig(bitrate, days)
+      .then((r: any) => { setD(r); setErr(""); })
+      .catch((e: any) => { setD(null); setErr(e.message); });
+
+  useEffect(() => { load(); }, []);
+
+  const apply = async () => {
+    setBusy(true); setMsg(""); setErr("");
+    try {
+      const r = await api.autoconfigApply(f.bitrate_kbps, f.retention_days);
+      setMsg(`Применено: камер аналитики не более ${r.applied.analytics_cameras_max}, `
+        + `профиль «${r.applied.performance_profile}». `
+        + "Воркер подхватит настройки за ~10 секунд.");
+      await load();
+    } catch (e: any) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const res = d?.resources, plan = d?.plan;
+  const RU: Record<string, string> = { cpu: "CPU", ram: "оперативную память", disk: "диск" };
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <h3 style={{ marginTop: 0 }}>
+        Автоконфигурация{" "}
+        {d?.first_run && <span className="badge" style={{ background: "#2d6" }}>первый запуск</span>}
+      </h3>
+      <p className="muted" style={{ marginTop: 0 }}>
+        Система определяет ресурсы сервера и предлагает пределы (ТЗ §16). Расход на камеру
+        берётся по верхней границе вилок ТЗ, из ресурсов вычитается запас 20% (§19) и слой
+        приложения — предложение сознательно осторожнее, чем «влезет впритык».
+      </p>
+
+      <div className="grid" style={{ gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
+        <div>
+          <label>Битрейт основного потока, кбит/с</label>
+          <input type="number" min={64} max={100000} value={f.bitrate_kbps}
+            onChange={e => setF({ ...f, bitrate_kbps: Number(e.target.value) })} />
+        </div>
+        <div>
+          <label>Глубина хранения, суток</label>
+          <input type="number" min={1} max={3650} value={f.retention_days}
+            onChange={e => setF({ ...f, retention_days: Number(e.target.value) })} />
+        </div>
+      </div>
+      <button className="btn" style={{ marginTop: 8 }} onClick={() => load()}>Пересчитать</button>
+
+      {err && <div className="empty" style={{ marginTop: 8 }}>{err}</div>}
+      {msg && <div className="muted" style={{ marginTop: 8, color: "#2d6" }}>{msg}</div>}
+
+      {res && plan && (
+        <>
+          <div className="muted" style={{ marginTop: 12, fontSize: 12 }}>
+            Обнаружено: {res.cores_physical} физ. ядер ({res.cores_logical} потоков),{" "}
+            {Math.round(res.ram_mb / 1024)} ГБ ОЗУ, свободно на диске архива{" "}
+            {res.disk_free_gb} ГБ из {res.disk_total_gb} ГБ,{" "}
+            {res.gpu ? "обнаружен ускоритель" : "ускоритель не обнаружен"}.
+          </div>
+
+          <div className="row" style={{ marginTop: 12 }}>
+            <Metric label="Камер записи" value={plan.recording_max}
+              hint={`упирается в ${RU[plan.recording.bound_by]}; по CPU ${plan.recording.by_cpu}, `
+                + `по ОЗУ ${plan.recording.by_ram}, по диску ${plan.recording.by_disk}`} />
+            <Metric label="Камер аналитики" value={plan.analytics_max}
+              hint={`по ресурсам ${plan.analytics_by_resources}, `
+                + `упирается в ${RU[plan.analytics.bound_by]}`} />
+            <Metric label="Профиль" value={plan.profile}
+              hint={`свободно ${plan.budget.cores_left_for_analytics} ядра под аналитику`} />
+          </div>
+
+          {(plan.warnings || []).map((w: string, i: number) => (
+            <div key={i} className="empty" style={{ marginTop: 8 }}>{w}</div>
+          ))}
+
+          <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>
+            Сейчас настроено: камер заведено {d.current.cameras_total} (в аналитике{" "}
+            {d.current.cameras_analytics}), предел аналитики{" "}
+            {d.current.analytics_cameras_max}, профиль{" "}
+            {d.current.performance_profile || "не задан"}.
+            {d.applied_at && ` Автоконфигурация применялась ${d.applied_at}.`}
+          </div>
+
+          <button className="btn" style={{ marginTop: 8 }} onClick={apply} disabled={busy}>
+            {busy ? "Применение..." : "Применить предложение"}
+          </button>
+          <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+            Применяются только предел камер аналитики и профиль. Глубина хранения и уже
+            заведённые камеры не трогаются.
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 /** Калькулятор хранения (SPEC §21): битрейт × камеры × дни → требуемый объём. */
 function StorageCalculator() {
   const [f, setF] = useState({ bitrate_kbps: 2048, cameras: 120, days: 14 });
@@ -334,6 +450,9 @@ export function Monitoring() {
 
       <RecordLayerPanel />
       <StoragePanel isAdmin={isAdmin} />
+      {/* Планирование (§16) стоит перед калькулятором хранения: сначала
+          «сколько камер потянет сервер», потом «сколько диска под них». */}
+      {isAdmin && <AutoConfigPanel />}
       {isAdmin && <StorageCalculator />}
 
       <div className="row" style={{ marginBottom: 16 }}>

@@ -106,7 +106,7 @@ Content-Type: application/json
 | `/api/search` | `search` | поиск похожих лиц по загруженному фото |
 | `/api/settings` | `settings` | системные настройки, профили производительности, тест Telegram и SMTP |
 | `/api/audit` | `audit` | журнал аудита, экспорт CSV/XLSX (только чтение) |
-| `/api/system` | `system` | метрики мониторинга, хранилище архива и калькулятор (SPEC §21), экспорт Prometheus |
+| `/api/system` | `system` | метрики мониторинга, хранилище архива и калькулятор (SPEC §21), автоконфигурация по ресурсам сервера (SPEC §16: `GET /api/system/autoconfig`, `POST /api/system/autoconfig/apply`), экспорт Prometheus |
 | `/api/media/{kind}/{name}` | — | отдача снимков/аватаров/сегментов, авторизация токеном в query-параметре (нужно для `<img src>`/`<video src>`, которые не могут выставить заголовок `Authorization`) |
 | `/api/health` | — | health-check (БД + Redis), без авторизации, используется Docker healthcheck |
 
