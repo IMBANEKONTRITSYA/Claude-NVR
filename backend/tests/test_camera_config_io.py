@@ -11,6 +11,7 @@
    посреди файла не должна оставить парк камер наполовину обновлённым.
 """
 import io
+import json
 
 import pytest
 
@@ -243,3 +244,186 @@ def test_operator_cannot_export_or_import(client, make_user, request):
 def test_import_rejects_garbage_file(client, admin_headers, cam_residue):
     r = _import(client, admin_headers, "не файл конфигурации вовсе", filename="x.txt")
     assert r.status_code == 400
+
+
+# --- расписание детекции и зоны детекции в файле (§3 + §6 + §11) -----------
+#
+# До этого файл конфигурации нёс только «плоские» поля камеры. Расписание
+# детекции (§6) и полигоны ROI (§11 «Настройки по камерам: retention, ROI,
+# режим») в нём отсутствовали, поэтому восстановление парка из выгрузки
+# молча возвращало все камеры к «детекция круглосуточно по всему кадру».
+# Тесты ниже стерегут ровно три свойства: значения переживают круг,
+# старый файл без колонок ничего не стирает, пустая ячейка снимает
+# настройку осознанно.
+
+SCHEDULE = {"enabled": True, "windows": [{"days": [0, 1, 2, 3, 4], "start": "22:00", "end": "06:00"}]}
+ROI = {"polygons": [[[0.1, 0.1], [0.9, 0.1], [0.9, 0.9]]]}
+
+
+def test_csv_cell_carries_nested_structures_verbatim():
+    rows = [{"name": "Cam", "rtsp_url": "rtsp://10.0.0.2/s",
+             "detection_schedule": SCHEDULE, "roi": ROI}]
+    csv_text = camera_config.rows_to_csv(rows)
+    parsed = camera_config.parse_file(csv_text.encode("utf-8"))
+    assert camera_config.parse_json_object(parsed[0]["detection_schedule"], "s") == SCHEDULE
+    assert camera_config.parse_json_object(parsed[0]["roi"], "r") == ROI
+
+
+def test_json_export_keeps_structures_as_objects_not_strings():
+    """В JSON-выгрузке расписание — объект: файл читают и правят руками."""
+    rows = [{"name": "Cam", "rtsp_url": "rtsp://10.0.0.2/s", "detection_schedule": SCHEDULE}]
+    parsed = camera_config.parse_file(camera_config.rows_to_json(rows).encode("utf-8"))
+    assert parsed[0]["detection_schedule"] == SCHEDULE
+    assert camera_config.parse_json_object(parsed[0]["detection_schedule"], "s") == SCHEDULE
+
+
+def test_empty_cell_is_absence_not_error():
+    assert camera_config.parse_json_object("", "s") is None
+    assert camera_config.parse_json_object("   ", "s") is None
+    assert camera_config.parse_json_object(None, "s") is None
+
+
+def test_broken_json_in_cell_names_the_field():
+    for bad in ("{не json", "[1,2]", "42"):
+        try:
+            camera_config.parse_json_object(bad, "detection_schedule")
+            raise AssertionError(f"принято значение {bad!r}")
+        except ValueError as e:
+            assert "detection_schedule" in str(e)
+
+
+def test_camera_without_schedule_exports_empty_cell():
+    """Пустая ячейка, а не «{}»: отсутствие расписания — это отсутствие."""
+    class _Cam:
+        name, location, enabled, mode = "Cam", "", True, "record_only"
+        motion_sensitivity = retention_days = onvif_port = None
+        onvif_enabled = False
+        onvif_host = onvif_username = None
+        detection_schedule = roi = None
+
+    row = camera_config.camera_row(_Cam(), "rtsp://10.0.0.2/s", None, include_secrets=True)
+    assert row["detection_schedule"] is None and row["roi"] is None
+    assert ",," in camera_config.rows_to_csv([row])
+
+
+def _schedule_of(client, headers, name):
+    cams = {c["name"]: c for c in client.get("/api/cameras", headers=headers).json()}
+    return cams[name]["detection_schedule"]
+
+
+def test_roundtrip_preserves_schedule_and_roi(client, admin_headers, admin_token, request, cam_residue):
+    """Круговой сценарий §3: правка локации не должна стоить расписания и зон."""
+    name = f"sch_{request.node.name}"[:60]
+    cam_id = _make_camera(client, admin_headers, name, mode="analytics", detection_schedule=SCHEDULE)
+    try:
+        assert client.put(f"/api/cameras/{cam_id}/roi", json=ROI, headers=admin_headers).status_code == 200
+
+        body = _export(client, admin_token)
+        r = _import(client, admin_headers, body.replace("склад", "проходная"))
+        assert r.status_code == 200 and r.json()["ok"], r.text
+
+        assert _schedule_of(client, admin_headers, name) == SCHEDULE
+        assert client.get(f"/api/cameras/{cam_id}/roi", headers=admin_headers).json() == ROI
+    finally:
+        client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
+
+
+def test_file_without_new_columns_keeps_schedule_and_roi(client, admin_headers, admin_token, request, cam_residue):
+    """Файл прежней версии (без колонок) — «не трогать», а не «стереть».
+
+    Иначе загрузка старого файла ради правки одной локации разом снимает
+    ночные расписания и зоны со всего парка, ничего не сообщая.
+    """
+    name = f"old_{request.node.name}"[:60]
+    cam_id = _make_camera(client, admin_headers, name, mode="analytics", detection_schedule=SCHEDULE)
+    try:
+        client.put(f"/api/cameras/{cam_id}/roi", json=ROI, headers=admin_headers)
+        # Файл, каким его выгружала прежняя версия: только плоские колонки.
+        old_body = f"name,rtsp_url,location\n{name},rtsp://admin:***@10.9.9.9:554/main,проходная\n"
+        r = _import(client, admin_headers, old_body)
+        assert r.status_code == 200 and r.json()["ok"], r.text
+
+        assert _schedule_of(client, admin_headers, name) == SCHEDULE, "старый файл стёр расписание"
+        assert client.get(f"/api/cameras/{cam_id}/roi", headers=admin_headers).json() == ROI
+    finally:
+        client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
+
+
+def test_empty_cells_clear_schedule_and_roi(client, admin_headers, request, cam_residue):
+    """Пустая ячейка при наличии колонки — осознанное снятие настройки."""
+    name = f"clr_{request.node.name}"[:60]
+    cam_id = _make_camera(client, admin_headers, name, mode="analytics", detection_schedule=SCHEDULE)
+    try:
+        client.put(f"/api/cameras/{cam_id}/roi", json=ROI, headers=admin_headers)
+        body = (f"name,rtsp_url,detection_schedule,roi\n"
+                f"{name},rtsp://admin:***@10.9.9.9:554/main,,\n")
+        r = _import(client, admin_headers, body)
+        assert r.status_code == 200 and r.json()["ok"], r.text
+
+        assert _schedule_of(client, admin_headers, name) is None
+        assert client.get(f"/api/cameras/{cam_id}/roi", headers=admin_headers).json() == {"polygons": []}
+    finally:
+        client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
+
+
+def test_import_creates_camera_with_schedule_and_roi_from_json_file(client, admin_headers, request, cam_residue):
+    name = f"mk_{request.node.name}"[:60]
+    body = json.dumps({"cameras": [{
+        "name": name, "rtsp_url": "rtsp://u:p@10.1.2.3:554/s", "mode": "analytics",
+        "detection_schedule": SCHEDULE, "roi": ROI,
+    }]}, ensure_ascii=False)
+    r = _import(client, admin_headers, body, filename="cameras.json")
+    assert r.status_code == 200 and r.json()["created"] == 1, r.text
+    cams = {c["name"]: c for c in client.get("/api/cameras", headers=admin_headers).json()}
+    try:
+        assert cams[name]["detection_schedule"] == SCHEDULE
+        assert client.get(f"/api/cameras/{cams[name]['id']}/roi", headers=admin_headers).json() == ROI
+    finally:
+        client.delete(f"/api/cameras/{cams[name]['id']}", headers=admin_headers)
+
+
+def test_invalid_schedule_in_file_rolls_back_whole_import(client, admin_headers, request, cam_residue):
+    """Расписание проверяется той же моделью, что и форма (§6): «25:00» — не время."""
+    name = f"bad_{request.node.name}"[:60]
+    bad = json.dumps({"enabled": True, "windows": [{"days": [0], "start": "25:00", "end": "06:00"}]})
+    body = ("name,rtsp_url,detection_schedule\n"
+            f"{name},rtsp://u:p@10.1.2.3:554/s,\"{bad}\"\n")
+    data = _import(client, admin_headers, body).json()
+    assert not data["ok"] and data["created"] == 0
+    assert data["errors"][0]["row"] == 1
+    assert all(c["name"] != name for c in client.get("/api/cameras", headers=admin_headers).json())
+
+
+def test_invalid_roi_in_file_is_reported(client, admin_headers, request, cam_residue):
+    name = f"broi_{request.node.name}"[:60]
+    body = ("name,rtsp_url,roi\n"
+            f"{name},rtsp://u:p@10.1.2.3:554/s,\"{{\"\"polygons\"\": \"\"не список\"\"}}\"\n")
+    data = _import(client, admin_headers, body).json()
+    assert not data["ok"] and data["created"] == 0
+    assert "polygons" in data["errors"][0]["error"]
+
+
+def test_export_carries_settings_to_a_fresh_installation(client, admin_headers, admin_token, request, cam_residue):
+    """§3 «перенос конфигурации с тестового стенда на боевой сервер».
+
+    Отдельный тест, а не вариация кругового: при импорте поверх той же
+    камеры расписание и зоны уцелели бы и от правила «колонки нет —
+    не трогать», то есть круговой сценарий зелен даже с выгрузкой без
+    этих колонок. На чистой установке подставить их неоткуда — здесь
+    камера заводится файлом заново, и потеря видна.
+    """
+    name = f"mv_{request.node.name}"[:60]
+    cam_id = _make_camera(client, admin_headers, name, mode="analytics", detection_schedule=SCHEDULE)
+    client.put(f"/api/cameras/{cam_id}/roi", json=ROI, headers=admin_headers)
+    body = _export(client, admin_token, secrets=True)
+    client.delete(f"/api/cameras/{cam_id}", headers=admin_headers)
+
+    r = _import(client, admin_headers, body)
+    assert r.status_code == 200 and r.json()["ok"], r.text
+    cams = {c["name"]: c for c in client.get("/api/cameras", headers=admin_headers).json()}
+    assert name in cams, "камера не заведена импортом"
+    try:
+        assert cams[name]["detection_schedule"] == SCHEDULE, "расписание не пережило перенос"
+        assert client.get(f"/api/cameras/{cams[name]['id']}/roi", headers=admin_headers).json() == ROI
+    finally:
+        client.delete(f"/api/cameras/{cams[name]['id']}", headers=admin_headers)
