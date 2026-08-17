@@ -65,7 +65,11 @@ jobs:
         working-directory: backend
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest pytest-cov aiosqlite
+          # aiosmtpd — лёгкий SMTP-сервер для тестов почты (SPEC §11).
+          # Без него tests/test_integration_smtp.py уходил бы в skip целиком,
+          # то есть почтовый канал алертов не проверялся бы в CI вовсе — тот
+          # же класс молчаливого пропуска, что и ffmpeg выше.
+          pip install -r requirements.txt pytest pytest-cov aiosqlite aiosmtpd
       - name: Run tests with coverage
         working-directory: backend
         # Цикл 5 поднял честное покрытие с 58.9% до 70.9% (тесты
@@ -106,7 +110,10 @@ jobs:
         # Postgres джобе не нужен).
         run: |
           python -m pip install --upgrade pip
-          pip install pytest fastapi httpx defusedxml sqlalchemy
+          # aiosmtpd: worker/mailer.py — только stdlib, поэтому его тест
+          # (tests/test_mailer.py) выполняется в этой лёгкой джобе, а не
+          # скипается вместе с тестами, которым нужен cv2.
+          pip install pytest fastapi httpx defusedxml sqlalchemy aiosmtpd
           pytest tests/ -q
 
   upscaler:

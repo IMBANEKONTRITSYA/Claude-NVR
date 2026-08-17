@@ -104,7 +104,7 @@ Content-Type: application/json
 | `/api/stats` | `stats` | KPI, графики по дням/часам, тепловая карта, топ персон |
 | `/api/reports` | `reports` | экспорт CSV/XLSX (появления, персоны, камеры) |
 | `/api/search` | `search` | поиск похожих лиц по загруженному фото |
-| `/api/settings` | `settings` | системные настройки, профили производительности, тест Telegram |
+| `/api/settings` | `settings` | системные настройки, профили производительности, тест Telegram и SMTP |
 | `/api/audit` | `audit` | журнал аудита, экспорт CSV/XLSX (только чтение) |
 | `/api/system` | `system` | метрики мониторинга, хранилище архива и калькулятор (SPEC §21), экспорт Prometheus |
 | `/api/media/{kind}/{name}` | — | отдача снимков/аватаров/сегментов, авторизация токеном в query-параметре (нужно для `<img src>`/`<video src>`, которые не могут выставить заголовок `Authorization`) |
@@ -145,6 +145,7 @@ Content-Type: application/json
   "person_id": 42,
   "name": "Иван Иванов",
   "is_known": true,
+  "alert": true,
   "snapshot": "snapshots/cam1_...jpg",
   "ts": "2026-08-04T12:00:00",
   "bbox": {"x1": 100, "y1": 50, "x2": 200, "y2": 180},
@@ -152,6 +153,10 @@ Content-Type: application/json
   "frame_h": 360
 }
 ```
+
+Поле `alert` — персона в watchlist (флаг «оповещать» в её карточке). По
+нему Стена подаёт звуковой сигнал, если включён `alert_sound_enabled`
+(SPEC §6); в `type: "box"` его нет — сигналить на каждый кадр незачем.
 
 Также транслируется `type: "faces:enhanced"` — когда фоновый апскейл
 завершает улучшение снимка (обновлённый путь к файлу, для замены

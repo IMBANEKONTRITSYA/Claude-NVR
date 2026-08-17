@@ -54,6 +54,7 @@ from storage import (BYTES_PER_GB, bytes_to_free, disk_alert_level,
 from shutdown import shutdown_event, handle_shutdown_signal
 from logging_utils import configure_logging
 from hwaccel import hw_decode_requested, detect_hw_accelerator_name
+import mailer
 import onvif_client
 
 logger = configure_logging("facewatch.worker")
@@ -83,6 +84,16 @@ CONFIG = {
     "alert_cooldown_sec": 300,
     "telegram_bot_token": "",
     "telegram_chat_id": "",
+    # SPEC §6 «Алерты при детекции (Telegram, email, звук)». Пустой smtp_host
+    # или пустой список получателей = почтовый канал выключен; остальные
+    # каналы от этого не зависят.
+    "smtp_host": "",
+    "smtp_port": 587,
+    "smtp_user": "",
+    "smtp_password": "",
+    "smtp_tls": "starttls",
+    "smtp_from": "",
+    "alert_email_to": "",
     # Профиль производительности (ТЗ 18)
     "frame_skip": 1,           # анализировать каждый (frame_skip+1)-й обработанный кадр
     "motion_prefilter": 1,     # детектор лиц только по движению
@@ -111,6 +122,9 @@ _CONFIG_TYPES = {
     "retention_days": int, "motion_threshold": int, "similarity_threshold": float,
     "detection_fps": int, "event_cooldown_sec": int, "alert_cooldown_sec": int,
     "telegram_bot_token": str, "telegram_chat_id": str,
+    "smtp_host": str, "smtp_port": int, "smtp_user": str,
+    "smtp_password": str, "smtp_tls": str, "smtp_from": str,
+    "alert_email_to": str,
     "frame_skip": int, "motion_prefilter": int, "idle_fps": int,
     "face_model": str, "upscale_mode": str, "cluster_interval_min": int,
     "detect_width": int, "record_segment_min": int,
@@ -156,7 +170,7 @@ r = redis.from_url(REDIS_URL, decode_responses=True)
 # backend дошифровывает такие значения при старте, но воркер может прочитать
 # настройки раньше, чем это произойдёт, поэтому читает оба вида.
 SECRET_SETTING_PREFIX = "enc:v1:"
-SECRET_SETTING_KEYS = frozenset({"telegram_bot_token"})
+SECRET_SETTING_KEYS = frozenset({"telegram_bot_token", "smtp_password"})
 
 
 def _decrypt_setting(stored: str) -> str:
@@ -196,19 +210,68 @@ def refresh_config():
         logger.error("не удалось прочитать настройки", exc_info=True)
 
 
-def send_telegram_alert(person_id: int, name: str, camera_id: int, snapshot_path: str):
-    """Telegram-оповещение с cooldown через Redis (один алерт на персону за период)."""
+def _alert_cooldown_passed(person_id: int) -> bool:
+    """True, если по этой персоне можно слать алерт (кулдаун истёк).
+
+    Кулдаун общий на все каналы (§6: Telegram, email, звук) и берётся ОДИН
+    раз на событие, а не каждым каналом по отдельности: иначе первый канал
+    забирал бы ключ, а второй молча пропускал бы каждый алерт — почта не
+    работала бы вовсе при включённом Telegram. Недоступность Redis не должна
+    глушить оповещения, поэтому ошибка трактуется как «кулдаун истёк».
+    """
+    try:
+        return r.set(f"alert_cooldown:{person_id}", "1",
+                     ex=CONFIG["alert_cooldown_sec"], nx=True) is not None
+    except Exception:
+        return True
+
+
+def send_person_alert(person_id: int, name: str, camera_id: int, snapshot_path: str):
+    """Watchlist-оповещение по всем настроенным каналам (SPEC §6).
+
+    Вызывается из фоновой нити: и Telegram, и SMTP — сетевые вызовы до
+    нескольких секунд, в нити обработки кадров они срезали бы FPS детекции.
+    Отказ одного канала не отменяет другой — они настраиваются независимо, и
+    администратор, включивший оба, ждёт дублирования, а не «какого-нибудь».
+    """
+    if not _alert_cooldown_passed(person_id):
+        return
+    text_msg = f"⚠️ FaceWatch: обнаружена персона «{name}» на камере #{camera_id}"
+    send_telegram_alert(text_msg, person_id, camera_id)
+    send_email_alert("FaceWatch: обнаружена персона из watchlist", text_msg,
+                     person_id, camera_id)
+
+
+def send_email_alert(subject: str, text_msg: str, person_id: int | None = None,
+                     camera_id: int | None = None):
+    """Письмо по SMTP-настройкам из БД. Молчит, если почта не настроена."""
+    try:
+        sent = mailer.send_email(
+            CONFIG["smtp_host"], int(CONFIG["smtp_port"]), CONFIG["smtp_user"],
+            CONFIG["smtp_password"], CONFIG["smtp_tls"], CONFIG["smtp_from"],
+            CONFIG["alert_email_to"], subject, text_msg,
+        )
+    except mailer.MailerError as e:
+        # Отдельный лог от Telegram: администратор должен видеть, какой
+        # именно канал молчит. Текст MailerError не содержит пароля.
+        logger.warning("ошибка отправки почтового уведомления",
+                       extra={"person_id": person_id, "camera_id": camera_id,
+                              "error": str(e)})
+        return False
+    except Exception:
+        logger.warning("ошибка отправки почтового уведомления", exc_info=True,
+                       extra={"person_id": person_id, "camera_id": camera_id})
+        return False
+    return sent
+
+
+def send_telegram_alert(text_msg: str, person_id: int | None = None,
+                        camera_id: int | None = None):
+    """Telegram-оповещение. Кулдаун снимается вызывающим (send_person_alert)."""
     token = CONFIG["telegram_bot_token"]
     chat = CONFIG["telegram_chat_id"]
     if not token or not chat:
-        return
-    cooldown_key = f"alert_cooldown:{person_id}"
-    try:
-        if r.set(cooldown_key, "1", ex=CONFIG["alert_cooldown_sec"], nx=True) is None:
-            return  # cooldown активен
-    except Exception:
-        pass
-    text_msg = f"⚠️ FaceWatch: обнаружена персона «{name}» на камере #{camera_id}"
+        return False
     try:
         import urllib.request
         import urllib.parse
@@ -220,6 +283,8 @@ def send_telegram_alert(person_id: int, name: str, camera_id: int, snapshot_path
         urllib.request.urlopen(req, timeout=5).read()
     except Exception:
         logger.warning("ошибка отправки Telegram-уведомления", exc_info=True, extra={"person_id": person_id, "camera_id": camera_id})
+        return False
+    return True
 
 
 class Camera(Base):
@@ -938,15 +1003,20 @@ class _PendingEvent:
     ленивыми атрибутами, дёргающими БД в произвольный момент.
     """
 
-    __slots__ = ("pid", "name", "is_known", "bbox", "bbox_json", "emb", "snap_rel")
+    __slots__ = ("pid", "name", "is_known", "bbox", "bbox_json", "emb", "snap_rel",
+                 "alert")
 
-    def __init__(self, pid, name, is_known, bbox, bbox_json, emb):
+    def __init__(self, pid, name, is_known, bbox, bbox_json, emb, alert=False):
         self.pid = pid
         self.name = name
         self.is_known = is_known
         self.bbox = bbox
         self.bbox_json = bbox_json
         self.emb = emb
+        # Персона в watchlist (§6). Читается здесь же, в фазе 1, вместе с
+        # остальными полями Person — после закрытия сессии `person` уже
+        # недоступна, а флаг нужен на публикации, чтобы Стена подала звук.
+        self.alert = alert
         self.snap_rel = None
 
 
@@ -998,10 +1068,11 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url
             bbox_json = {"x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3]}
 
             # Watchlist-оповещение: свой redis-cooldown, шлём из фоновой нити,
-            # чтобы HTTP к Telegram (до 5с) не тормозил обработку кадров
+            # чтобы сетевые вызовы каналов (§6: Telegram до 5 с, SMTP до 15 с)
+            # не тормозили обработку кадров
             if is_known and wants_alert:
                 threading.Thread(
-                    target=send_telegram_alert,
+                    target=send_person_alert,
                     args=(pid, name, cam_id, ""),
                     daemon=True,
                 ).start()
@@ -1031,7 +1102,8 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url
                 for k in [k for k, v in last_event_at.items() if v < cutoff_t]:
                     del last_event_at[k]
 
-            pending.append(_PendingEvent(pid, name, is_known, bbox, bbox_json, emb))
+            pending.append(_PendingEvent(pid, name, is_known, bbox, bbox_json, emb,
+                                         is_known and wants_alert))
 
     # Подавляющее большинство кадров не создаёт ни одного события (все лица
     # отсекает cooldown) — для них ни снимок, ни вторая сессия не нужны.
@@ -1129,6 +1201,7 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url
                     "person_id": p.pid,
                     "name": p.name,
                     "is_known": p.is_known,
+                    "alert": p.alert,
                     "snapshot": p.snap_rel,
                     "ts": ev.ts.isoformat(),
                     "bbox": p.bbox_json,
@@ -1360,6 +1433,18 @@ def check_disk_alerts() -> str | None:
     log("заполнение диска архива",
         extra={"level": level, "used_pct": round(used_pct, 1),
                "free_gb": round(du.free / BYTES_PER_GB, 1)})
+    # SPEC §9 требует алерт по переполнению диска, а не только запись в лог:
+    # журнал на объекте никто не читает, пока архив не начал стираться.
+    # Из фоновой нити — check_disk_alerts() зовётся из цикла менеджера, и
+    # 15-секундный таймаут SMTP задержал бы обход камер.
+    threading.Thread(
+        target=send_email_alert,
+        args=(f"FaceWatch: диск архива заполнен на {used_pct:.0f}%",
+              f"Уровень: {level}. Занято {used_pct:.1f}%, "
+              f"свободно {du.free / BYTES_PER_GB:.1f} ГБ.\n"
+              f"При достижении порога перезаписи старые сегменты будут удалены."),
+        daemon=True,
+    ).start()
     return level
 
 
