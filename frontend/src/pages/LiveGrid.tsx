@@ -8,6 +8,7 @@ import {
   applyZoom, clampPage, clampPan, gridColumns, isLayout, pageSlice, zoomTransform,
 } from "../liveLayout";
 import { PtzHold, PtzVector } from "../ptz";
+import { LiveDiagnosis, diagnoseLiveFailure } from "../liveDiagnostics";
 
 type Box = { id: number; name: string; is_known: boolean; x: number; y: number; w: number; h: number; ts: number };
 type Preset = { token: string; name: string };
@@ -158,6 +159,11 @@ function CameraTile({ cam, boxes, onClick }: any) {
   const hlsRef = useRef<Hls | null>(null);
   const tileRef = useRef<HTMLDivElement | null>(null);
   const [error, setError] = useState(false);
+  // Почему плитка чёрная. Одной надписи «Камера недоступна» дежурному
+  // мало: за ней прячутся и истёкшая сессия, и не заведённый слоем
+  // записи путь, и кодек, который не тянет браузер, — и действия по ним
+  // разные. Диагноз снимается с самого плейлиста, см. liveDiagnostics.ts.
+  const [diagnosis, setDiagnosis] = useState<LiveDiagnosis | null>(null);
   // Снимок — запасной путь, когда HLS не играет. Если и он не отдался,
   // камера действительно недоступна, и только тогда честно говорим об этом.
   const [snapshotFailed, setSnapshotFailed] = useState(false);
@@ -194,18 +200,41 @@ function CameraTile({ cam, boxes, onClick }: any) {
     const src = `/hls/cam${cam.id}/index.m3u8`;
     setError(false);
     setSnapshotFailed(false);
+    setDiagnosis(null);
+
+    // Плейлист запрашивается только после отказа воспроизведения, а не
+    // заранее: на здоровой стене из 16 камер это 16 лишних запросов
+    // каждый раз, а пользы от них нет — картинка и так идёт.
+    let cancelled = false;
+    const explain = async () => {
+      setError(true);
+      let playlistStatus = 0;
+      let playlistBody: string | undefined;
+      try {
+        const r = await fetch(src, { cache: "no-store" });
+        playlistStatus = r.status;
+        if (r.ok) playlistBody = await r.text();
+      } catch {
+        playlistStatus = 0;
+      }
+      if (!cancelled) setDiagnosis(diagnoseLiveFailure({ playlistStatus, playlistBody }));
+    };
 
     if (v.canPlayType("application/vnd.apple.mpegurl")) {
       v.src = src;
-      v.play().catch(() => setError(true));
+      v.play().catch(explain);
     } else if (Hls.isSupported()) {
       const hls = new Hls({ lowLatencyMode: true, liveSyncDuration: 1.5 });
       hlsRef.current = hls;
       hls.loadSource(src);
       hls.attachMedia(v);
-      hls.on(Hls.Events.ERROR, (_e, data) => { if (data.fatal) setError(true); });
+      hls.on(Hls.Events.ERROR, (_e, data) => { if (data.fatal) explain(); });
     }
-    return () => { hlsRef.current?.destroy(); hlsRef.current = null; };
+    return () => {
+      cancelled = true;
+      hlsRef.current?.destroy();
+      hlsRef.current = null;
+    };
   }, [cam.id]);
 
   // Пересчёт прямоугольника видео: при смене размера плитки (в том числе
@@ -321,7 +350,16 @@ function CameraTile({ cam, boxes, onClick }: any) {
           </div>
         ))}
       </div>
-      {error && snapshotFailed && <div className="nostream">Камера недоступна</div>}
+      {/* Причина показывается и поверх снимка: снимок из архива есть и
+          тогда, когда живой поток не идёт, и без подписи плитка выглядит
+          работающей — оператор смотрит на кадр минутной давности, не зная
+          об этом. */}
+      {error && (
+        <div className="nostream">
+          {diagnosis?.title ?? "Камера недоступна"}
+          {diagnosis?.hint && <div className="nostream-hint">{diagnosis.hint}</div>}
+        </div>
+      )}
       {zoom > MIN_ZOOM && (
         <div className="zoom-badge" onClick={e => { e.stopPropagation(); resetZoom(); }}
           title="Сбросить цифровой зум">

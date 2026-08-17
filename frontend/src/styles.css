@@ -65,7 +65,13 @@ th { color: var(--muted); font-weight: 500; }
 .cam-mosaic { display: grid; gap: 8px; }
 .cam-tile { background: #000; aspect-ratio: 16 / 9; position: relative; border-radius: 6px; overflow: hidden; }
 .cam-tile .lbl { position: absolute; top: 6px; left: 6px; background: rgba(0,0,0,0.6); padding: 2px 6px; border-radius: 4px; font-size: 12px; }
-.cam-tile .nostream { color: var(--muted); display: flex; align-items: center; justify-content: center; height: 100%; }
+/* Причина, по которой плитка чёрная (SPEC §4). Поверх снимка, потому
+   что снимок из архива есть и при мёртвом живом потоке: без подписи
+   оператор смотрит на кадр минутной давности, считая его живым. */
+.cam-tile .nostream { position: absolute; inset: 0; color: var(--muted); display: flex;
+  flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+  text-align: center; padding: 8px; background: rgba(0, 0, 0, .62); pointer-events: none; }
+.cam-tile .nostream-hint { font-size: 11px; line-height: 1.35; opacity: .85; max-width: 34ch; }
 /* SPEC §4, цифровой зум: индикатор кратности он же кнопка сброса —
    увеличенный кадр иначе нечем вернуть в исходное положение. */
 .cam-tile .zoom-badge { position: absolute; top: 6px; right: 6px; background: rgba(0,0,0,0.65); color: #fff; padding: 2px 7px; border-radius: 4px; font-size: 12px; cursor: pointer; user-select: none; }
