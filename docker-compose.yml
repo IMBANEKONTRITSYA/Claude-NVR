@@ -60,11 +60,23 @@ services:
     restart: unless-stopped
 
   mediamtx:
-    image: bluenviron/mediamtx:latest
+    # Версия зафиксирована, а не `latest`. Слой записи разговаривает с
+    # MediaMTX по Control API, набор прав и имена полей рантайма которого
+    # менялись между выпусками; с `latest` рабочее развёртывание ломается
+    # от `docker compose pull`, без единого изменения в репозитории, и
+    # выглядит это как «сегодня все камеры почернели». Обновление версии —
+    # осознанный коммит, после которого гоняются тесты слоя записи.
+    image: bluenviron/mediamtx:1.16.0
     container_name: facewatch-mediamtx
     logging: *default-logging
+    environment:
+      # Пароль Control API (см. authInternalUsers в mediamtx/mediamtx.yml).
+      # Индекс 1 — вторая запись списка, пользователь `facewatch`. То же
+      # значение подставляется воркеру в MEDIAMTX_API_URL ниже; они обязаны
+      # совпадать, иначе слой записи молча остаётся без путей.
+      MTX_AUTHINTERNALUSERS_1_PASS: ${MEDIAMTX_API_PASSWORD:-facewatch-mediamtx-api}
     ports:
-      # MediaMTX не требует аутентификации по умолчанию (SPEC §15). Он тянет
+      # MediaMTX не публикует наружу ни Control API, ни запись. Он тянет
       # камеры сам и раздаёт HLS через внутреннюю docker-сеть (хост
       # "mediamtx"), куда ходит nginx — публикация наружу никому не нужна и
       # означала бы, что любой в локальной сети смотрит камеры без входа в
@@ -152,7 +164,11 @@ services:
       RETENTION_DAYS: ${RETENTION_DAYS:-14}
       # Control API MediaMTX: воркер синхронизирует по нему пути слоя записи
       # (SPEC §20). Порт наружу не публикуется — только внутренняя сеть.
-      MEDIAMTX_API_URL: http://mediamtx:9997
+      # Логин и пароль — в самом адресе: MediaMTX отдаёт Control API
+      # анонимно только с loopback, а воркер приходит из своего
+      # контейнера. Пароль обязан совпадать с MTX_AUTHINTERNALUSERS_1_PASS
+      # сервиса mediamtx выше.
+      MEDIAMTX_API_URL: http://facewatch:${MEDIAMTX_API_PASSWORD:-facewatch-mediamtx-api}@mediamtx:9997
     volumes:
       - media:/media
       # Модели распознавания. В образ они вкладываются на сборке, но том

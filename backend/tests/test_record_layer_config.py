@@ -14,6 +14,7 @@
 import ast
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -154,9 +155,113 @@ def test_forbidden_token_check_is_not_vacuous():
     assert {"camera_worker", "manager", "sync_paths"} <= tokens
 
 
-def test_worker_reaches_mediamtx_api_by_internal_network():
+def _api_users() -> list[dict]:
+    """Записи authInternalUsers, дающие право `api`."""
+    return [u for u in (MEDIAMTX.get("authInternalUsers") or [])
+            if any(p.get("action") == "api" for p in (u.get("permissions") or []))]
+
+
+def test_mediamtx_grants_api_beyond_loopback():
+    """Главная поломка цикла 34: воркер получал HTTP 401 на КАЖДЫЙ вызов
+    Control API, и вместе с ним отваливались §4 и §5 целиком.
+
+    Дефолт MediaMTX выдаёт право `api` только записи с
+    `ips: ['127.0.0.1', '::1']`, а воркер живёт в отдельном контейнере и
+    приходит с адреса docker-сети. Пока `authInternalUsers` в
+    `mediamtx.yml` не было вовсе, действовал именно этот дефолт: пути
+    камер не заводились (чёрный экран на всех камерах), статусы потоков не
+    читались (все камеры «offline» навсегда), а healthcheck контейнера
+    ходил с loopback и оставался зелёным.
+
+    Проверено на настоящих бинарниках v1.9.3 и v1.16.0: запрос с
+    не-loopback адреса → `HTTP 401 authentication error`; с явной записью
+    и Basic-авторизацией → 200.
+    """
+    users = _api_users()
+    assert users, (
+        "в mediamtx.yml нет ни одной записи authInternalUsers с правом "
+        "action: api — Control API останется доступен только с loopback, "
+        "и воркер из соседнего контейнера получит HTTP 401"
+    )
+    remote = [u for u in users if not u.get("ips")]
+    assert remote, (
+        "право api выдано только конкретным адресам "
+        f"({[u.get('ips') for u in users]}); воркер приходит с произвольного "
+        "адреса docker-сети и будет получать HTTP 401"
+    )
+    for u in remote:
+        assert u.get("pass"), (
+            f"пользователь {u.get('user')!r} получает api с любого адреса без "
+            "пароля — это открытый доступ к конфигурации всех камер"
+        )
+        assert u.get("user") != "any", (
+            "право api с любого адреса выдано пользователю `any` — пароль "
+            "для него MediaMTX не спрашивает"
+        )
+
+
+def test_mediamtx_does_not_grant_publish():
+    """Камеры MediaMTX тянет сам (`source:` в пути), публиковать в него
+    некому. С правом `publish` любой, кто дотянулся до внутренней сети, мог
+    бы занять путь и подменить поток камеры."""
+    for u in MEDIAMTX.get("authInternalUsers") or []:
+        actions = {p.get("action") for p in (u.get("permissions") or [])}
+        assert "publish" not in actions, (
+            f"пользователь {u.get('user')!r} получил право publish"
+        )
+
+
+def test_worker_reaches_mediamtx_api_with_credentials():
+    """Адрес Control API у воркера обязан нести учётку: без неё MediaMTX
+    отвечает 401 (см. test_mediamtx_grants_api_beyond_loopback)."""
     env = COMPOSE["services"]["worker"]["environment"]
-    assert env["MEDIAMTX_API_URL"] == "http://mediamtx:9997"
+    url = env["MEDIAMTX_API_URL"]
+    parts = urlsplit(url.replace("${MEDIAMTX_API_PASSWORD:-", "").replace("}", ""))
+    assert parts.hostname == "mediamtx" and parts.port == 9997, url
+    assert parts.username, (
+        f"MEDIAMTX_API_URL={url!r} без логина — воркер пойдёт в Control API "
+        "анонимно и получит 401"
+    )
+    api_users = {u.get("user") for u in _api_users()}
+    assert parts.username in api_users, (
+        f"логин {parts.username!r} не совпадает ни с одним пользователем "
+        f"authInternalUsers с правом api ({api_users})"
+    )
+
+
+def test_mediamtx_and_worker_share_the_same_api_password():
+    """Пароль задаётся в двух местах (переменная контейнера mediamtx и адрес
+    воркера) и обязан быть одним и тем же. Рассогласование даёт ровно тот же
+    401 и те же симптомы, что отсутствие прав вовсе, — а healthcheck при
+    этом зелёный, потому что ходит с loopback."""
+    mtx_env = COMPOSE["services"]["mediamtx"]["environment"]
+    override = mtx_env["MTX_AUTHINTERNALUSERS_1_PASS"]
+    worker_url = COMPOSE["services"]["worker"]["environment"]["MEDIAMTX_API_URL"]
+    assert override in worker_url, (
+        f"пароль mediamtx ({override!r}) не встречается в MEDIAMTX_API_URL "
+        f"воркера ({worker_url!r})"
+    )
+    # Индекс в имени переменной обязан указывать на пользователя с правом api:
+    # MTX_AUTHINTERNALUSERS_<i>_PASS адресует запись списка по её номеру, и
+    # сдвиг записи наверх молча начнёт переопределять чужой пароль.
+    idx = int(re.fullmatch(r"MTX_AUTHINTERNALUSERS_(\d+)_PASS",
+                           "MTX_AUTHINTERNALUSERS_1_PASS").group(1))
+    users = MEDIAMTX["authInternalUsers"]
+    assert idx < len(users), f"в authInternalUsers нет записи с индексом {idx}"
+    assert any(p.get("action") == "api" for p in users[idx]["permissions"]), (
+        f"MTX_AUTHINTERNALUSERS_{idx}_PASS переопределяет пароль записи "
+        f"{users[idx].get('user')!r}, у которой нет права api"
+    )
+
+
+def test_mediamtx_image_is_pinned():
+    """`latest` ломает рабочее развёртывание по `docker compose pull`, без
+    единого изменения в репозитории: набор прав Control API и имена полей
+    рантайма между выпусками MediaMTX менялись."""
+    image = COMPOSE["services"]["mediamtx"]["image"]
+    assert not image.endswith(":latest") and ":" in image, (
+        f"образ MediaMTX не зафиксирован: {image!r}"
+    )
 
 
 def test_worker_waits_for_mediamtx():
