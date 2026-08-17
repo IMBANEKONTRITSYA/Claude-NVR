@@ -211,17 +211,34 @@ async def lifespan(app: FastAPI):
     # не сервис: три расписания на объекте не стоят пятого systemd-юнита
     # (§26). Остановка через Event и ожидание задачи — иначе §13
     # «graceful shutdown» нарушался бы отменой посреди отправки письма.
+    #
+    # Фоновый цикл гасится флагом окружения только в тестах (его ставит
+    # backend/tests/conftest.py). Причина — не «мешает», а
+    # недетерминированность: цикл тикает по стенным часам каждые TICK_SEC и
+    # закрывает любое расписание с наступившим слотом (по умолчанию 8:00).
+    # Тест, заводящий включённое расписание при прогоне после 8 утра,
+    # получал бы гонку с этим тиком — слот закрывался бы у него под руками.
+    # Саму логику прохода тесты проверяют явными вызовами `run_due_now()`
+    # (test_integration_report_schedules.py), поэтому покрытие от снятия
+    # фонового цикла не страдает, а прогон становится детерминированным.
     from .services.report_scheduler import scheduler_loop
     reports_stop = asyncio.Event()
-    reports_task = asyncio.create_task(scheduler_loop(reports_stop))
+    scheduler_disabled = os.environ.get(
+        "FACEWATCH_DISABLE_REPORT_SCHEDULER", ""
+    ).strip().lower() in ("1", "true", "yes")
+    reports_task = (
+        None if scheduler_disabled
+        else asyncio.create_task(scheduler_loop(reports_stop))
+    )
     try:
         yield
     finally:
         reports_stop.set()
-        try:
-            await asyncio.wait_for(reports_task, timeout=20)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            reports_task.cancel()
+        if reports_task is not None:
+            try:
+                await asyncio.wait_for(reports_task, timeout=20)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                reports_task.cancel()
 
 
 app = FastAPI(title="FaceWatch API", lifespan=lifespan)

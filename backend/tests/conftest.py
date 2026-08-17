@@ -13,6 +13,13 @@ import os
 import pytest
 
 os.environ.setdefault("ALLOW_INSECURE_DEFAULT_SECRETS", "true")
+# Фоновый цикл планировщика отчётов тикает по стенным часам и закрывает
+# расписания с наступившим слотом (по умолчанию 8:00). В прогоне после
+# 8 утра это гонка с тестами, которые заводят включённое расписание и
+# проверяют его слот. Логика прохода покрыта явными `run_due_now()`
+# (test_integration_report_schedules.py), поэтому фоновый цикл в тестах
+# гасится — прогон становится детерминированным. См. main.py:lifespan.
+os.environ.setdefault("FACEWATCH_DISABLE_REPORT_SCHEDULER", "true")
 
 from app.config import settings  # noqa: E402  (после setdefault выше)
 
