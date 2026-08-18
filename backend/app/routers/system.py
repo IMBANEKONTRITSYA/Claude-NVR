@@ -191,6 +191,7 @@ async def record_layer_status(_=Depends(require_role("admin", "operator")),
             "gb_last_day": round(bytes_day / BYTES_PER_GB, 2),
             "streams": [], "summary": None, "segment_gaps": [],
             "analytics": None, "control_api_error": None,
+            "record_root_warning": None,
         }
 
     return {
@@ -207,6 +208,12 @@ async def record_layer_status(_=Depends(require_role("admin", "operator")),
         # «распознавание молчит» неотличимо от «в кадре никого нет».
         "analytics": payload.get("analytics"),
         "control_api_error": payload.get("control_api_error"),
+        # Корень, куда MediaMTX пишет сегменты, разведён с тем, который
+        # сканирует архив (SPEC §5 «путь архива конфигурируется»). Симптом
+        # такого расхождения — «пропуск записи» разом на всех камерах и
+        # диск, который никто не чистит; сам по себе он на причину не
+        # указывает, поэтому причина едет отдельным полем.
+        "record_root_warning": payload.get("record_root_warning"),
     }
 
 

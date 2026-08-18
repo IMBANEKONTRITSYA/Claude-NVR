@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from record_layer import (
+    DEFAULT_MEDIA_ROOT,
     MediaMTXClient,
     _duration_ns,
     MediaMTXError,
@@ -33,6 +34,10 @@ from record_layer import (
     parse_segment_name,
     path_conf,
     path_name,
+    record_media_root,
+    record_path_template,
+    record_root_divergence,
+    segments_dir,
     sync_paths,
 )
 
@@ -188,6 +193,100 @@ def test_record_path_yields_spec_segment_naming():
     rendered = template.replace("%path", path_name(3)).replace("%s", "1754460000") + ".mp4"
     assert os.path.basename(rendered) == "cam3_1754460000.mp4"
     assert parse_segment_name(os.path.basename(rendered)) == (3, 1754460000)
+
+
+# --------------------------------------------------------------------------
+# Корень медиаданных: SPEC §5 «путь архива конфигурируется под отдельный
+# диск», §26 раскладка `/var/lib/facewatch/`. До цикла 39 `recordPath` был
+# захардкожен `/media/segments/...` — вынос архива на другой диск давал
+# MediaMTX, пишущий по старому пути, и архив, сканирующий новый.
+
+
+def test_record_path_follows_configured_media_path(monkeypatch):
+    """Главная проверка цикла 39: сменили MEDIA_PATH — сменился и каталог,
+    куда MediaMTX кладёт сегменты. При захардкоженном пути этот тест падает
+    (`/media/segments/...` != `/var/lib/facewatch/media/segments/...`)."""
+    monkeypatch.setenv("MEDIA_PATH", "/var/lib/facewatch/media")
+    monkeypatch.delenv("MEDIAMTX_MEDIA_PATH", raising=False)
+    conf = path_conf("rtsp://cam/main")
+    assert conf["recordPath"] == "/var/lib/facewatch/media/segments/%path_%s"
+
+
+def test_record_path_and_indexer_scan_the_same_directory(monkeypatch):
+    """Смысл всей правки: каталог из `recordPath` обязан совпадать с тем,
+    который сканирует индексация архива и чистит retention. Расходятся они —
+    архив пуст, а диск не чистится ничем."""
+    monkeypatch.setenv("MEDIA_PATH", "/mnt/nvr-archive")
+    monkeypatch.delenv("MEDIAMTX_MEDIA_PATH", raising=False)
+    write_dir = os.path.dirname(path_conf("rtsp://cam/main")["recordPath"])
+    assert write_dir == segments_dir(os.environ["MEDIA_PATH"])
+
+
+def test_media_root_defaults_to_compose_mount(monkeypatch):
+    """Ничего не задано — прежнее поведение docker-compose (`/media`), то
+    есть правка не ломает режим 1 §26."""
+    monkeypatch.delenv("MEDIA_PATH", raising=False)
+    monkeypatch.delenv("MEDIAMTX_MEDIA_PATH", raising=False)
+    assert record_media_root() == DEFAULT_MEDIA_ROOT
+    assert path_conf("rtsp://cam/main")["recordPath"] == "/media/segments/%path_%s"
+
+
+def test_mediamtx_media_path_overrides_for_split_mounts(monkeypatch):
+    """Развёртывание, где MediaMTX видит тот же том по своему пути: воркер
+    сканирует MEDIA_PATH, а MediaMTX пишет по MEDIAMTX_MEDIA_PATH."""
+    monkeypatch.setenv("MEDIA_PATH", "/srv/facewatch/media")
+    monkeypatch.setenv("MEDIAMTX_MEDIA_PATH", "/recordings")
+    assert path_conf("rtsp://cam/main")["recordPath"] == "/recordings/segments/%path_%s"
+
+
+def test_trailing_slash_does_not_double_separator(monkeypatch):
+    """`MEDIA_PATH=/media/` — законное значение из .env, и оно не должно
+    давать `//segments`: MediaMTX подставляет путь в имя файла как есть."""
+    monkeypatch.setenv("MEDIA_PATH", "/media/")
+    monkeypatch.delenv("MEDIAMTX_MEDIA_PATH", raising=False)
+    assert record_path_template() == "/media/segments/%path_%s"
+
+
+def test_empty_media_path_falls_back_instead_of_writing_to_root(monkeypatch):
+    """Пустая переменная в .env (`MEDIA_PATH=`) не должна превращать
+    `recordPath` в `/segments/...` — запись в корень ФС."""
+    monkeypatch.setenv("MEDIA_PATH", "")
+    monkeypatch.delenv("MEDIAMTX_MEDIA_PATH", raising=False)
+    assert record_media_root() == DEFAULT_MEDIA_ROOT
+    assert record_path_template().startswith("/media/segments/")
+
+
+def test_segment_naming_survives_custom_media_path(monkeypatch):
+    """SPEC §20 требует имя `cam{id}_{unix_ts}.mp4` независимо от каталога:
+    его разбирают ротация (fileage.py) и индексация."""
+    monkeypatch.setenv("MEDIA_PATH", "/data/archive")
+    monkeypatch.delenv("MEDIAMTX_MEDIA_PATH", raising=False)
+    template = path_conf("rtsp://cam/main")["recordPath"]
+    rendered = template.replace("%path", path_name(7)).replace("%s", "1754460000") + ".mp4"
+    assert rendered == "/data/archive/segments/cam7_1754460000.mp4"
+    assert parse_segment_name(os.path.basename(rendered)) == (7, 1754460000)
+
+
+def test_no_divergence_reported_when_roots_agree():
+    """Штатное развёртывание — предупреждения нет. Позитивный контроль:
+    иначе баннер висел бы всегда и его перестали бы читать."""
+    assert record_root_divergence("/media", "/media") is None
+    assert record_root_divergence("/var/lib/facewatch/media",
+                                  "/var/lib/facewatch/media") is None
+
+
+def test_trailing_slash_is_not_a_divergence():
+    """`MEDIA_PATH=/media/` против `/media` — одно и то же место."""
+    assert record_root_divergence("/media/", "/media") is None
+
+
+def test_divergence_text_names_both_directories():
+    """Расхождение обязано называть оба каталога: иначе предупреждение
+    сообщает, что что-то не так, но не помогает это починить."""
+    msg = record_root_divergence("/media", "/recordings")
+    assert msg is not None
+    assert "/recordings/segments/%path_%s" in msg
+    assert "/media/segments" in msg
 
 
 def test_retention_left_to_worker_not_mediamtx():

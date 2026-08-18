@@ -50,7 +50,9 @@ from ort_threads import analytics_thread_budget, limit_threads as limit_ort_thre
 from motion_windows import (DEFAULT_GUARD_SEC, MotionWindowTracker,
                             SETTLE_SEC as MOTION_SETTLE_SEC,
                             segments_without_motion)
-from record_layer import (MediaMTXClient, path_conf, path_name, redact_url,
+from record_layer import (MediaMTXClient, path_conf, path_name,
+                          record_media_root, record_path_template,
+                          record_root_divergence, redact_url, segments_dir,
                           sync_paths)
 from record_status import (UNKNOWN, newly_lost, newly_restored, segment_gaps,
                            stream_states, summarize)
@@ -70,6 +72,10 @@ logger = configure_logging("facewatch.worker")
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 MEDIA_PATH = os.environ.get("MEDIA_PATH", "/media")
+# Корень медиаданных глазами MediaMTX (см. record_layer.record_media_root).
+# Совпадает с MEDIA_PATH везде, кроме развёртывания, где MediaMTX смонтировал
+# тот же том по другому пути и это заявлено через MEDIAMTX_MEDIA_PATH.
+RECORD_MEDIA_ROOT = record_media_root()
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 FERNET_KEY = os.environ.get("RTSP_ENCRYPTION_KEY", "ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ=")
 MEDIAMTX_HOST = os.environ.get("MEDIAMTX_HOST", "mediamtx")
@@ -165,6 +171,12 @@ _record_prev_status: dict[int, str] | None = None
 # Хранится, чтобы, во-первых, не повторять одно и то же предупреждение
 # каждые 10 секунд, во-вторых — показать причину в «Мониторинге».
 _record_api_error: str | None = None
+
+# Расхождение «куда пишет MediaMTX» и «где ищет архив» (None — совпадают).
+# Заполняется один раз на старте: обе величины приходят из окружения и в
+# течение жизни процесса не меняются.
+_record_root_warning: str | None = None
+
 
 def _pg_connect_args(url: str) -> dict:
     """TCP-настройки соединения с Postgres против бесконечной блокировки.
@@ -1784,7 +1796,8 @@ def record_layer_sync(cams) -> None:
     desired = {}
     for cam_id, rtsp_url in cams:
         desired[path_name(cam_id)] = path_conf(
-            rtsp_url, segment_duration_min=CONFIG["record_segment_min"]
+            rtsp_url, segment_duration_min=CONFIG["record_segment_min"],
+            media_root=RECORD_MEDIA_ROOT,
         )
     stats = sync_paths(MediaMTXClient(MEDIAMTX_API_URL), desired)
     if any(stats.values()):
@@ -1894,6 +1907,10 @@ def publish_record_layer_status(cam_names) -> dict:
                # интерфейс показывал бы «неизвестно» на всех камерах без
                # единого намёка, куда смотреть.
                "control_api_error": _record_api_error,
+               # Расхождение корней медиаданных (см. log_record_root): при
+               # нём архив может молча остаться пустым, и одних алертов
+               # «пропуск записи» мало — они не говорят, куда смотреть.
+               "record_root_warning": _record_root_warning,
                "analytics": {"model_ready": FACE_APP is not None,
                              "model": CONFIG["face_model"],
                              "error": MODEL_ERROR}}
@@ -1945,11 +1962,40 @@ def index_record_segments() -> None:
     """
     try:
         index_new_segments(
-            Session, VideoSegment, os.path.join(MEDIA_PATH, "segments"),
+            Session, VideoSegment, segments_dir(MEDIA_PATH),
             now=time.time(), from_timestamp=datetime.utcfromtimestamp,
         )
     except Exception:
         logger.error("не удалось занести сегменты записи в архив", exc_info=True)
+
+
+def log_record_root() -> str | None:
+    """Пишет в журнал, куда слой записи кладёт сегменты и где их ищет архив.
+
+    Смысл строки — в том, что до цикла 39 `recordPath` был захардкожен
+    `/media/segments/...` независимо от `MEDIA_PATH`. Стоило вынести архив
+    на отдельный диск (SPEC §5 «путь архива конфигурируется», §26 раскладка
+    `/var/lib/facewatch/`) — и MediaMTX продолжал писать в старый каталог, а
+    воркер сканировал новый. Симптом был отложенный и ни на что не
+    указывающий: через два интервала сегмента загорался алерт «пропуск
+    записи» СРАЗУ НА ВСЕХ камерах, retention при этом не удалял ничего
+    (файлов по своему пути он не видел), и диск заполнялся до отказа.
+
+    Возвращает текст расхождения либо None — он же уезжает в состояние слоя
+    записи, чтобы страница мониторинга могла его показать.
+    """
+    scan = segments_dir(MEDIA_PATH)
+    write = record_path_template(RECORD_MEDIA_ROOT)
+    logger.info("слой записи: каталоги сегментов",
+                extra={"mediamtx_record_path": write, "indexer_scan_dir": scan,
+                       "media_path": MEDIA_PATH,
+                       "mediamtx_media_root": RECORD_MEDIA_ROOT})
+    msg = record_root_divergence(MEDIA_PATH, RECORD_MEDIA_ROOT)
+    if msg:
+        logger.warning("слой записи: корни медиаданных разведены",
+                       extra={"mediamtx_record_path": write,
+                              "indexer_scan_dir": scan})
+    return msg
 
 
 def manager():
@@ -1957,9 +2003,11 @@ def manager():
     # именно `/health` этого API опрашивает healthcheck контейнера, и до
     # цикла 38 он отвечал «жив» независимо от того, крутится ли этот цикл
     # (uvicorn работает в своей нити). Зависший менеджер выглядел здоровым.
-    global HEARTBEAT
+    global HEARTBEAT, _record_root_warning
     HEARTBEAT = Heartbeat()
     HEARTBEAT.beat("startup")
+
+    _record_root_warning = log_record_root()
 
     # Настройки читаем ДО загрузки модели: профиль задаёт face_model и
     # detect_width, иначе выбор в админке не применялся бы до перезапуска.
