@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, getToken, segmentThumbUrl } from "../api";
 import {
   DEFAULT_RATE,
@@ -9,6 +9,22 @@ import {
   positionLabel,
   stepTime,
 } from "../framePlayer";
+import {
+  Position,
+  TimelineRange,
+  TimelineSegment,
+  clockLabel,
+  coverageBars,
+  dayWindow,
+  formatArchiveTime,
+  fractionToTime,
+  locateAt,
+  nextIndex,
+  parseArchiveTime,
+  positionToClock,
+  recordedLabel,
+  timeToFraction,
+} from "../archiveTimeline";
 
 /** Миниатюра кадра сегмента (ТЗ §7).
  *
@@ -35,23 +51,44 @@ function SegThumb({ id }: { id: number }) {
   );
 }
 
-/** Плеер архива с покадровым просмотром (ТЗ §5).
+/** Плеер архива: покадровый просмотр и непрерывный ход через файлы (ТЗ §5).
  *
  * Длительность кадра измеряется по самому потоку через
  * `requestVideoFrameCallback`: у камер §1 основной поток идёт 15–30 fps,
  * это настройка камеры, и в `video_segments` её нет. Константа вместо
  * замера означала бы, что на половине камер шаг перепрыгивает кадр или
  * топчется на месте.
+ *
+ * **Цепочка, а не файл.** Запись §5 непрерывная, а сегмент — пять минут;
+ * плеер, играющий один файл, останавливался на границе, и событие,
+ * растянутое на два сегмента, оператор досматривал вторым кликом. Здесь
+ * конец файла — не конец просмотра: `onAdvance` переводит плеер на
+ * следующее звено, и воспроизведение продолжается. Перерыв записи цепочку
+ * не рвёт (см. `nextIndex`) — он перескакивается, а видно его на шкале.
  */
-function SegmentPlayer({ src }: { src: string }) {
+function ChainPlayer({ segments, index, seekOffset, onAdvance, onClock }: {
+  segments: TimelineSegment[];
+  index: number;
+  /** Куда встать внутри текущего файла, с. Меняется при клике по шкале. */
+  seekOffset: number;
+  onAdvance: (next: number) => void;
+  onClock: (ms: number) => void;
+}) {
   const video = useRef<HTMLVideoElement | null>(null);
   const frameDur = useRef<number>(FALLBACK_FRAME_DURATION);
   const lastFrameTime = useRef<number | null>(null);
   // Точная граница начала показанного кадра. `currentTime` для этого не
   // годится: он отдаёт позицию воспроизведения где-то внутри кадра.
   const anchor = useRef<number | null>(null);
+  // Играл ли плеер до смены файла. Без этого переход через границу
+  // сегмента останавливал бы просмотр — то есть ровно то, что цепочка и
+  // должна была убрать.
+  const wasPlaying = useRef(false);
   const [rate, setRate] = useState<PlaybackRate>(DEFAULT_RATE);
   const [pos, setPos] = useState(0);
+
+  const seg = segments[index];
+  const src = seg ? `/api/archive/file/${seg.id}?token=${getToken()}` : "";
 
   // `mediaTime` показанного кадра — точная граница его начала, известная
   // от декодера. На ней стоит весь шаг: длительность кадра измеряется с
@@ -89,6 +126,50 @@ function SegmentPlayer({ src }: { src: string }) {
     setPos(0);
   }, [src]);
 
+  // Встать в запрошенную секунду нового файла и, если до перехода играли,
+  // продолжить играть.
+  //
+  // Перемотка делается по `loadedmetadata`, а не сразу после смены `src`:
+  // до загрузки метаданных `duration` неизвестна, и присвоение
+  // `currentTime` браузер молча отбрасывает — клик по шкале попадал бы в
+  // начало файла вместо запрошенной минуты. `readyState` проверяется
+  // отдельно на случай, когда метаданные уже загружены и события не будет
+  // (повторный клик по тому же сегменту).
+  useEffect(() => {
+    const el = video.current;
+    if (!el) return;
+    const apply = () => {
+      if (seekOffset > 0 && Number.isFinite(el.duration)) {
+        el.currentTime = Math.min(seekOffset, el.duration);
+      }
+      el.playbackRate = rate;
+      if (wasPlaying.current) void el.play().catch(() => { /* автозапуск может быть запрещён */ });
+    };
+    if (el.readyState >= 1) apply();
+    el.addEventListener("loadedmetadata", apply);
+    return () => el.removeEventListener("loadedmetadata", apply);
+    // rate намеренно не в зависимостях: его меняет свой обработчик, и
+    // перезапуск этого эффекта на смене скорости дёргал бы перемотку.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [src, seekOffset]);
+
+  // Настенное время текущей позиции — наверх: по нему подписывается
+  // шкала и берутся границы экспортируемого фрагмента.
+  useEffect(() => {
+    onClock(positionToClock(segments, index, pos));
+  }, [segments, index, pos, onClock]);
+
+  // Конец файла — не конец просмотра.
+  const handleEnded = () => {
+    const next = nextIndex(segments, index);
+    if (next === null) {
+      wasPlaying.current = false;
+      return;
+    }
+    wasPlaying.current = true;
+    onAdvance(next);
+  };
+
   const step = useCallback((dir: 1 | -1) => {
     const el = video.current;
     if (!el) return;
@@ -124,6 +205,9 @@ function SegmentPlayer({ src }: { src: string }) {
         controls
         style={{ width: "100%", background: "#000" }}
         src={src}
+        onPlay={() => { wasPlaying.current = true; }}
+        onPause={() => { wasPlaying.current = false; }}
+        onEnded={handleEnded}
         onTimeUpdate={e => setPos((e.target as HTMLVideoElement).currentTime)}
         onSeeked={e => setPos((e.target as HTMLVideoElement).currentTime)}
       />
@@ -140,6 +224,58 @@ function SegmentPlayer({ src }: { src: string }) {
   );
 }
 
+/** Полоса шкалы суток: где есть запись, где перерыв, где стоит плеер (ТЗ §5).
+ *
+ * Отсутствие записи здесь — не пустое место «по умолчанию», а показанное
+ * состояние: подложка полосы окрашена как перерыв, а покрытие рисуется
+ * поверх. Иначе «нет данных» и «нет записи» выглядели бы одинаково, а это
+ * разные вещи: первое означает, что шкала не загрузилась.
+ */
+function TimelineStrip({ ranges, fromMs, toMs, playheadMs, onSeek }: {
+  ranges: TimelineRange[];
+  fromMs: number;
+  toMs: number;
+  playheadMs: number;
+  onSeek: (ms: number) => void;
+}) {
+  const bars = useMemo(() => coverageBars(ranges, fromMs, toMs), [ranges, fromMs, toMs]);
+  // Каждые два часа: 12 подписей на сутки читаются, 24 сливаются.
+  const ticks = useMemo(
+    () => Array.from({ length: 13 }, (_, i) => ({ pct: (i / 12) * 100, label: `${i * 2}:00` })),
+    [],
+  );
+  const headPct = Number.isFinite(playheadMs)
+    ? timeToFraction(playheadMs, fromMs, toMs) * 100 : null;
+
+  const seek = (e: React.MouseEvent<HTMLDivElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    onSeek(fractionToTime((e.clientX - rect.left) / rect.width, fromMs, toMs));
+  };
+
+  return (
+    <div className="timeline">
+      <div className="timeline-strip" onClick={seek} title="Клик — перейти к этому времени">
+        {bars.map((b, i) => (
+          <div key={i} className="timeline-bar"
+               style={{ left: `${b.leftPct}%`, width: `${b.widthPct}%` }} />
+        ))}
+        {ticks.slice(1, -1).map(t => (
+          <div key={t.pct} className="timeline-tick" style={{ left: `${t.pct}%` }} />
+        ))}
+        {headPct !== null && (
+          <div className="timeline-head" style={{ left: `${headPct}%` }} />
+        )}
+      </div>
+      <div className="timeline-labels">
+        {ticks.map(t => (
+          <span key={t.pct} style={{ left: `${t.pct}%` }}>{t.label}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function Archive() {
   const [cams, setCams] = useState<any[]>([]);
   const [segs, setSegs] = useState<any[]>([]);
@@ -148,8 +284,47 @@ export function Archive() {
   // Границы экспортируемого фрагмента (ТЗ §5). Держатся отдельно от
   // фильтров поиска: оператор ищет по часам, а выгружает минуты.
   const [exp, setExp] = useState({ from: "", to: "" });
+  // Сутки шкалы. В шкале архива, а не в поясе браузера: `video_segments`
+  // хранит UTC, и «сегодня» здесь — те же сутки, что и в записях.
+  const [day, setDay] = useState(() => new Date().toISOString().slice(0, 10));
+  const [tl, setTl] = useState<{
+    ranges: TimelineRange[]; segments: TimelineSegment[];
+    recorded_sec: number; truncated: boolean;
+  } | null>(null);
+  const [tlError, setTlError] = useState("");
+  // Позиция в цепочке: какой файл играет и с какой секунды в него встали.
+  const [pos, setPos] = useState<Position | null>(null);
+  const [clockMs, setClockMs] = useState(NaN);
+
+  const { fromMs, toMs } = useMemo(() => dayWindow(day), [day]);
 
   useEffect(() => { api.cameras().then(setCams); search(); }, []);
+
+  // Шкала перезагружается при смене камеры или суток. Без камеры её нет:
+  // покрытие — это свойство одной камеры, а не объекта целиком.
+  useEffect(() => {
+    setTl(null);
+    setPos(null);
+    setClockMs(NaN);
+    setTlError("");
+    const camId = Number(f.camera_id);
+    if (!camId) return;
+    let cancelled = false;
+    api.archiveTimeline(camId, formatArchiveTime(fromMs), formatArchiveTime(toMs))
+      .then((r: any) => { if (!cancelled) setTl(r); })
+      .catch((e: any) => { if (!cancelled) setTlError(String(e?.message ?? e)); });
+    return () => { cancelled = true; };
+  }, [f.camera_id, fromMs, toMs]);
+
+  /** Клик по шкале или по строке таблицы — встать на это настенное время. */
+  const seekTo = useCallback((ms: number) => {
+    if (!tl) return;
+    const p = locateAt(tl.segments, ms);
+    // null — за последней записью суток: позиция не меняется, плеер не
+    // гасится. Гасить его на промахе значило бы терять кадр, который
+    // оператор уже нашёл.
+    if (p) setPos(p);
+  }, [tl]);
 
   // Выбор сегмента подставляет его границы как начальное окно экспорта —
   // дальше оператор сужает их до нужного события.
@@ -161,7 +336,21 @@ export function Archive() {
   useEffect(() => {
     if (!sel) return;
     setExp({ from: String(sel.started_at).slice(0, 19), to: String(sel.ended_at ?? "").slice(0, 19) });
+    // Выбранная строка — это ещё и «покажи мне вот это место шкалы»:
+    // камера и сутки подтягиваются под неё, а сама позиция ставится
+    // эффектом ниже, когда шкала этих суток загрузится.
+    setDay(String(sel.started_at).slice(0, 10));
+    setF(prev => (String(prev.camera_id) === String(sel.camera_id)
+      ? prev : { ...prev, camera_id: String(sel.camera_id) }));
   }, [sel]);
+
+  // Позиция ставится не в обработчике клика, а здесь: между кликом и
+  // ответом шкалы цепочки ещё нет, и вставать было бы не во что.
+  useEffect(() => {
+    if (!sel || !tl) return;
+    const p = locateAt(tl.segments, parseArchiveTime(String(sel.started_at)));
+    if (p) setPos(p);
+  }, [sel, tl]);
 
   const search = async () => {
     const params: Record<string, string> = {};
@@ -170,6 +359,10 @@ export function Archive() {
   };
 
   const url = (id: number) => `/api/archive/file/${id}`;
+
+  // Камера, из архива которой собирается фрагмент: выбранная в фильтре
+  // (со шкалой это основной путь) либо камера выбранной строки.
+  const exportCamId = Number(f.camera_id) || Number(sel?.camera_id) || 0;
 
   const exportUrl = (cameraId: number, from: string, to: string) => {
     const q = new URLSearchParams({
@@ -236,52 +429,138 @@ export function Archive() {
           </table>
         </div>
         <div className="card">
-          {sel ? (
+          {/* Шкала суток (ТЗ §5). Раньше плеер играл ровно один файл: до
+              «что было в 03:40» оператор добирался перебором строк, а
+              перерыв в записи по таблице не читался вовсе — отсутствие
+              строки в списке не видно. */}
+          <div style={{ marginBottom: 12 }}>
+            <div className="seg-player-bar" style={{ marginBottom: 6 }}>
+              <label style={{ margin: 0 }}>Сутки</label>
+              <input type="date" value={day} onChange={e => setDay(e.target.value)}
+                     style={{ width: 160 }} />
+              <span className="empty" style={{ fontSize: 12 }}>
+                {clockLabel(clockMs)}
+              </span>
+              {tl && (
+                <span className="empty" style={{ fontSize: 12 }}>
+                  записано: {recordedLabel(tl.recorded_sec)}
+                </span>
+              )}
+            </div>
+            {!f.camera_id && (
+              <div className="empty">Выберите камеру — шкала строится по одной камере</div>
+            )}
+            {tlError && <div className="empty">Шкала недоступна: {tlError}</div>}
+            {f.camera_id && tl && (
+              <>
+                <TimelineStrip ranges={tl.ranges} fromMs={fromMs} toMs={toMs}
+                               playheadMs={clockMs} onSeek={seekTo} />
+                {tl.truncated && (
+                  <div className="empty" style={{ fontSize: 12 }}>
+                    Сегментов за сутки больше, чем помещается в шкалу, — показано начало окна.
+                  </div>
+                )}
+                {tl.segments.length === 0 && (
+                  <div className="empty" style={{ fontSize: 12 }}>За эти сутки записи нет</div>
+                )}
+              </>
+            )}
+          </div>
+
+          {pos && tl ? (
+            <>
+              <h3>
+                Камера #{f.camera_id} · сегмент #{tl.segments[pos.index]?.id}
+                {" "}<span className="empty" style={{ fontSize: 12, fontWeight: "normal" }}>
+                  ({pos.index + 1} из {tl.segments.length}, воспроизведение идёт через границы файлов)
+                </span>
+              </h3>
+              <ChainPlayer
+                segments={tl.segments}
+                index={pos.index}
+                seekOffset={pos.offsetSec}
+                onAdvance={next => setPos({ index: next, offsetSec: 0 })}
+                onClock={setClockMs}
+              />
+              <a className="btn" href={`${url(tl.segments[pos.index].id)}?token=${getToken()}`}
+                 download style={{ marginTop: 8, display: "inline-block" }}>
+                Скачать MP4
+              </a>
+            </>
+          ) : sel ? (
             <>
               <h3>Сегмент #{sel.id}</h3>
-              <SegmentPlayer src={`${url(sel.id)}?token=${getToken()}`} />
+              <ChainPlayer
+                segments={[{ id: sel.id, started_at: sel.started_at,
+                             ended_at: sel.ended_at, duration_sec: sel.duration_sec }]}
+                index={0}
+                seekOffset={0}
+                onAdvance={() => { /* цепочки нет — играется один файл */ }}
+                onClock={setClockMs}
+              />
               <a className="btn" href={`${url(sel.id)}?token=${getToken()}`} download style={{ marginTop: 8, display: "inline-block" }}>
                 Скачать MP4
               </a>
+            </>
+          ) : null}
 
-              {/* ТЗ §5 «экспорт фрагментов»: до этого архив умел отдавать
-                  только сегмент целиком, и событие на границе двух
-                  сегментов оператор склеивал вручную. Фрагмент собирается
-                  remux'ом поверх скольких угодно сегментов камеры. */}
-              <div style={{ marginTop: 16, borderTop: "1px solid #333", paddingTop: 12 }}>
-                <h4 style={{ margin: "0 0 8px" }}>Экспорт фрагмента</h4>
-                <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                  <div>
-                    <label>С</label>
-                    <input type="datetime-local" step="1" value={exp.from}
-                           onChange={e => setExp({ ...exp, from: e.target.value })} />
-                  </div>
-                  <div>
-                    <label>По</label>
-                    <input type="datetime-local" step="1" value={exp.to}
-                           onChange={e => setExp({ ...exp, to: e.target.value })} />
-                  </div>
+          {/* ТЗ §5 «экспорт фрагментов»: до этого архив умел отдавать
+              только сегмент целиком, и событие на границе двух сегментов
+              оператор склеивал вручную. Фрагмент собирается remux'ом
+              поверх скольких угодно сегментов камеры.
+
+              Блок держится на камере, а не на выбранной строке: со шкалой
+              оператор доходит до нужной минуты, ни разу не тронув таблицу,
+              и требовать от него выбрать строку ради экспорта значило бы
+              вернуть перебор, который шкала и убрала. */}
+          {exportCamId > 0 && (
+            <div style={{ marginTop: 16, borderTop: "1px solid #333", paddingTop: 12 }}>
+              <h4 style={{ margin: "0 0 8px" }}>Экспорт фрагмента</h4>
+              <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                <div>
+                  <label>С</label>
+                  <input type="datetime-local" step="1" value={exp.from}
+                         onChange={e => setExp({ ...exp, from: e.target.value })} />
                 </div>
-                <a className="btn"
-                   href={exportUrl(sel.camera_id, exp.from, exp.to)}
-                   download
-                   style={{
-                     marginTop: 8, display: "inline-block",
-                     // Пустые границы дали бы 422 от сервера; ссылка
-                     // гасится до запроса.
-                     pointerEvents: exp.from && exp.to ? undefined : "none",
-                     opacity: exp.from && exp.to ? 1 : 0.5,
-                   }}>
-                  Скачать фрагмент
-                </a>
-                <div className="empty" style={{ marginTop: 6, fontSize: 12 }}>
-                  Фрагмент склеивается из сегментов камеры без перекодирования,
-                  поэтому начало сдвигается к ближайшему опорному кадру —
-                  на 1–2 секунды раньше указанного.
+                <div>
+                  <label>По</label>
+                  <input type="datetime-local" step="1" value={exp.to}
+                         onChange={e => setExp({ ...exp, to: e.target.value })} />
                 </div>
               </div>
-            </>
-          ) : <div className="empty">Выберите сегмент</div>}
+              {/* Границы с точки просмотра: оператор нашёл момент глазами,
+                  и переписывать его руками в поле — лишний шаг, на котором
+                  и ошибаются. */}
+              <div className="seg-player-bar" style={{ marginTop: 6 }}>
+                <button className="btn sm" disabled={!Number.isFinite(clockMs)}
+                        onClick={() => setExp(p => ({ ...p, from: formatArchiveTime(clockMs) }))}>
+                  Начало отсюда
+                </button>
+                <button className="btn sm" disabled={!Number.isFinite(clockMs)}
+                        onClick={() => setExp(p => ({ ...p, to: formatArchiveTime(clockMs) }))}>
+                  Конец здесь
+                </button>
+              </div>
+              <a className="btn"
+                 href={exportUrl(exportCamId, exp.from, exp.to)}
+                 download
+                 style={{
+                   marginTop: 8, display: "inline-block",
+                   // Пустые границы дали бы 422 от сервера; ссылка
+                   // гасится до запроса.
+                   pointerEvents: exp.from && exp.to ? undefined : "none",
+                   opacity: exp.from && exp.to ? 1 : 0.5,
+                 }}>
+                Скачать фрагмент
+              </a>
+              <div className="empty" style={{ marginTop: 6, fontSize: 12 }}>
+                Фрагмент склеивается из сегментов камеры без перекодирования,
+                поэтому начало сдвигается к ближайшему опорному кадру —
+                на 1–2 секунды раньше указанного.
+              </div>
+            </div>
+          )}
+          {!sel && !pos && <div className="empty">Выберите камеру и сутки или сегмент в списке</div>}
         </div>
       </div>
     </div>

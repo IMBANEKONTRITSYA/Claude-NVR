@@ -10,7 +10,8 @@ from ..db import get_db
 from ..models import VideoSegment
 from ..auth import require_role, require_role_query
 from ..params import limit_param
-from ..schemas import SegmentOut
+from ..schemas import SegmentOut, TimelineOut
+from ..services import archive_timeline as timeline_svc
 from ..services import export as export_svc
 from ..services import thumbs as thumbs_svc
 from ..services.archive_query import segments_query
@@ -37,6 +38,66 @@ async def list_segments(
     )
     r = await db.execute(q)
     return r.scalars().all()
+
+
+@router.get("/timeline", response_model=TimelineOut)
+async def timeline(
+    camera_id: int = Query(..., ge=1),
+    date_from: datetime = Query(...),
+    date_to: datetime = Query(...),
+    _=Depends(require_role("admin", "operator")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Шкала архива одной камеры за окно времени (ТЗ §5).
+
+    Отвечает на вопрос, которого до сих пор нельзя было задать системе:
+    **в какие минуты у камеры есть запись**. Таблица сегментов на него не
+    отвечает — она показывает то, что есть, а дыра это то, чего нет, и в
+    списке строк она не видна.
+
+    Отдаёт три вещи разом, одним запросом: склеенные диапазоны покрытия
+    (для отрисовки шкалы), упорядоченную цепочку сегментов (по ней плеер
+    идёт через границы файлов без остановки) и «сколько записано за окно».
+
+    Границы окна наивные и трактуются как UTC — так же, как их хранит
+    `video_segments` и как их принимает экспорт фрагмента: приведение к
+    поясу браузера где-нибудь по дороге сдвинуло бы шкалу относительно
+    самих записей.
+    """
+    date_from = export_svc.as_naive_utc(date_from)
+    date_to = export_svc.as_naive_utc(date_to)
+    window_sec = (date_to - date_from).total_seconds()
+    if window_sec <= 0:
+        raise HTTPException(422, "Конец периода должен быть позже начала")
+    if window_sec > timeline_svc.MAX_TIMELINE_HOURS * 3600:
+        raise HTTPException(
+            422,
+            f"Окно шкалы не может быть длиннее {timeline_svc.MAX_TIMELINE_HOURS} часов",
+        )
+
+    # +1 к потолку — чтобы отличить «ровно потолок» от «упёрлись»: без
+    # этого выдача из ровно MAX строк неотличима от обрезанной.
+    q = timeline_svc.timeline_query(
+        camera_id, date_from, date_to,
+        limit=timeline_svc.MAX_TIMELINE_SEGMENTS + 1,
+    )
+    segments = (await db.execute(q)).scalars().all()
+    truncated = len(segments) > timeline_svc.MAX_TIMELINE_SEGMENTS
+    if truncated:
+        segments = segments[: timeline_svc.MAX_TIMELINE_SEGMENTS]
+
+    ranges = timeline_svc.clamp_ranges(
+        timeline_svc.merge_coverage(segments), date_from, date_to,
+    )
+    return TimelineOut(
+        camera_id=camera_id,
+        date_from=date_from,
+        date_to=date_to,
+        ranges=[{"start": r.start, "end": r.end} for r in ranges],
+        segments=segments,
+        recorded_sec=timeline_svc.recorded_seconds(ranges),
+        truncated=truncated,
+    )
 
 
 @router.get("/file/{seg_id}")

@@ -202,6 +202,13 @@ export const api = {
     const q = new URLSearchParams(params).toString();
     return req(`/api/archive/segments?${q}`);
   },
+  /** Шкала архива камеры за окно (SPEC §5): покрытие, дыры, цепочка файлов. */
+  archiveTimeline: (cameraId: number, dateFrom: string, dateTo: string) => {
+    const q = new URLSearchParams({
+      camera_id: String(cameraId), date_from: dateFrom, date_to: dateTo,
+    }).toString();
+    return req(`/api/archive/timeline?${q}`);
+  },
   kpi: () => req("/api/stats/kpi"),
   byDay: () => req("/api/stats/by-day"),
   byHour: () => req("/api/stats/by-hour"),
