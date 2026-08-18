@@ -279,6 +279,25 @@ jobs:
           MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
             python perf/bench_remux.py --pull --quick 1 4 8 | tee perf-remux.txt
 
+      - name: Measure stream recovery after a break (SPEC §19)
+        # §19 «Запись: восстановление потока ≤ 5 секунд после обрыва» —
+        # норматив, который до цикла 40 не измерялся ни разу. RTO циклов
+        # 38-39 мерил восстановление СЕРВИСА (падение процесса, зависание),
+        # а это другой отказ: при обрыве потока запись не падает, она
+        # перестаёт писать одну камеру, и вопрос в том, сколько архива
+        # теряется сверх самого обрыва.
+        #
+        # Меряется добавка системы: от момента, когда камера снова отдаёт
+        # поток, до момента, когда файл этой камеры снова растёт. Обрыв
+        # берётся разной длительности, потому что §2/§13 обещают
+        # «экспоненциальную задержку»: если бы она росла, короткий обрыв
+        # укладывался бы в норматив, а длинный — нет.
+        #
+        # Бинарник MediaMTX уже скачан шагом замера remux выше.
+        run: |
+          MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
+            python perf/bench_recovery.py | tee perf-recovery.txt
+
       - name: Run analytics chain benchmark
         # Отдельным шагом, потому что тянет модель `buffalo_s` (~125 МБ) из
         # сети: отказ скачивания помечается в результате как `skipped` и не
@@ -300,6 +319,7 @@ jobs:
             perf-chain.json
             perf-rto-hang.txt
             perf-remux.txt
+            perf-recovery.txt
 
   frontend:
     runs-on: ubuntu-latest
