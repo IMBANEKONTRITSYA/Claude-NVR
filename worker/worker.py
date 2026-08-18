@@ -45,6 +45,7 @@ from backoff import reconnect_delay
 from detection_schedule import schedule_active
 from face_select import pick_matching_face
 from fileage import prune_media
+from liveness import Heartbeat, start_watchdog
 from ort_threads import analytics_thread_budget, limit_threads as limit_ort_threads
 from motion_windows import (DEFAULT_GUARD_SEC, MotionWindowTracker,
                             SETTLE_SEC as MOTION_SETTLE_SEC,
@@ -165,11 +166,49 @@ _record_prev_status: dict[int, str] | None = None
 # каждые 10 секунд, во-вторых — показать причину в «Мониторинге».
 _record_api_error: str | None = None
 
+def _pg_connect_args(url: str) -> dict:
+    """TCP-настройки соединения с Postgres против бесконечной блокировки.
+
+    Класс отказа, который они закрывают: сессия к Postgres умерла молча —
+    NAT/файрвол выбросил запись о соединении, сервер уехал в перезагрузку, —
+    сокет остался формально открытым, и `recv()` ждёт **без срока**.
+    Менеджер воркера при этом висит в первом же `Session()` и не делает
+    больше ничего: ни синхронизации слоя записи, ни индексации сегментов,
+    ни retention (см. `liveness.py`).
+
+    `pool_pre_ping` от этого не спасает: его `SELECT 1` уходит в тот же
+    мёртвый сокет и блокируется вместе с остальным. Спасает keepalive —
+    ядро само рвёт соединение примерно за
+    `keepalives_idle + keepalives_interval × keepalives_count` (здесь ~60 с),
+    после чего SQLAlchemy получает нормальную ошибку, `pool_pre_ping`
+    выбрасывает соединение из пула и следующий запрос идёт по новому.
+
+    `statement_timeout` сознательно **не** задаётся: у воркера есть законно
+    долгие запросы (уборка архива по retention удаляет десятки тысяч
+    строк), и глобальный срок молча ронял бы их на объекте с большим
+    архивом. Долгий запрос — это работа, а не зависание; зависание ловит
+    сторож живости, у которого на каждый этап свой бюджет.
+
+    Только для Postgres: тесты слоя записи поднимают SQLite-файл, который
+    таких параметров не знает.
+    """
+    if not url.startswith(("postgresql", "postgres:")):
+        return {}
+    return {
+        "connect_timeout": 10,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 3,
+    }
+
+
 # pool_size подобран под целевую нагрузку ТЗ: каждая из до 16 камер держит
 # свой поток с короткоживущими сессиями (load_cam_state, запись событий),
 # плюс сегментный транскод/рекластеризация в отдельных потоках — дефолтный
 # pool_size=5 у SQLAlchemy становится узким местом раньше, чем CPU/сеть.
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=20, max_overflow=10)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=20, max_overflow=10,
+                       connect_args=_pg_connect_args(DATABASE_URL))
 Session = sessionmaker(bind=engine)
 Base = declarative_base()
 def _normalize_fernet_key(raw: str) -> bytes:
@@ -415,6 +454,11 @@ ACCELERATOR = "CPU"
 # Глобальная ссылка на модель: нити камер читают её каждый кадр, поэтому
 # смена модели в профиле применяется без перезапуска контейнера.
 FACE_APP = None
+
+# Отметки живости менеджера (см. liveness.py). Заводятся в manager(); None
+# означает «менеджер ещё не стартовал» — в этом состоянии `/health` не
+# может судить о зависании и не судит.
+HEARTBEAT = None
 
 
 # Модули insightface, которые системе действительно нужны.
@@ -1909,6 +1953,14 @@ def index_record_segments() -> None:
 
 
 def manager():
+    # Отметки живости заводятся ПЕРВЫМИ и передаются в embed-API ниже:
+    # именно `/health` этого API опрашивает healthcheck контейнера, и до
+    # цикла 38 он отвечал «жив» независимо от того, крутится ли этот цикл
+    # (uvicorn работает в своей нити). Зависший менеджер выглядел здоровым.
+    global HEARTBEAT
+    HEARTBEAT = Heartbeat()
+    HEARTBEAT.beat("startup")
+
     # Настройки читаем ДО загрузки модели: профиль задаёт face_model и
     # detect_width, иначе выбор в админке не применялся бы до перезапуска.
     refresh_config()
@@ -1925,10 +1977,15 @@ def manager():
     # позже (см. цикл дозагрузки ниже), и API обязан это подхватить.
     try:
         from embed_api import start_embed_api
-        start_embed_api(lambda: FACE_APP, port=9000)
+        start_embed_api(lambda: FACE_APP, port=9000, heartbeat=HEARTBEAT)
         logger.info("embed-API запущен", extra={"port": 9000})
     except Exception:
         logger.error("не удалось запустить embed-API", exc_info=True)
+
+    # Сторож — после embed-API и ДО загрузки модели: скачивание модели при
+    # первом запуске идёт минуты, и это как раз тот этап, зависание на
+    # котором раньше было неотличимо от работы.
+    watchdog = start_watchdog(HEARTBEAT)
 
     # Отказ загрузки модели НЕ должен ронять процесс (SPEC §2: «Отказ
     # аналитики НЕ влияет на запись»).
@@ -1940,6 +1997,7 @@ def manager():
     # а production-сервер видеонаблюдения обычно изолирован. Контейнер
     # уходил в бесконечный CrashLoop, и запись не велась вообще.
     loaded_model = None
+    HEARTBEAT.beat("model_load")
     _try_load_model()
     if FACE_APP is not None:
         loaded_model = (CONFIG["face_model"], CONFIG["detect_width"], analytics_threads())
@@ -1954,6 +2012,7 @@ def manager():
 
     while not shutdown_event.is_set():
         try:
+            HEARTBEAT.beat("camera_scan")
             refresh_config()
             # Бюджет потоков ORT — часть параметров модели: он применяется
             # к сессиям при создании, и смена настройки без перезагрузки
@@ -1963,9 +2022,11 @@ def manager():
             # Смена модели/разрешения в профиле применяется без перезапуска
             if FACE_APP is not None and want_model != loaded_model:
                 logger.info("параметры модели изменились, перезагружаю")
+                HEARTBEAT.beat("model_load")
                 if _try_load_model():
                     loaded_model = want_model
             elif FACE_APP is None and time.time() - last_model_retry > MODEL_RETRY_SEC:
+                HEARTBEAT.beat("model_load")
                 # Повторная попытка после отказа: модель могла появиться без
                 # перезапуска контейнера (администратор положил файлы в том,
                 # починился доступ в интернет). Раз в 5 минут, а не каждый
@@ -2029,15 +2090,18 @@ def manager():
             # Слой записи (SPEC §20) — вне сессии БД: sync_paths() ходит по
             # сети в MediaMTX, и держать на это время открытое соединение с
             # Postgres незачем (правило из цикла 20).
+            HEARTBEAT.beat("record_layer_sync")
             try:
                 record_layer_sync(record_cams)
             except Exception:
                 logger.error("не удалось синхронизировать слой записи", exc_info=True)
+            HEARTBEAT.beat("index_segments")
             index_record_segments()
 
             # Статус потоков записи — после индексации: проверка пропуска
             # сегмента смотрит на последнюю занесённую строку, и порядок
             # наоборот давал бы ложный пропуск ровно на один проход.
+            HEARTBEAT.beat("record_status")
             try:
                 publish_record_layer_status(record_cam_names)
             except Exception:
@@ -2046,6 +2110,7 @@ def manager():
             now = time.time()
             if now - last_cleanup > 3600:
                 last_cleanup = now
+                HEARTBEAT.beat("cleanup")
                 try:
                     cleanup_old()
                 except Exception:
@@ -2059,6 +2124,7 @@ def manager():
             # возвращающий ноль камер.
             if now - last_motion_prune > 300:
                 last_motion_prune = now
+                HEARTBEAT.beat("motion_prune")
                 try:
                     prune_motionless_segments()
                 except Exception:
@@ -2075,10 +2141,12 @@ def manager():
             # настраиваются раздельно и могут стоять в любом порядке.
             # Связать их (например, «сносить только при critical») значило
             # бы, что понижение порога алерта молча отключает перезапись.
+            HEARTBEAT.beat("disk_alerts")
             try:
                 check_disk_alerts()
             except Exception:
                 logger.error("ошибка проверки заполнения диска", exc_info=True)
+            HEARTBEAT.beat("disk_quota")
             try:
                 enforce_disk_quota()
             except Exception:
@@ -2093,8 +2161,10 @@ def manager():
         except Exception:
             logger.error("ошибка цикла воркера", exc_info=True)
         # Прерываемое ожидание: shutdown не должен ждать до 10с впустую.
+        HEARTBEAT.beat("idle")
         shutdown_event.wait(10)
 
+    HEARTBEAT.beat("shutdown")
     logger.info("завершение: жду остановки нитей камер...")
     # Бюджет ожидания общий на все камеры (не по 8с на каждую), иначе
     # остановка 16 камер могла бы растянуться на пару минут и упереться
@@ -2111,6 +2181,12 @@ def manager():
     # ничего не перекодирует, терять на остановке нечего (до цикла 24 здесь
     # терялся последний сегмент каждой камеры, см. REVIEW_LOG.md цикл 23).
     index_record_segments()
+    # Сторож работает до последнего действия менеджера (в том числе сторожит
+    # само завершение — зависший shutdown ничем не лучше зависшего цикла), и
+    # снимается только здесь, чтобы не сработать на процессе, которому
+    # осталось выйти.
+    if watchdog is not None:
+        watchdog.stop()
     logger.info("воркер остановлен")
 
 

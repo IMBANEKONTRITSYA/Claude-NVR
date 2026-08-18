@@ -192,6 +192,18 @@ jobs:
         run: pip install opencv-python-headless numpy onnxruntime onnx insightface scikit-image
       - name: Run benchmarks
         run: python perf/bench.py --json | tee perf-results.json
+      - name: Measure hang detection (SPEC §13, §19 RTO)
+        # Слагаемое RTO для класса отказа «сервис жив и не отвечает».
+        # Postgres и Redis не нужны — замер поднимает настоящего сторожа
+        # живости над настоящим заблокированным циклом событий и берёт
+        # время до выхода процесса, поэтому идёт в этой джобе.
+        #
+        # Смысл его в CI — не порог, а отслеживание: до цикла 38 механизма
+        # не было вовсе, а замер отчитывался числом из healthcheck, которое
+        # ни к чему не приводило (Docker по красному healthcheck контейнер
+        # не перезапускает). Число сравнивается циклом с прошлым.
+        run: python perf/bench_rto.py --hang-only | tee perf-rto-hang.txt
+
       - name: Run analytics chain benchmark
         # Отдельным шагом, потому что тянет модель `buffalo_s` (~125 МБ) из
         # сети: отказ скачивания помечается в результате как `skipped` и не
@@ -204,6 +216,7 @@ jobs:
           path: |
             perf-results.json
             perf-chain.json
+            perf-rto-hang.txt
 
   frontend:
     runs-on: ubuntu-latest
