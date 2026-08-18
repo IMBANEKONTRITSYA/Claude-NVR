@@ -42,6 +42,7 @@ from sqlalchemy import (Column, Integer, BigInteger, String, DateTime, Boolean,
 from pgvector.sqlalchemy import Vector
 
 from backoff import reconnect_delay
+import cpu_affinity
 from detection_schedule import schedule_active
 from face_select import pick_matching_face
 from fileage import prune_media
@@ -938,7 +939,7 @@ def onvif_poll_worker(cam_id: int, host: str, port: int, username: str | None, p
 
 
 def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None = None,
-                   onvif_config: dict | None = None):
+                   onvif_config: dict | None = None, cpus: list[int] | None = None):
     """Аналитика по одной камере (SPEC §6).
 
     Основной поток эта функция больше не трогает вообще: его тянет и пишет
@@ -947,7 +948,21 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
     занимается исключительно детекцией и распознаванием. Так выполняется
     §2: «Отказ аналитики НЕ влияет на запись» — падение или перезапуск этой
     нити ничего не делает с архивом.
+
+    `cpus` — ядра NUMA-ноды, отведённой этому каналу (SPEC §17). None или
+    пустой список означает «не привязывать»: односокетная машина или
+    привязка выключена оператором.
     """
+    # Привязка — ПЕРВЫМ действием нити, до открытия захвата и до первого
+    # кадра. Порядок здесь не косметический: политика памяти Linux —
+    # first-touch, страница достаётся ноде того потока, который к ней
+    # обратился первым. Привязка после первых кадров закрепила бы за
+    # каналом ядра одной ноды и буферы другой — то есть ровно тот случай,
+    # который §17 просит устранить, только теперь уже намертво.
+    if cpus:
+        pinned = cpu_affinity.pin_current_thread(cpus)
+        logger.info("канал привязан к ядрам", extra={
+            "camera_id": cam_id, "cpus": sorted(cpus), "pinned": pinned})
     analyze_url = sub_rtsp_url or rtsp_url
     # Снимки лиц режутся из полноразмерного кадра, который камера отдаёт по
     # HTTP (ONVIF GetSnapshotUri), а не из кадра аналитики: на субпотоке
@@ -1998,6 +2013,28 @@ def log_record_root() -> str | None:
     return msg
 
 
+# Последняя напечатанная сводка раскладки по NUMA — чтобы не писать её в
+# лог каждые 10 секунд на каждом проходе менеджера.
+_numa_logged: dict | None = None
+
+
+def _log_numa_layout(analytics_ids) -> dict:
+    """Напечатать раскладку каналов по NUMA-нодам при её изменении (§17).
+
+    Печатается один раз на состояние, а не на проход: менеджер крутится
+    каждые 10 с, и безусловная запись утопила бы журнал. Но и молчать
+    нельзя — без строки в логе на объекте нельзя отличить «привязка
+    работает» от «привязка молча не встала», а именно это отличие решает,
+    искать ли причину низкого FPS в NUMA (см. DEPLOY_CHECKLIST.md).
+    """
+    global _numa_logged
+    info = cpu_affinity.describe(analytics_ids)
+    if info != _numa_logged:
+        _numa_logged = info
+        logger.info("раскладка аналитики по NUMA", extra=info)
+    return info
+
+
 def manager():
     # Отметки живости заводятся ПЕРВЫМИ и передаются в embed-API ниже:
     # именно `/health` этого API опрашивает healthcheck контейнера, и до
@@ -2085,6 +2122,14 @@ def manager():
                     logger.info("слой аналитики включён: модель загружена")
             record_cams: list[tuple[int, str]] = []
             record_cam_names: list[tuple[int, str]] = []
+            # Камеры, которые должны быть под аналитикой на этом проходе, —
+            # и те, чья нить уже крутится, и те, что ещё предстоит поднять.
+            # Раскладка по NUMA-нодам (§17) обязана считаться от ПОЛНОГО
+            # списка: если считать её только от поднимаемых, перезапуск
+            # одной нити переносил бы камеру на другой сокет всякий раз,
+            # когда соседи в этот момент живы.
+            analytics_ids: list[int] = []
+            pending: list[tuple[int, str, str | None, dict | None]] = []
             with Session() as s:
                 cams = s.execute(select(Camera).where(Camera.enabled == True)).scalars().all()
                 for cam in cams:
@@ -2112,6 +2157,9 @@ def manager():
                     # отработал — камера пишется независимо (SPEC §2).
                     if FACE_APP is None:
                         continue
+                    # В раскладку камера попадает независимо от того, жива
+                    # ли её нить: см. комментарий к analytics_ids выше.
+                    analytics_ids.append(cam.id)
                     if cam.id in threads and threads[cam.id].is_alive():
                         continue
                     onvif_config = None
@@ -2129,11 +2177,24 @@ def manager():
                             "username": cam.onvif_username,
                             "password": onvif_password,
                         }
-                    t = threading.Thread(
-                        target=camera_worker, args=(cam.id, rtsp, FACE_APP, sub, onvif_config), daemon=True
-                    )
-                    t.start()
-                    threads[cam.id] = t
+                    pending.append((cam.id, rtsp, sub, onvif_config))
+
+            # Раскладка каналов по NUMA-нодам (SPEC §17) — после того, как
+            # известен ВЕСЬ список камер analytics, и до старта нитей: нить
+            # обязана получить свою ноду до первого кадра, иначе её буферы
+            # успевают лечь на чужую память (политика first-touch,
+            # см. cpu_affinity.py). На односокетной машине раскладка пуста и
+            # ни одна нить не привязывается.
+            layout = cpu_affinity.plan(analytics_ids)
+            _log_numa_layout(analytics_ids)
+            for cam_id, rtsp, sub, onvif_config in pending:
+                t = threading.Thread(
+                    target=camera_worker,
+                    args=(cam_id, rtsp, FACE_APP, sub, onvif_config, layout.get(cam_id)),
+                    daemon=True,
+                )
+                t.start()
+                threads[cam_id] = t
 
             # Слой записи (SPEC §20) — вне сессии БД: sync_paths() ходит по
             # сети в MediaMTX, и держать на это время открытое соединение с
