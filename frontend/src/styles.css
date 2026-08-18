@@ -162,6 +162,40 @@ table tbody tr:hover { background: var(--bg2); }
   margin-top: 8px; flex-wrap: wrap;
 }
 
+/* Шкала архива (SPEC §5): сутки одной камеры одной полосой.
+
+   Подложка полосы окрашена как перерыв, покрытие рисуется поверх —
+   «нет записи» обязано выглядеть иначе, чем «шкала не загрузилась».
+   Полоса кликабельна целиком, включая перерывы: клик в перерыв
+   перематывает к следующей записи, как в промышленном NVR. */
+.timeline { margin-top: 4px; }
+.timeline-strip {
+  position: relative; height: 34px; cursor: pointer;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 4px;
+  overflow: hidden;
+}
+.timeline-bar {
+  position: absolute; top: 0; bottom: 0;
+  background: var(--green); opacity: 0.75;
+}
+.timeline-tick {
+  position: absolute; top: 0; bottom: 0; width: 1px;
+  background: var(--border);
+}
+/* Каретка поверх покрытия и делений: она отвечает на вопрос «где я
+   сейчас», и спрятать её под полоской записи нельзя. */
+.timeline-head {
+  position: absolute; top: -2px; bottom: -2px; width: 2px;
+  margin-left: -1px; background: var(--accent); pointer-events: none;
+}
+.timeline-labels {
+  position: relative; height: 14px; margin-top: 2px;
+  color: var(--muted); font-size: 11px;
+}
+.timeline-labels span {
+  position: absolute; transform: translateX(-50%); white-space: nowrap;
+}
+
 /* Миниатюра кадра сегмента в выдаче архива (SPEC §7). Размер задан в CSS,
    а не атрибутами img: строка таблицы не должна прыгать, пока картинка
    догружается ленивой загрузкой. */

@@ -337,3 +337,41 @@ class SegmentOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class TimelineSegmentOut(BaseModel):
+    """Звено цепочки воспроизведения шкалы (SPEC §5).
+
+    Без `file_path`, в отличие от `SegmentOut`: плееру он не нужен — файл
+    он берёт по `/api/archive/file/{id}` — а шкала суток это до 1440 строк,
+    то есть столько же серверных путей в разметке страницы без единого
+    применения.
+    """
+    id: int
+    started_at: datetime
+    ended_at: datetime
+    duration_sec: int
+
+    class Config:
+        from_attributes = True
+
+
+class TimelineRangeOut(BaseModel):
+    """Непрерывный кусок записи: между `start` и `end` дыр нет."""
+    start: datetime
+    end: datetime
+
+
+class TimelineOut(BaseModel):
+    camera_id: int
+    date_from: datetime
+    date_to: datetime
+    ranges: list[TimelineRangeOut]
+    segments: list[TimelineSegmentOut]
+    # Секунды записи внутри окна — по склеенным диапазонам, не суммой
+    # длительностей: перекрытия не должны давать «25 часов из 24».
+    recorded_sec: float
+    # Выдача упёрлась в потолок сегментов: шкала показывает не всё окно.
+    # Флаг существует, чтобы страница сказала это вслух — обрезанная шкала
+    # выглядит как «дальше записи нет».
+    truncated: bool
