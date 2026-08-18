@@ -214,14 +214,25 @@ def test_calculator_defaults_to_actual_camera_count(client, admin_headers, make_
 
 
 def test_calculator_defaults_to_configured_retention(client, admin_headers):
-    """Без параметра `days` берётся настроенный retention, а не константа 14."""
-    client.put("/api/settings", json={"retention_days": 21}, headers=admin_headers)
+    """Без параметра `days` берётся настроенный retention, а не константа 14.
+
+    Исходное значение считывается, а не предполагается: в песочнице сид даёт
+    14, в CI — 30 (`RETENTION_DAYS` окружения), и восстановление в
+    захардкоженные 14 оставляло бы после теста чужую настройку. Ровно эту
+    ошибку — подставленное вместо прочитанного — и чинит этот PR, так что
+    допускать её в собственном тесте тем более нельзя.
+    """
+    # `/api/settings` отдаёт значения строками (таблица `settings` хранит
+    # текст) — приводим явно, иначе `before + 7` склеит строки.
+    before = int(client.get("/api/settings", headers=admin_headers).json()["retention_days"])
+    probe = before + 7          # заведомо отличается от исходного
+    client.put("/api/settings", json={"retention_days": probe}, headers=admin_headers)
     try:
         d = client.get("/api/system/storage/calculator", headers=admin_headers).json()
-        assert d["days"] == 21
+        assert d["days"] == probe
         assert d["days_source"] == "actual"
     finally:
-        client.put("/api/settings", json={"retention_days": 14}, headers=admin_headers)
+        client.put("/api/settings", json={"retention_days": before}, headers=admin_headers)
 
 
 def test_explicit_params_still_win(client, admin_headers, make_camera):
