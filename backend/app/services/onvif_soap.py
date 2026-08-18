@@ -19,9 +19,10 @@ SOAP 1.2 с жёстко заданными WSDL/XSD; серверных SOAP-ф
 WS-Security UsernameToken (Text и Digest) против отдельной ONVIF-учётки из
 конфигурации — НЕ против таблицы `users`: пароли пользователей хранятся
 bcrypt-хэшами, а UsernameToken Digest требует знания пароля в открытом
-виде. Свежесть `Created` проверяется (окно ±5 минут), но кэш nonce против
-повторов не ведётся — это отмечено в known gaps как «проверить/усилить на
-сервере».
+виде. Свежесть `Created` проверяется (окно ±5 минут), и с цикла 39 ведётся
+кэш использованных nonce (`nonce_cache_key` здесь + Redis в
+`routers/onvif.py`): одной проверки свежести мало — внутри пятиминутного
+окна перехваченный заголовок принимался сколько угодно раз.
 """
 from __future__ import annotations
 
@@ -55,6 +56,12 @@ _PWD_TEXT = ("http://docs.oasis-open.org/wss/2004/01/"
 
 # Допустимый сдвиг часов между клиентом и сервером для WS-Security Created.
 CLOCK_SKEW = timedelta(minutes=5)
+
+# Сколько помнить использованный nonce. Токен с `Created` за пределами
+# CLOCK_SKEW отбраковывается и без кэша, поэтому помнить дольше двойного
+# окна бессмысленно: за его границей повтор уже не пройдёт проверку
+# свежести. Меньше — оставляло бы щель ровно посередине.
+NONCE_TTL_SEC = int(2 * CLOCK_SKEW.total_seconds())
 
 
 def localname(tag: str) -> str:
@@ -205,6 +212,49 @@ def verify_security(header, expected: Credentials,
 
     if not ok:
         raise SoapError("ter:NotAuthorized", "Неверные учётные данные ONVIF")
+
+
+def nonce_cache_key(header) -> str | None:
+    """Ключ кэша использованных nonce для этого токена, либо None, если
+    кэшировать нечего (PasswordText — в нём nonce нет вовсе).
+
+    Зачем кэш. Проверка `Created` на свежесть (`_created_is_fresh`) режет
+    повтор перехваченного UsernameToken **только через пять минут**. Внутри
+    этого окна перехваченный заголовок принимается сколько угодно раз: для
+    Profile G это чужой список камер объекта, границы архива и, если
+    replay-источник сконфигурирован, ссылка на воспроизведение записи.
+    ONVIF Core прямо требует помнить использованные nonce — до цикла 39
+    этого не было.
+
+    Ключ — SHA-256 от пары (nonce, Created), а не от одного nonce: клиент
+    вправе переиспользовать nonce с новым Created (спецификация этого не
+    запрещает), и ключ по одному nonce отбраковывал бы законные запросы
+    такого клиента. Хэш, а не значения: nonce и Created попадают в Redis,
+    который читают и другие процессы, а сами значения — часть материала
+    дайджеста.
+
+    Функция чистая: обращение к Redis — в вызывающем (`routers/onvif.py`),
+    чтобы разбор и сеть тестировались порознь.
+    """
+    if header is None:
+        return None
+    token = find_local(header, "UsernameToken")
+    if token is None:
+        return None
+    pwd_node = find_local(token, "Password")
+    if pwd_node is None:
+        return None
+    if (pwd_node.get("Type") or _PWD_DIGEST).strip() == _PWD_TEXT:
+        # PasswordText не содержит nonce; повтор такого заголовка не
+        # отличим от нового запроса в принципе, и притворяться, что кэш
+        # что-то даёт, нельзя. Защита здесь — TLS (§14), а не кэш.
+        return None
+    nonce = (text_of(token, "Nonce", "") or "").strip()
+    created = (text_of(token, "Created", "") or "").strip()
+    if not nonce:
+        return None
+    material = f"{nonce}|{created}".encode("utf-8")
+    return "onvif:g:nonce:" + hashlib.sha256(material).hexdigest()
 
 
 # --- Сборка ответа ----------------------------------------------------------
