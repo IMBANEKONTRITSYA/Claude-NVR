@@ -234,10 +234,18 @@ export const api = {
   sysMetrics: () => req("/api/system/metrics"),
   // SPEC §5, §21: заполнение диска, фактический расход, прогноз хранения
   storage: () => req("/api/system/storage"),
-  // SPEC §14, §9: статус каждого из 120 потоков слоя записи
+  // SPEC §14, §9: статус потоков слоя записи (число камер — сколько заведено)
   recordLayer: () => req("/api/system/record-layer"),
-  storageCalc: (bitrate_kbps: number, cameras: number, days: number) =>
-    req(`/api/system/storage/calculator?bitrate_kbps=${bitrate_kbps}&cameras=${cameras}&days=${days}`),
+  // SPEC §16. `cameras`/`days` необязательны: без них сервер подставляет
+  // фактическое число включённых камер и настроенный retention, и первый
+  // ответ относится к этой системе, а не к вымышленной. §22 прямо
+  // запрещает хардкодить количество камер.
+  storageCalc: (bitrate_kbps: number, cameras?: number, days?: number) => {
+    const q = new URLSearchParams({ bitrate_kbps: String(bitrate_kbps) });
+    if (cameras !== undefined) q.set("cameras", String(cameras));
+    if (days !== undefined) q.set("days", String(days));
+    return req(`/api/system/storage/calculator?${q}`);
+  },
   // SPEC §16 «Автоконфигурация при первом запуске»: ресурсы сервера →
   // предложение по числу камер записи, камер аналитики и профилю.
   autoconfig: (bitrate_kbps: number, retention_days: number) =>
