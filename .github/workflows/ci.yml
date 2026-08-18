@@ -116,6 +116,58 @@ jobs:
           pip install pytest fastapi httpx defusedxml sqlalchemy aiosmtpd
           pytest tests/ -q
 
+  record-layer-live:
+    runs-on: ubuntu-latest
+    # Слой записи против НАСТОЯЩЕГО MediaMTX, а не против двойника Control
+    # API из worker/tests/test_record_layer.py.
+    #
+    # Заведена потому, что двойник уже дважды молча разошёлся с настоящим
+    # сервером, и оба раза это находил не он, а ручной запуск бинарника:
+    # цикл 30 (длительности возвращаются как `5m0s`) и цикл 34 (нулевая
+    # длительность в v1.16.0 — пустая строка, а не `0s`). Оба раза
+    # `test_sync_is_idempotent` был зелёным, а на боевом сервере
+    # синхронизация патчила каждый путь на каждом тике менеджера. Третий
+    # раз ловить это вручную незачем: MediaMTX — статический бинарник, он
+    # ставится и запускается на раннере без Docker.
+    #
+    # Джоба быстрая (~1 минута из-за скачивания бинарника): весь набор
+    # укладывается в 6 секунд, потому что ждёт появления файла, а не
+    # ротации сегмента боевой длительности.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ffmpeg
+        # Нужен дважды: как источник RTSP (публикует синтетический поток в
+        # MediaMTX) и как ffprobe для проверки §24 «только remux».
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Download pinned MediaMTX
+        # Версия обязана совпадать с docker-compose.yml — иначе
+        # проверяется не то, что поедет на объект. Сверку делает сам тест
+        # (test_binary_matches_the_pinned_version), читая docker-compose.yml,
+        # поэтому здесь версия тоже берётся оттуда, а не пишется руками.
+        run: |
+          set -euo pipefail
+          VER=$(grep -oP 'image:\s*bluenviron/mediamtx:\K\S+' docker-compose.yml)
+          echo "MediaMTX $VER"
+          # Распаковка в отдельный каталог обязательна: в корне репозитория
+          # уже есть КАТАЛОГ mediamtx/ (конфигурация сервера), и tar,
+          # доставая файл с тем же именем в cwd, падает с
+          # «mediamtx: Cannot open: File exists».
+          mkdir -p "$RUNNER_TEMP/mtx"
+          curl -fsSL -o "$RUNNER_TEMP/mtx.tar.gz" \
+            "https://github.com/bluenviron/mediamtx/releases/download/v${VER}/mediamtx_v${VER}_linux_amd64.tar.gz"
+          tar xzf "$RUNNER_TEMP/mtx.tar.gz" -C "$RUNNER_TEMP/mtx" mediamtx
+          echo "MEDIAMTX_BIN=$RUNNER_TEMP/mtx/mediamtx" >> "$GITHUB_ENV"
+      - name: Install worker test deps
+        # Только stdlib-часть: тест живёт в том же модуле record_layer.py,
+        # который намеренно не тянет cv2/insightface.
+        run: pip install pytest
+      - name: Run record layer tests against real MediaMTX
+        working-directory: worker
+        run: pytest tests/test_record_layer_live.py -q
+
   upscaler:
     runs-on: ubuntu-latest
     # До цикла 20 у сервиса апскейла не было ни тестов, ни CI-джобы —
