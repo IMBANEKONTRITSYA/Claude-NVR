@@ -17,6 +17,7 @@
 """
 import socket
 import threading
+import time
 
 import pytest
 
@@ -199,16 +200,42 @@ def test_recover_once_kicks_answering_camera_with_delete_then_add():
     сервер отвергает."""
     client = FakeClient({"cam1": _live(True), "cam2": _live(False)})
     planner = RecoveryPlanner()
-    stats = recover_once(client, DESIRED, client.runtime_paths(), planner, 100.0,
-                         probe=lambda url: True)
+    stats = recover_once(client, DESIRED, client.runtime_paths(), planner,
+                         probe=lambda url: True, clock=lambda: 100.0)
     assert client.calls == [("delete", "cam2"), ("add", "cam2")]
     assert stats == {"down": 1, "probed": 1, "alive": 1, "kicked": 1, "failed": 0}
+
+
+def test_recover_once_takes_every_moment_from_one_clock():
+    """Регрессия: проход не смеет смешивать переданное время с
+    `time.monotonic()`.
+
+    Пока `due_probes()` получал время от вызывающего, а решение о пинке
+    сверялось с `time.monotonic()`, прочитанным внутри, обе величины были
+    из разных отсчётов. На машине с большим uptime это незаметно
+    (`monotonic()` заведомо больше выдуманного `100.0`), а на свежем
+    раннере CI `monotonic()` меньше сотни — и пинок не проходил никогда:
+    ровно так этот набор и упал в CI, будучи зелёным в песочнице.
+
+    Часы смещены **вперёд** от `monotonic()`, а не назад и не в
+    фиксированную точку: только так проверка падает при смешении часов на
+    ЛЮБОЙ машине. С часами, отдающими маленькое число, тест на машине с
+    большим uptime зеленел бы и со смешанными часами — то есть повторил бы
+    исходную ошибку в самой проверке.
+    """
+    client = FakeClient({"cam1": _live(True), "cam2": _live(False)})
+    ahead = time.monotonic() + 10_000
+    stats = recover_once(client, DESIRED, client.runtime_paths(),
+                         RecoveryPlanner(), probe=lambda url: True,
+                         clock=lambda: ahead)
+    assert stats["kicked"] == 1
+    assert client.calls == [("delete", "cam2"), ("add", "cam2")]
 
 
 def test_recover_once_leaves_silent_camera_alone():
     client = FakeClient({"cam1": _live(True), "cam2": _live(False)})
     stats = recover_once(client, DESIRED, client.runtime_paths(), RecoveryPlanner(),
-                         100.0, probe=lambda url: False)
+                         probe=lambda url: False, clock=lambda: 100.0)
     assert client.calls == []
     assert stats["kicked"] == 0 and stats["probed"] == 1
 
@@ -218,8 +245,8 @@ def test_recover_once_probes_the_camera_url_not_the_path_name():
     имя пути, проба уходила бы в медиасервер и отвечала бы «жива» всегда."""
     client = FakeClient({"cam1": _live(True), "cam2": _live(False)})
     asked = []
-    recover_once(client, DESIRED, client.runtime_paths(), RecoveryPlanner(), 100.0,
-                 probe=lambda url: asked.append(url) or False)
+    recover_once(client, DESIRED, client.runtime_paths(), RecoveryPlanner(),
+                 probe=lambda url: asked.append(url) or False, clock=lambda: 100.0)
     assert asked == ["rtsp://cam-two/main"]
 
 
@@ -230,7 +257,7 @@ def test_online_paths_cost_nothing():
     client = FakeClient({"cam1": _live(True), "cam2": _live(True)})
     asked = []
     stats = recover_once(client, DESIRED, client.runtime_paths(), RecoveryPlanner(),
-                         100.0, probe=lambda url: asked.append(url) or True)
+                         probe=lambda url: asked.append(url) or True, clock=lambda: 100.0)
     assert asked == [] and client.calls == [] and stats["down"] == 0
 
 
@@ -241,8 +268,8 @@ def test_failed_add_is_counted_and_backed_off():
     client = FakeClient({"cam1": _live(True), "cam2": _live(False)},
                         fail_add=True)
     planner = RecoveryPlanner()
-    stats = recover_once(client, DESIRED, client.runtime_paths(), planner, 100.0,
-                         probe=lambda url: True)
+    stats = recover_once(client, DESIRED, client.runtime_paths(), planner,
+                         probe=lambda url: True, clock=lambda: 100.0)
     assert stats["failed"] == 1 and stats["kicked"] == 0
     assert planner._state["cam2"]["kicks"] == 1
 

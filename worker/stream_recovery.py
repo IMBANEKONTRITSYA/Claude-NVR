@@ -331,13 +331,25 @@ def kick_path(client, name: str, conf: dict) -> None:
 
 
 def recover_once(client, desired: dict[str, dict], runtime: dict[str, dict] | None,
-                 planner: RecoveryPlanner, now: float, *,
-                 probe=rtsp_alive, executor: ThreadPoolExecutor | None = None) -> dict:
+                 planner: RecoveryPlanner, *, probe=rtsp_alive,
+                 executor: ThreadPoolExecutor | None = None,
+                 clock=time.monotonic) -> dict:
     """Один проход супервизора. Возвращает статистику прохода.
 
     Разделение «планировщик решает — проход делает» держит всю сетевую
     часть в одном месте и позволяет проверить решения (кого опрашивать,
     когда пинать) без сети вовсе.
+
+    **Все моменты времени берутся из `clock`, и момент снимается дважды** —
+    до опроса и после него. Второе обязательно: опрос недоступной камеры
+    длится до таймаута, и планировать следующий проход от времени, снятого
+    до опроса, значило бы назначать его в прошлое. Отсюда же и параметр
+    вместо «текущего времени» аргументом: пока проход брал `now` от
+    вызывающего, а после опроса читал `time.monotonic()` сам, эти две
+    величины были из разных отсчётов — тест с выдуманным `now = 100.0`
+    проходил на машине с большим uptime и падал на свежем раннере, где
+    `monotonic()` меньше сотни. Одни часы на весь проход убирают этот
+    класс ошибки целиком.
     """
     down = down_paths(desired, runtime)
     planner.sync(down)
@@ -345,7 +357,7 @@ def recover_once(client, desired: dict[str, dict], runtime: dict[str, dict] | No
     if not down:
         return stats
 
-    targets = planner.due_probes(down, now)
+    targets = planner.due_probes(down, clock())
     if not targets:
         return stats
     stats["probed"] = len(targets)
@@ -358,14 +370,11 @@ def recover_once(client, desired: dict[str, dict], runtime: dict[str, dict] | No
     for (name, _url), alive in zip(targets, results):
         if alive:
             stats["alive"] += 1
-        # Время берётся заново: опрос недоступной камеры длится до
-        # таймаута, и планировать следующий проход от `now`, снятого до
-        # опроса, значило бы назначать его в прошлое.
-        if not planner.probed(name, alive, time.monotonic()):
+        if not planner.probed(name, alive, clock()):
             continue
         try:
             kick_path(client, name, desired[name])
-            planner.kicked(name, time.monotonic())
+            planner.kicked(name, clock())
             stats["kicked"] += 1
             logger.info(
                 "поток записи: камера ответила, пересоздаю путь",
@@ -373,7 +382,7 @@ def recover_once(client, desired: dict[str, dict], runtime: dict[str, dict] | No
                        "event": "record_stream_kick"})
         except MediaMTXError:
             stats["failed"] += 1
-            planner.kicked(name, time.monotonic())
+            planner.kicked(name, clock())
             logger.error("не удалось пересоздать путь записи", exc_info=True,
                          extra={"path": name})
     return stats
@@ -421,8 +430,7 @@ class RecoverySupervisor:
             return {"down": 0, "probed": 0, "alive": 0, "kicked": 0, "failed": 0,
                     "api_error": True}
         stats = recover_once(client, desired, runtime, self.planner,
-                             time.monotonic(), probe=self._probe,
-                             executor=self._executor)
+                             probe=self._probe, executor=self._executor)
         self.last_stats = stats
         return stats
 

@@ -166,7 +166,7 @@ class _Supervisor:
         except Exception:
             return
         stats = self._recover_once(self.client, self.desired, runtime,
-                                   self.planner, time.monotonic())
+                                   self.planner)
         self.kicks += stats["kicked"]
 
 

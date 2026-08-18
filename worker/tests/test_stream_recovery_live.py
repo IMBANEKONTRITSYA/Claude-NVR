@@ -203,8 +203,7 @@ def test_kick_restores_recording_faster_than_the_server_would(live):
 
     # Пока камеры нет, супервизор обязан молчать: пинок по молчащей камере
     # ничего не чинит, а конфигурацию рвёт.
-    stats = recover_once(client, _desired(live), client.runtime_paths(),
-                         planner, time.monotonic())
+    stats = recover_once(client, _desired(live), client.runtime_paths(), planner)
     assert stats["kicked"] == 0, "пинок ушёл по камере, которой нет"
 
     live["camera"].start()
@@ -218,8 +217,7 @@ def test_kick_restores_recording_faster_than_the_server_would(live):
     kicked = False
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
-        stats = recover_once(client, _desired(live), client.runtime_paths(),
-                             planner, time.monotonic())
+        stats = recover_once(client, _desired(live), client.runtime_paths(), planner)
         kicked = kicked or bool(stats["kicked"])
         if _written(seg_dir) > before:
             break
