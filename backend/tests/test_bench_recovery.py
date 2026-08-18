@@ -120,6 +120,37 @@ def test_missing_mediamtx_is_a_skip_not_a_failure():
     assert "verdict" not in out
 
 
+def test_supervisor_in_the_bench_is_the_production_one():
+    """Замер крутит боевой супервизор, а не его копию.
+
+    Тот же класс ошибки, что и с конфигурацией пути выше: копия
+    планировщика задержек или пробы разошлась бы с воркером, и цифра в
+    отчёте относилась бы к схеме, которой на объекте нет. Проверяется
+    тождество функций, а не текст.
+    """
+    mod = _module()
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "worker"))
+    import stream_recovery  # noqa: PLC0415
+
+    sup = mod._Supervisor("http://127.0.0.1:9997", {})
+
+    assert sup._recover_once is stream_recovery.recover_once
+    assert isinstance(sup.planner, stream_recovery.RecoveryPlanner)
+
+
+def test_supervisor_is_on_by_default():
+    """По умолчанию мерится **боевая** конфигурация.
+
+    С цикла 43 воркер восстанавливает поток сам, и замер без супервизора
+    описывал бы прошлое системы. Прежний режим остаётся под флагом —
+    именно как база для сравнения, а не как основной результат.
+    """
+    import inspect  # noqa: PLC0415
+
+    default = inspect.signature(_module().run).parameters["supervisor_on"].default
+    assert default is True
+
+
 @pytest.mark.parametrize("outage", [2, 5, 15, 30])
 def test_default_outages_probe_both_sides_of_the_budget(outage):
     """Набор длительностей обрыва перекрывает бюджет с обеих сторон.

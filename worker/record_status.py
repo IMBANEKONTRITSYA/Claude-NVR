@@ -11,11 +11,36 @@ Redis. Причина та же, что у `storage.py`: решение «это
 решение «у этой камеры пропущен сегмент» должны быть проверяемы без
 поднятия MediaMTX, которого в песочнице нет.
 
-Имена полей рантайма сверены с `api/openapi.yaml` MediaMTX v1.20.0:
-актуальные — `online`, `onlineTime`, `inboundBytes`,
-`inboundFramesInError`; `ready`, `readyTime`, `bytesReceived`,
-`bytesSent` помечены в апстриме **deprecated** и здесь не используются
-(цикл 24 ссылался на `readyTime` — это устаревшее поле).
+**Имена полей рантайма были сверены не с той версией — и `online` вообще
+не то поле.** До цикла 43 модуль считал поток живым по `online` и брал
+объём по `inboundBytes`, ориентируясь на `api/openapi.yaml` **v1.20.0**.
+Запуск обеих версий с настоящим обрывом показал две разные ошибки:
+
+* **`online` у пути со статическим источником не падает никогда.**
+  Именно так слой записи и заводит каждую камеру (`source: rtsp://…`,
+  `sourceOnDemand: no`), поэтому `online: true` означает лишь «путь
+  заведён и сервер пытается тянуть», а не «поток идёт». Проверено на
+  v1.16.0 и v1.20.0: через 2, 6 и 12 секунд после исчезновения камеры
+  `online` остаётся `true`, а `ready`/`available` — `false`. Следствие
+  на объекте: потерянный поток **никогда** не показывался потерянным,
+  алерт §14 «потеря потока» не срабатывал ни разу, и статус камеры в БД
+  (а с ним стена камер §4 и live) вечно оставался `online`;
+* **`inboundBytes` и `inboundFramesInError` в v1.16.0 не существуют** —
+  их добавили позже, а закреплён в `docker-compose.yml` именно v1.16.0.
+  Поле возвращалось пустым, то есть «Принято» на мониторинге всегда
+  показывало 0 МБ, а «кадров с ошибками» — 0 при любом их числе.
+
+Отсюда правило модуля: **жив ли поток — по `available`** (не помечен
+deprecated ни в одной из версий и в обеих означает наличие потока), с
+откатом на `ready` для совместимости; объём и ошибки кадров — по паре
+имён «новое, иначе старое». Единственный, кто мог это поймать, — запуск
+настоящего бинарника (`tests/test_record_status_live.py`), потому что оба
+поля есть в схеме и оба непусты.
+
+Модуль — чистая логика над уже полученными словарями: ни сети, ни БД, ни
+Redis. Причина та же, что у `storage.py`: решение «этот поток потерян» и
+решение «у этой камеры пропущен сегмент» должны быть проверяемы без
+поднятия MediaMTX.
 """
 from __future__ import annotations
 
@@ -36,6 +61,45 @@ def path_name(camera_id: int) -> str:
     """Дублирует `record_layer.path_name` намеренно: этот модуль не должен
     зависеть от клиента API, чтобы оставаться проверяемым в одиночку."""
     return f"cam{camera_id}"
+
+
+def path_live(path: dict | None) -> bool:
+    """Идёт ли по пути поток прямо сейчас (см. шапку модуля).
+
+    Порядок полей — не вкус, а совместимость версий:
+
+    * `available` есть и в v1.16.0 (закреплена в docker-compose.yml), и в
+      v1.20.0, ни в одной не помечен deprecated, и в обеих падает в
+      `false` на обрыве — проверено запуском обоих бинарников;
+    * `ready` — то же значение, но в v1.20.0 уже deprecated; остаётся
+      откатом на случай сборки, где `available` не отдаётся;
+    * `online` не используется вовсе: у пути со статическим источником —
+      а других слой записи не заводит — он не падает никогда.
+    """
+    if not path:
+        return False
+    for key in ("available", "ready"):
+        if key in path:
+            return bool(path[key])
+    return False
+
+
+def _int_field(path: dict, *names: str) -> int:
+    """Первое непустое из полей — новое имя, затем прежнее.
+
+    `inboundBytes`/`inboundFramesInError` появились после v1.16.0, а
+    закреплена именно она; `bytesReceived` в v1.20.0 помечен deprecated,
+    но отдаётся. Брать одно имя — значит показывать нули на одной из
+    версий (что и происходило до цикла 43).
+    """
+    for name in names:
+        value = path.get(name)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+    return 0
 
 
 def stream_states(cameras, runtime: dict[str, dict] | None) -> dict[int, dict]:
@@ -66,10 +130,14 @@ def stream_states(cameras, runtime: dict[str, dict] | None) -> dict[int, dict]:
         out[cam_id] = {
             "camera_id": cam_id,
             "name": name,
-            "status": ONLINE if p.get("online") else OFFLINE,
-            "inbound_bytes": int(p.get("inboundBytes") or 0),
-            "online_since": p.get("onlineTime"),
-            "frames_in_error": int(p.get("inboundFramesInError") or 0),
+            "status": ONLINE if path_live(p) else OFFLINE,
+            "inbound_bytes": _int_field(p, "inboundBytes", "bytesReceived"),
+            # Время начала потока — парное к `available`/`ready`, а не к
+            # `online`: последнее у статического источника проставляется
+            # один раз при заведении пути и после обрыва не меняется, то
+            # есть «в сети с» показывало бы дату старта воркера.
+            "online_since": p.get("availableTime") or p.get("readyTime"),
+            "frames_in_error": _int_field(p, "inboundFramesInError"),
         }
     return out
 

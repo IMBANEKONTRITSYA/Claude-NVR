@@ -158,3 +158,41 @@ def test_record_layer_allowed_to_operator(client, make_user_headers):
     r = client.get("/api/system/record-layer",
                    headers=make_user_headers("recl-operator", "operator"))
     assert r.status_code == 200
+
+
+def test_recovery_state_is_attached_to_its_stream(client, admin_headers, publish_state):
+    """SPEC §19: воркер восстанавливает поток сам и сообщает, что видит.
+
+    Оператору на стене камер нужно различать «камера выключена» и «камера
+    отвечает по RTSP, а запись всё равно не идёт»: первое чинят на
+    объекте, второе — в настройках потока. Воркер отдаёт это картой по
+    camera_id (после JSON — строковые ключи), а бэкенд обязан приклеить её
+    к своему потоку, иначе интерфейсу пришлось бы держать вторую карту и
+    сшивать её руками.
+    """
+    payload = _payload([{"camera_id": 7, "name": "Склад", "status": "offline",
+                         "inbound_bytes": 0, "online_since": None,
+                         "frames_in_error": 0}])
+    payload["recovery"] = {"7": {"down_for_sec": 12.5, "probes_failed": 0,
+                                 "kicks": 1, "camera_answering": True}}
+    publish_state(payload)
+
+    d = client.get("/api/system/record-layer", headers=admin_headers).json()
+
+    assert d["streams"][0]["recovery"]["camera_answering"] is True
+    assert d["streams"][0]["recovery"]["kicks"] == 1
+
+
+def test_stream_without_recovery_state_has_no_such_field(client, admin_headers, publish_state):
+    """Позитивный контроль: на здоровом потоке поля нет вовсе.
+
+    Пустой объект вместо отсутствия поля означал бы, что интерфейс рисует
+    строку «камера не отвечает по RTSP» под каждой исправной камерой.
+    """
+    publish_state(_payload([{"camera_id": 7, "name": "Склад", "status": "online",
+                             "inbound_bytes": 10, "online_since": None,
+                             "frames_in_error": 0}]))
+
+    d = client.get("/api/system/record-layer", headers=admin_headers).json()
+
+    assert "recovery" not in d["streams"][0]
