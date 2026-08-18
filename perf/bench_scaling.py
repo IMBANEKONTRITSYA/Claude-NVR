@@ -285,23 +285,47 @@ def run_processes(clip: str, channels: int, seconds: float,
 
 
 def _cpu_sets(channels: int) -> list[list[int]]:
-    """Раздать каналам непересекающиеся ядра, пока их хватает.
+    """Раздать каналам непересекающиеся **блоки** ядер.
 
     Раскладка по NUMA-нодам здесь не воспроизводится — в песочнице нода
     одна. Смысл пиннинга в замере другой: снять с планировщика право
     таскать канал между ядрами, чтобы режимы отличались только моделью
     параллелизма.
+
+    **Блоками, а не по одному ядру на канал** — и это исправление, а не
+    вкусовщина. Первая редакция выдавала каналу ровно одно ядро, и на
+    раннере CI (AMD EPYC 7763, 4 vCPU) режим процессов показал 3.82 FPS на
+    ядро против 6.20 у нитей — то есть якобы вдвое хуже, тогда как в
+    песочнице (Intel, 4 vCPU) те же режимы дали 4.60 против 4.96. Разница
+    между машинами объясняется не моделью параллелизма, а SMT:
+    `thread_siblings_list` в песочнице показывает по одному номеру на
+    группу (siblings не видны), а на раннере два соседних vCPU вполне
+    могут оказаться двумя нитями ОДНОГО физического ядра — и два процесса,
+    прибитых к номерам 0 и 1, делят одно ядро, пока нити свободно
+    расходятся по всем четырём.
+
+    То есть замер сравнивал не «нити против процессов», а «две нити
+    одного ядра против четырёх vCPU». Блоки убирают этот перекос: каждый
+    канал получает равную долю машины, как в production канал получает
+    ядра своей ноды целиком (`worker/cpu_affinity.py` — по той же причине
+    привязывает к ноде, а не к ядру).
     """
     try:
         avail = sorted(os.sched_getaffinity(0))
     except AttributeError:                       # pragma: no cover
         avail = list(range(os.cpu_count() or 1))
-    if not avail:
-        return [None] * channels                 # type: ignore[list-item]
-    if channels <= len(avail):
-        return [[avail[i]] for i in range(channels)]
-    # Каналов больше ядер — раздаём по кругу.
-    return [[avail[i % len(avail)]] for i in range(channels)]
+    if not avail or channels <= 0:
+        return [None] * max(channels, 0)         # type: ignore[list-item]
+    if channels >= len(avail):
+        # Ядер меньше каналов — делить нечего, раздаём по кругу.
+        return [[avail[i % len(avail)]] for i in range(channels)]
+    out: list[list[int]] = []
+    total = len(avail)
+    for i in range(channels):
+        lo = i * total // channels
+        hi = (i + 1) * total // channels
+        out.append(avail[lo:hi])
+    return out
 
 
 def _rss_mb(children=None) -> float | None:

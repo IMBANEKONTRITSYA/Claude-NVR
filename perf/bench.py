@@ -47,6 +47,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -63,6 +64,23 @@ CLIP_SECONDS = 20
 # SPEC §6/§19: детекция идёт по кадру, ужатому до detect_width (640 по
 # умолчанию) — инференс меряется на этом размере, а не на исходном.
 DETECT_W, DETECT_H = 640, 384
+
+
+@contextlib.contextmanager
+def _stdout_to_stderr():
+    """Увести весь вывод замера со stdout на stderr (см. main()).
+
+    Однопоточно по построению: замеры в этом файле идут последовательно, в
+    отличие от `bench_scaling.py`, где та же подмена делается со счётчиком
+    и замком, потому что прогрев там идёт из нескольких нитей сразу.
+    """
+    saved = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        yield
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
 
 
 def _have(cmd: str) -> bool:
@@ -1177,11 +1195,21 @@ def main() -> int:
     # сети (~125 МБ) и идёт минуты, а не секунды. Запускается явно
     # (`--only chain`) — как facesearch и archive.
     groups = set(args.only) if args.only else {"decode", "prefilter", "inference"}
-    res = run(groups, chain_repeats=args.repeat)
-
     if args.json:
+        # Замер идёт с подменённым stdout, и это не косметика: insightface
+        # печатает состав модели через `print()`, а джоба `perf` собирает
+        # вывод в артефакт (`... --json | tee perf-chain.json`). До этой
+        # правки артефакт содержал десяток строк лога перед `{` и не
+        # разбирался как JSON вовсе — то есть машиночитаемый режим не был
+        # машиночитаемым, а замечалось это только при попытке его прочесть.
+        # Подменяется дескриптор, а не `sys.stdout`: печатают в том числе
+        # C-расширения.
+        with _stdout_to_stderr():
+            res = run(groups, chain_repeats=args.repeat)
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
+
+    res = run(groups, chain_repeats=args.repeat)
 
     print(f"CPU: {res['cpu']}  ядер: {res['cores']}  AVX2: "
           f"{'есть' if res['avx2'] else 'НЕТ (как на целевом сервере)'}")
