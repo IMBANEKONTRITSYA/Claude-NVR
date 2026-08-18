@@ -163,7 +163,7 @@ def run(n_cameras: int, warmup: int, measure: int, pull: bool = False) -> dict:
     conf = os.path.join(WORK, "mediamtx_bench.yml")
     open(conf, "w").write(mediamtx_conf())
 
-    mtx = subprocess.Popen([MEDIAMTX_BIN, conf],
+    mtx = subprocess.Popen([MEDIAMTX_BIN, conf], cwd=os.path.dirname(conf),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
     proc = psutil.Process(mtx.pid)

@@ -57,6 +57,7 @@ from record_layer import (MediaMTXClient, path_conf, path_name,
                           sync_paths)
 from record_status import (UNKNOWN, newly_lost, newly_restored, segment_gaps,
                            stream_states, summarize)
+from stream_recovery import RecoverySupervisor
 from segment_index import index_new_segments
 from snapshot_http import fetch_snapshot_bytes
 from storage import (BYTES_PER_GB, bytes_to_free, disk_alert_level,
@@ -90,6 +91,11 @@ MEDIAMTX_PORT = int(os.environ.get("MEDIAMTX_PORT", "8554"))
 MEDIAMTX_API_URL = os.environ.get(
     "MEDIAMTX_API_URL", f"http://facewatch:facewatch-mediamtx-api@{MEDIAMTX_HOST}:9997"
 )
+# Период прохода супервизора восстановления потоков (SPEC §19, см.
+# stream_recovery.py). `0` выключает супервизор целиком — на случай, когда
+# на объекте пересоздание путей нежелательно и потерю секунд архива после
+# обрыва принимают осознанно.
+RECORD_RECOVERY_INTERVAL = float(os.environ.get("RECORD_RECOVERY_INTERVAL", "1.0"))
 
 DBSCAN_EPS = 0.35
 DBSCAN_MIN_SAMPLES = 3
@@ -177,6 +183,20 @@ _record_api_error: str | None = None
 # Заполняется один раз на старте: обе величины приходят из окружения и в
 # течение жизни процесса не меняются.
 _record_root_warning: str | None = None
+
+# Желаемая конфигурация путей слоя записи с последнего прохода менеджера.
+# Читает её нить супервизора восстановления (stream_recovery.py), которая
+# крутится раз в секунду и своей сессии БД не имеет: спрашивать список
+# камер у Postgres секундным опросом ради величины, меняющейся раз в
+# недели, незачем. Присваивание словаря целиком — атомарная операция, и
+# блокировка здесь не нужна: нить либо видит прежний словарь, либо новый,
+# но никогда не половину.
+_record_desired: dict[str, dict] = {}
+
+# Супервизор восстановления потоков (SPEC §19). Создаётся в manager(),
+# отсюда его состояние забирает publish_record_layer_status() для
+# интерфейса.
+_record_recovery: RecoverySupervisor | None = None
 
 
 def _pg_connect_args(url: str) -> dict:
@@ -1808,12 +1828,21 @@ def record_layer_sync(cams) -> None:
     потока. Субпоток в архив не пишется») — независимо от того, какой поток
     использует аналитика.
     """
+    global _record_desired
+
     desired = {}
     for cam_id, rtsp_url in cams:
         desired[path_name(cam_id)] = path_conf(
             rtsp_url, segment_duration_min=CONFIG["record_segment_min"],
             media_root=RECORD_MEDIA_ROOT,
         )
+    # Желаемая конфигурация публикуется ДО обращения к сети: супервизор
+    # восстановления (§19) пересоздаёт путь ровно этой конфигурацией, и
+    # если бы она обновлялась только после успешного sync_paths(), то при
+    # недоступном на этом проходе Control API супервизор продолжал бы
+    # заводить путь по устаревшему RTSP-URL — то есть чинил бы камеру
+    # адресом, который администратор уже сменил.
+    _record_desired = desired
     stats = sync_paths(MediaMTXClient(MEDIAMTX_API_URL), desired)
     if any(stats.values()):
         logger.info("синхронизация слоя записи", extra=stats)
@@ -1926,6 +1955,12 @@ def publish_record_layer_status(cam_names) -> dict:
                # нём архив может молча остаться пустым, и одних алертов
                # «пропуск записи» мало — они не говорят, куда смотреть.
                "record_root_warning": _record_root_warning,
+               # Восстановление потоков (§19): по камерам в обрыве —
+               # сколько он длится и отвечает ли камера на RTSP. Без этого
+               # «камера выключена» и «камера отвечает, а запись не идёт»
+               # на стене выглядят одинаково, а чинятся по-разному.
+               "recovery": (_record_recovery.snapshot()
+                            if _record_recovery is not None else {}),
                "analytics": {"model_ready": FACE_APP is not None,
                              "model": CONFIG["face_model"],
                              "error": MODEL_ERROR}}
@@ -2040,7 +2075,7 @@ def manager():
     # именно `/health` этого API опрашивает healthcheck контейнера, и до
     # цикла 38 он отвечал «жив» независимо от того, крутится ли этот цикл
     # (uvicorn работает в своей нити). Зависший менеджер выглядел здоровым.
-    global HEARTBEAT, _record_root_warning
+    global HEARTBEAT, _record_root_warning, _record_recovery
     HEARTBEAT = Heartbeat()
     HEARTBEAT.beat("startup")
 
@@ -2086,6 +2121,26 @@ def manager():
     _try_load_model()
     if FACE_APP is not None:
         loaded_model = (CONFIG["face_model"], CONFIG["detect_width"], analytics_threads())
+
+    # Супервизор восстановления потоков (SPEC §19: «восстановление потока
+    # ≤ 5 секунд после обрыва»). Поднимается ДО первого прохода менеджера,
+    # но до первой синхронизации путей ему нечего делать: список желаемых
+    # путей пуст, и tick() выходит сразу.
+    #
+    # Он в стороне от слоя аналитики намеренно (SPEC §2): загрузка модели
+    # выше могла провалиться, и запись это затрагивать не должно — в том
+    # числе её восстановление после обрыва.
+    if RECORD_RECOVERY_INTERVAL > 0:
+        _record_recovery = RecoverySupervisor(
+            lambda: MediaMTXClient(MEDIAMTX_API_URL),
+            lambda: _record_desired,
+            interval=RECORD_RECOVERY_INTERVAL,
+        ).start()
+        logger.info("супервизор восстановления потоков запущен",
+                    extra={"interval_sec": RECORD_RECOVERY_INTERVAL})
+    else:
+        logger.info("супервизор восстановления потоков выключен "
+                    "(RECORD_RECOVERY_INTERVAL=0)")
 
     threads: dict[int, threading.Thread] = {}
     last_cleanup = 0.0
@@ -2274,6 +2329,12 @@ def manager():
         shutdown_event.wait(10)
 
     HEARTBEAT.beat("shutdown")
+    # Супервизор останавливается ПЕРВЫМ и с ожиданием: между `delete` и
+    # `add` путь камеры не существует, и выход процесса в этот момент
+    # оставил бы камеру без записи до следующего старта воркера — то есть
+    # ровно ту дыру в архиве, против которой модуль и написан.
+    if _record_recovery is not None:
+        _record_recovery.stop()
     logger.info("завершение: жду остановки нитей камер...")
     # Бюджет ожидания общий на все камеры (не по 8с на каждую), иначе
     # остановка 16 камер могла бы растянуться на пару минут и упереться

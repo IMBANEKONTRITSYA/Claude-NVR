@@ -10,6 +10,13 @@
 Проверяется поведение, а не форма: после прохода слоя записи статус в БД
 обязан стать `online`, и обратно — `offline` при потере потока.
 
+`online: True` стоит и в фикстурах потерянного потока — это не опечатка,
+а форма ответа настоящего MediaMTX: у пути со статическим источником поле
+не падает никогда (проверено на v1.16.0 и v1.20.0, см. шапку
+`record_status.py`). До цикла 43 фикстуры повторяли не сервер, а
+представление о нём, и потому «обратное направление» проходило на коде,
+который на объекте камеру никогда не гасил.
+
 Требует полный requirements.txt воркера (урок цикла 16: тяжёлые импорты
 строго после `importorskip`).
 """
@@ -102,8 +109,8 @@ def test_record_only_camera_goes_online_from_record_layer(db, monkeypatch):
     live-просмотр по ней был мёртв.
     """
     db.add(1, "Проходная", mode="record_only")
-    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "online": True,
-                                     "inboundBytes": 4096}})
+    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "available": True, "ready": True,
+                                     "online": True, "inboundBytes": 4096}})
 
     worker.publish_record_layer_status([(1, "Проходная")])
 
@@ -113,8 +120,8 @@ def test_record_only_camera_goes_online_from_record_layer(db, monkeypatch):
 def test_lost_stream_returns_camera_to_offline(db, monkeypatch):
     """Обратное направление: потеря потока обязана гасить камеру."""
     db.add(1, "Проходная", status="online")
-    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "online": False,
-                                     "inboundBytes": 0}})
+    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "available": False, "ready": False,
+                                     "online": True, "inboundBytes": 0}})
 
     worker.publish_record_layer_status([(1, "Проходная")])
 
@@ -143,8 +150,8 @@ def test_analytics_thread_does_not_override_record_layer(db, monkeypatch):
     мигает с записью в БД и публикацией в Redis на каждом обороте.
     """
     db.add(1, "Проходная", mode="analytics", status="online")
-    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "online": False,
-                                     "inboundBytes": 0}})
+    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "available": False, "ready": False,
+                                     "online": True, "inboundBytes": 0}})
     worker.publish_record_layer_status([(1, "Проходная")])
     assert db.status(1) == "offline"
 
@@ -175,8 +182,8 @@ def test_camera_leaving_record_layer_releases_ownership(db, monkeypatch):
     сообщает, а вердикт аналитики продолжал бы отбрасываться.
     """
     db.add(1, "Проходная", mode="analytics")
-    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "online": True,
-                                     "inboundBytes": 1}})
+    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "available": True, "ready": True,
+                                     "online": True, "inboundBytes": 1}})
     worker.publish_record_layer_status([(1, "Проходная")])
     assert 1 in worker._record_layer_owned
 

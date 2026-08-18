@@ -88,7 +88,8 @@ def test_record_layer_publishes_status_without_model(monkeypatch):
             pass
 
         def runtime_paths(self):
-            return {"cam1": {"name": "cam1", "online": True, "inboundBytes": 4096}}
+            return {"cam1": {"name": "cam1", "available": True, "ready": True,
+                    "online": True, "inboundBytes": 4096}}
 
     monkeypatch.setattr(worker, "MediaMTXClient", _Client)
     monkeypatch.setattr(worker, "_last_segment_ts", lambda ids: {})

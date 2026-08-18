@@ -177,6 +177,21 @@ function RecordLayerPanel() {
                       <td style={{ color: color(x.status), fontWeight: 600 }}>
                         {label(x.status)}
                         {gaps.includes(x.camera_id) && " · пропуск сегмента"}
+                        {/* Восстановление после обрыва (SPEC §19): воркер
+                            опрашивает камеру и пересоздаёт путь, как только
+                            она отвечает. Без этой строки «камера выключена»
+                            и «камера отвечает, а запись не идёт» выглядят
+                            здесь одинаково, а чинятся по-разному: первое —
+                            на объекте, второе — в настройках потока. */}
+                        {x.recovery && (
+                          <div className="muted" style={{ fontWeight: 400, fontSize: 12 }}>
+                            {x.recovery.camera_answering
+                              ? "камера отвечает по RTSP, восстанавливаю запись"
+                              : "камера не отвечает по RTSP"}
+                            {" · "}обрыв {Math.round(x.recovery.down_for_sec)} с
+                            {x.recovery.kicks > 0 && ` · попыток ${x.recovery.kicks}`}
+                          </div>
+                        )}
                       </td>
                       <td>{(x.inbound_bytes / 1048576).toFixed(1)} МБ</td>
                       <td style={{ color: x.frames_in_error ? "var(--orange)" : undefined }}>

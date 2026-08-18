@@ -97,7 +97,7 @@ def live(tmp_path_factory):
         "    source: publisher\n",
         encoding="utf-8")
 
-    mtx = subprocess.Popen([MEDIAMTX_BIN, str(conf)],
+    mtx = subprocess.Popen([MEDIAMTX_BIN, str(conf)], cwd=str(conf.parent),
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     client = MediaMTXClient(f"http://127.0.0.1:{api_port}", timeout=5)
     _wait(lambda: client.list_path_configs() is not None, 20,

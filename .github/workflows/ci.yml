@@ -166,7 +166,13 @@ jobs:
         run: pip install pytest
       - name: Run record layer tests against real MediaMTX
         working-directory: worker
-        run: pytest tests/test_record_layer_live.py -q
+        # Все наборы `*_live.py`, а не один перечисленный файл: цикл 43
+        # добавил ещё два (статус потока и его восстановление), и оба
+        # проверяют ровно тот класс расхождений с сервером, ради которого
+        # джоба заведена — семантику полей рантайма и поведение
+        # переподключения. Перечислять их руками значило бы, что третий
+        # такой набор молча не поедет в CI.
+        run: pytest tests/test_*_live.py -q
 
   upscaler:
     runs-on: ubuntu-latest
@@ -293,10 +299,18 @@ jobs:
         # «экспоненциальную задержку»: если бы она росла, короткий обрыв
         # укладывался бы в норматив, а длинный — нет.
         #
+        # С цикла 43 замер идёт ДВАЖДЫ: боевая конфигурация (супервизор
+        # восстановления включён) и прежняя, без него. Одного числа мало —
+        # выигрыш супервизора и разброс раннера иначе неразличимы, а
+        # сравнивать с числом прошлого цикла можно только внутри одной
+        # модели CPU (carryover циклов 39-41).
+        #
         # Бинарник MediaMTX уже скачан шагом замера remux выше.
         run: |
           MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
             python perf/bench_recovery.py | tee perf-recovery.txt
+          MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
+            python perf/bench_recovery.py --no-supervisor | tee perf-recovery-baseline.txt
 
       - name: Run analytics chain benchmark
         # Отдельным шагом, потому что тянет модель `buffalo_s` (~125 МБ) из
@@ -363,6 +377,7 @@ jobs:
             perf-rto-hang.txt
             perf-remux.txt
             perf-recovery.txt
+            perf-recovery-baseline.txt
 
   frontend:
     runs-on: ubuntu-latest

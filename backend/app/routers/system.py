@@ -194,13 +194,26 @@ async def record_layer_status(_=Depends(require_role("admin", "operator")),
             "record_root_warning": None,
         }
 
+    # Состояние восстановления (SPEC §19) приезжает от воркера отдельной
+    # картой по camera_id и здесь приклеивается к своему потоку: интерфейс
+    # показывает его в строке камеры, и раскладывать в нём вторую карту по
+    # ключу означало бы держать в UI то же соединение, только руками.
+    # Ключи после JSON — строки, поэтому сравнение идёт по str(camera_id).
+    recovery = payload.get("recovery") or {}
+    streams = payload.get("streams") or []
+    if isinstance(recovery, dict):
+        for stream in streams:
+            info = recovery.get(str(stream.get("camera_id")))
+            if info:
+                stream["recovery"] = info
+
     return {
         "available": True,
         "updated_at": payload.get("updated_at"),
         "cameras_enabled": enabled,
         "segments_last_day": segments_day,
         "gb_last_day": round(bytes_day / BYTES_PER_GB, 2),
-        "streams": payload.get("streams") or [],
+        "streams": streams,
         "summary": payload.get("summary"),
         "segment_gaps": payload.get("segment_gaps") or [],
         # Состояние слоя аналитики: отказ загрузки модели больше не роняет
