@@ -58,7 +58,7 @@ def _credentials() -> soap.Credentials | None:
                             password=settings.ONVIF_G_PASSWORD)
 
 
-def _require_auth(header) -> None:
+async def _require_auth(header) -> None:
     creds = _credentials()
     if creds is None:
         # Фича включена, но учётка не заведена: не пускаем никого.
@@ -67,6 +67,35 @@ def _require_auth(header) -> None:
             "ONVIF Profile G включён, но учётная запись не сконфигурирована",
             receiver=True)
     soap.verify_security(header, creds)
+    await _claim_nonce(header)
+
+
+async def _claim_nonce(header) -> None:
+    """Отбраковывает повторное предъявление того же UsernameToken.
+
+    Порядок важен: nonce занимается ПОСЛЕ проверки учётных данных, а не до.
+    Иначе кто угодно, не зная пароля, мог бы заранее занять чужие nonce и
+    отклонять законные запросы VMS — отказ в обслуживании через ту самую
+    защиту, которая от подмены и заводится.
+
+    Redis недоступен — отказ, а не пропуск. Profile G на нём и так стоит
+    (`FindRecordings` кладёт область поиска в Redis), поэтому «пропустить»
+    означало бы снять защиту в единственной ситуации, когда VMS всё равно
+    не сможет закончить поиск.
+    """
+    key = soap.nonce_cache_key(header)
+    if key is None:
+        return
+    try:
+        fresh = await get_redis().set(key, "1", ex=soap.NONCE_TTL_SEC, nx=True)
+    except Exception as exc:  # noqa: BLE001
+        raise soap.SoapError(
+            "ter:NotAuthorized",
+            "Проверка повторного использования nonce недоступна",
+            receiver=True) from exc
+    if not fresh:
+        raise soap.SoapError("ter:NotAuthorized",
+                             "Повторное использование nonce WS-Security")
 
 
 def _reply(xml: str, status: int = 200) -> Response:
@@ -295,7 +324,7 @@ async def _dispatch(request: Request, service: str) -> Response:
         # остальное — под WS-Security.
         open_actions = {"GetSystemDateAndTime", "GetServices", "GetServiceCapabilities"}
         if action not in open_actions:
-            _require_auth(header)
+            await _require_auth(header)
 
         if service == "device":
             if action == "GetServices":

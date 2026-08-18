@@ -372,5 +372,127 @@ def test_verify_security_stale_created_rejected():
         soap.verify_security(header, soap.Credentials("u", "s3cr3t"))
 
 
+# --- Повтор перехваченного UsernameToken (SPEC §12, §14) --------------------
+#
+# Проверка `Created` на свежесть режет повтор ТОЛЬКО через пять минут. Внутри
+# этого окна перехваченный заголовок принимался сколько угодно раз, а это
+# список камер объекта, границы архива и — при сконфигурированном источнике —
+# ссылка на воспроизведение записи. ONVIF Core требует помнить использованные
+# nonce; до цикла 39 кэша не было.
+
+
+def _digest_header(username: str, password: str, nonce: bytes,
+                   created: str | None = None) -> str:
+    """Полный UsernameToken с PasswordDigest — единственный тип пароля, в
+    котором nonce вообще есть."""
+    created = created or soap.iso_utc(datetime.now(timezone.utc))
+    digest = base64.b64encode(
+        hashlib.sha1(nonce + created.encode() + password.encode()).digest()
+    ).decode()
+    return (
+        "<s:Header><wsse:Security xmlns:wsse=\""
+        "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\" "
+        "xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/"
+        "oasis-200401-wss-wssecurity-utility-1.0.xsd\">"
+        f"<wsse:UsernameToken><wsse:Username>{username}</wsse:Username>"
+        "<wsse:Password Type=\"http://docs.oasis-open.org/wss/2004/01/"
+        "oasis-200401-wss-username-token-profile-1.0#PasswordDigest\">"
+        f"{digest}</wsse:Password>"
+        f"<wsse:Nonce>{base64.b64encode(nonce).decode()}</wsse:Nonce>"
+        f"<wsu:Created>{created}</wsu:Created>"
+        "</wsse:UsernameToken></wsse:Security></s:Header>"
+    )
+
+
+def _summary(client, header: str):
+    return client.post("/onvif/search_service",
+                       content=_envelope("<tse:GetRecordingSummary/>", header),
+                       headers=SOAP_CT)
+
+
+def test_replayed_username_token_is_rejected(client, onvif_on):
+    """Тот же заголовок второй раз — отказ, хотя `Created` ещё свежий и
+    дайджест по-прежнему верен."""
+    user, password = onvif_on
+    header = _digest_header(user, password, b"nonce-replay-0001")
+
+    first = _summary(client, header)
+    second = _summary(client, header)
+
+    assert _find(first.text, "GetRecordingSummaryResponse") is not None
+    assert _find(second.text, "Fault") is not None
+    assert "nonce" in second.text.lower()
+
+
+def test_fresh_nonce_still_passes(client, onvif_on):
+    """Позитивный контроль: защита не должна отбраковывать нормальную
+    работу VMS, который шлёт запросы подряд с новыми nonce."""
+    user, password = onvif_on
+
+    for i in range(3):
+        r = _summary(client, _digest_header(user, password, f"nonce-ok-{i}".encode()))
+        assert _find(r.text, "GetRecordingSummaryResponse") is not None, r.text
+
+
+def test_same_nonce_with_new_created_is_allowed(client, onvif_on):
+    """Спецификация не запрещает переиспользовать nonce с новым `Created`, и
+    клиенты так делают. Ключ по одному nonce ломал бы таких клиентов —
+    поэтому он считается от пары."""
+    user, password = onvif_on
+    nonce = b"nonce-reused-with-new-created"
+    now = datetime.now(timezone.utc)
+
+    first = _summary(client, _digest_header(user, password, nonce,
+                                            soap.iso_utc(now)))
+    second = _summary(client, _digest_header(user, password, nonce,
+                                             soap.iso_utc(now - timedelta(seconds=30))))
+
+    assert _find(first.text, "GetRecordingSummaryResponse") is not None
+    assert _find(second.text, "GetRecordingSummaryResponse") is not None, second.text
+
+
+def test_wrong_password_does_not_burn_the_nonce(client, onvif_on):
+    """Порядок проверок: nonce занимается ПОСЛЕ проверки пароля. Иначе кто
+    угодно, не зная пароля, занимал бы чужие nonce заранее и отклонял
+    законные запросы VMS — отказ в обслуживании через саму защиту."""
+    user, password = onvif_on
+    nonce = b"nonce-not-burned-by-attacker"
+
+    attacker = _summary(client, _digest_header(user, "wrong-password", nonce))
+    legitimate = _summary(client, _digest_header(user, password, nonce))
+
+    assert _find(attacker.text, "Fault") is not None
+    assert _find(legitimate.text, "GetRecordingSummaryResponse") is not None, \
+        legitimate.text
+
+
+def test_password_text_has_no_nonce_to_cache(client, onvif_on):
+    """PasswordText не содержит nonce вовсе: повтор такого заголовка не
+    отличим от нового запроса в принципе. Притворяться, что кэш здесь
+    что-то даёт, нельзя — и ломать этот путь тоже (защита у него TLS §14)."""
+    user, password = onvif_on
+    header = _security_header(user, password)
+
+    assert soap.nonce_cache_key(soap.parse_envelope(
+        _envelope("<tse:GetRecordingSummary/>", header).encode())[0]) is None
+    for _ in range(2):
+        r = _summary(client, header)
+        assert _find(r.text, "GetRecordingSummaryResponse") is not None
+
+
+def test_nonce_key_is_a_hash_not_the_raw_values():
+    """nonce и Created — часть материала дайджеста, и класть их в Redis в
+    открытую незачем: ключ читают другие процессы."""
+    header, _ = soap.parse_envelope(_envelope(
+        "<tse:GetRecordingSummary/>",
+        _digest_header("u", "p", b"raw-nonce-value")).encode())
+
+    key = soap.nonce_cache_key(header)
+
+    assert key is not None and key.startswith("onvif:g:nonce:")
+    assert "raw-nonce-value" not in key
+    assert base64.b64encode(b"raw-nonce-value").decode() not in key
+
+
 def test_iso_utc_naive_treated_as_utc():
     assert soap.iso_utc(datetime(2026, 8, 17, 10, 0, 0)) == "2026-08-17T10:00:00Z"
