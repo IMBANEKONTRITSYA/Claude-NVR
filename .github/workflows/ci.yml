@@ -256,6 +256,29 @@ jobs:
         # не перезапускает). Число сравнивается циклом с прошлым.
         run: python perf/bench_rto.py --hang-only | tee perf-rto-hang.txt
 
+      - name: Measure remux cost on real MediaMTX (SPEC §19, §16)
+        # §19 «remux ≤ 0.04 ядра/камера» и вилка §16, на которой стоит вся
+        # автоконфигурация (autoconfig.REC_CORES_PER_CAMERA). Замер
+        # существовал с цикла 32, но в CI не был подключён — то есть между
+        # циклами не отслеживался, хотя это удельная стоимость всего слоя
+        # записи.
+        #
+        # `--pull` — продакшн-конфигурация: MediaMTX сам открывает
+        # RTSP-соединение к камере. Прежний режим (push) её не покрывал, и
+        # это было записано как known gap; замерено, что клиент RTSP
+        # добавляет ~55 % CPU на камеру, то есть прежнее число занижало
+        # боевую стоимость.
+        run: |
+          set -euo pipefail
+          VER=$(grep -oP 'image:\s*bluenviron/mediamtx:\K\S+' docker-compose.yml)
+          mkdir -p "$RUNNER_TEMP/mtx"
+          curl -fsSL -o "$RUNNER_TEMP/mtx.tar.gz" \
+            "https://github.com/bluenviron/mediamtx/releases/download/v${VER}/mediamtx_v${VER}_linux_amd64.tar.gz"
+          tar xzf "$RUNNER_TEMP/mtx.tar.gz" -C "$RUNNER_TEMP/mtx" mediamtx
+          pip install psutil
+          MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
+            python perf/bench_remux.py --pull --quick 1 4 8 | tee perf-remux.json
+
       - name: Run analytics chain benchmark
         # Отдельным шагом, потому что тянет модель `buffalo_s` (~125 МБ) из
         # сети: отказ скачивания помечается в результате как `skipped` и не
@@ -269,6 +292,7 @@ jobs:
             perf-results.json
             perf-chain.json
             perf-rto-hang.txt
+            perf-remux.json
 
   frontend:
     runs-on: ubuntu-latest

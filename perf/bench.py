@@ -1014,7 +1014,61 @@ def bench_archive(keep: bool = False, log=None) -> dict:
 
 # --- runner ---------------------------------------------------------------
 
-def run(groups: set[str]) -> dict:
+# Величины цепочки, по которым цикл сравнивает себя с предыдущим. Медиана
+# берётся именно по ним; остальные поля берутся из прогона-медианы как есть,
+# чтобы `detector_duty`, `faces_detected` и `ms_*` остались согласованными
+# между собой, а не оказались склеены из разных прогонов.
+CHAIN_MEDIAN_KEYS = ("chain_fps", "cores_per_camera_at_target",
+                     "ms_cpu_per_frame", "ms_detect_embed")
+
+
+def median_of_runs(runs: list[dict]) -> dict:
+    """Сводит N прогонов цепочки в один результат по медиане.
+
+    Зачем: цикл 38 занёс в carryover, что `chain_fps` на общих раннерах
+    GitHub гуляет ±20 % при **нетронутом** коде аналитики (8.17 → 6.41 →
+    6.75 за три цикла, ни один PR не касался пути аналитики). Одиночный
+    прогон на таком железе не отличает регрессию от соседа по гипервизору,
+    то есть правило «деградация > 15 % — carryover P2» срабатывало на шуме
+    и молчало бы о настоящей просадке той же величины.
+
+    Медиана, а не среднее: выброс вверх (раннер простаивал) и выброс вниз
+    (сосед забрал ядро) сдвигают среднее, а медиану из трёх — нет.
+
+    Возвращается прогон, ближайший к медиане по `chain_fps`, дополненный
+    полями `*_median`, `*_runs` и `spread_pct` — разбросом между лучшим и
+    худшим прогоном. Разброс печатается намеренно: если он сам по себе
+    больше 15 %, сравнивать циклы по этим числам нельзя вообще, и об этом
+    надо знать, а не узнавать через цикл.
+    """
+    ok = [r for r in runs if r and "error" not in r and "skipped" not in r]
+    if not ok:
+        return runs[0] if runs else {"error": "нет ни одного прогона"}
+    if len(ok) == 1:
+        return dict(ok[0], repeats=1)
+
+    fps = sorted(r["chain_fps"] for r in ok)
+    med_fps = statistics.median(fps)
+    # Представитель — прогон, чей chain_fps ближе всего к медиане: все
+    # остальные его поля описывают один и тот же прогон, а не смесь.
+    base = min(ok, key=lambda r: abs(r["chain_fps"] - med_fps))
+    out = dict(base)
+    out["repeats"] = len(ok)
+    for key in CHAIN_MEDIAN_KEYS:
+        vals = [r[key] for r in ok if r.get(key) is not None]
+        if vals:
+            out[f"{key}_median"] = round(statistics.median(vals), 3)
+            out[f"{key}_runs"] = vals
+    out["spread_pct"] = round((fps[-1] - fps[0]) / fps[0] * 100, 1) if fps[0] else None
+    # Вердикты §19/§16 выносятся по медиане, а не по прогону-представителю:
+    # именно медиана — то число, которое цикл сравнивает с нормативом.
+    out["meets_target"] = out["chain_fps_median"] >= DETECTION_FPS_TARGET
+    out["meets_cores_budget"] = (out["cores_per_camera_at_target_median"]
+                                 <= ANALYTICS_CORES_PER_CAMERA_SPEC)
+    return out
+
+
+def run(groups: set[str], chain_repeats: int = 1) -> dict:
     result: dict = {
         "cpu": _cpu_name(),
         "cores": os.cpu_count(),
@@ -1053,7 +1107,12 @@ def run(groups: set[str]) -> dict:
                 if "error" in made:
                     result["chain"] = {"skipped": made["error"]}
                 else:
-                    result["chain"] = bench_analytics_chain(face_clip)
+                    # Клип и модель готовятся один раз, повторяется только
+                    # сам замер: греть ONNX Runtime заново на каждый прогон
+                    # значило бы мерить загрузку модели, а не цепочку.
+                    runs = [bench_analytics_chain(face_clip)
+                            for _ in range(max(1, chain_repeats))]
+                    result["chain"] = median_of_runs(runs)
                     result["chain"]["clip"] = made
         if "archive" in groups:
             result["archive"] = bench_archive(
@@ -1104,6 +1163,10 @@ def main() -> int:
                     choices=["decode", "prefilter", "inference", "chain",
                              "facesearch", "archive"],
                     help="выполнить только указанные группы (можно повторять)")
+    ap.add_argument("--repeat", type=int, default=1, metavar="N",
+                    help="повторить замер цепочки N раз и взять медиану "
+                         "(carryover цикла 38: одиночный прогон на общем "
+                         "раннере гуляет ±20%% при нетронутом коде)")
     args = ap.parse_args()
 
     # facesearch и archive не входят в набор по умолчанию: они засевают
@@ -1114,7 +1177,7 @@ def main() -> int:
     # сети (~125 МБ) и идёт минуты, а не секунды. Запускается явно
     # (`--only chain`) — как facesearch и archive.
     groups = set(args.only) if args.only else {"decode", "prefilter", "inference"}
-    res = run(groups)
+    res = run(groups, chain_repeats=args.repeat)
 
     if args.json:
         print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1168,8 +1231,21 @@ def main() -> int:
             print(f"  найдено лиц: {ch['faces_detected']} за {ch['detector_runs']} "
                   f"прогонов детектора из {ch['frames']} кадров")
             verdict = "укладывается" if ch["meets_target"] else "НЕ УКЛАДЫВАЕТСЯ"
-            print(f"  ИТОГО цепочка: {ch['chain_fps']:.2f} FPS/канал — {verdict} "
+            headline = ch.get("chain_fps_median", ch["chain_fps"])
+            print(f"  ИТОГО цепочка: {headline:.2f} FPS/канал — {verdict} "
                   f"в норматив {ch['target_fps']:.0f} FPS")
+            if ch.get("repeats", 1) > 1:
+                runs = ", ".join(f"{v:.2f}" for v in ch["chain_fps_runs"])
+                print(f"  медиана из {ch['repeats']} прогонов: [{runs}], "
+                      f"разброс {ch['spread_pct']:.1f}%")
+                # Порог carryover для деградации — 15%. Если сам разброс
+                # между прогонами его перекрывает, сравнивать циклы по
+                # этому числу нельзя, и это надо печатать, а не выводить
+                # задним числом в отчёте.
+                if ch["spread_pct"] is not None and ch["spread_pct"] > 15:
+                    print("  ВНИМАНИЕ: разброс между прогонами больше порога "
+                          "деградации (15%) — сравнение с прошлым циклом "
+                          "по этому числу недостоверно")
             # Второй норматив того же замера: стоимость канала в ядрах
             # (§16). Именно по ней автоконфигурация считает, сколько камер
             # analytics предложить, и она же входит в §19 «CPU ≤ 80 %».
@@ -1177,7 +1253,9 @@ def main() -> int:
                              else "НЕ УКЛАДЫВАЕТСЯ")
             print(f"  {'CPU на кадр':28} {ch['ms_cpu_per_frame']:8.2f} мс "
                   f"(детектор на {ch['detector_duty'] * 100:.0f}% кадров)")
-            print(f"  ИТОГО стоимость канала: {ch['cores_per_camera_at_target']:.3f} "
+            cores = ch.get("cores_per_camera_at_target_median",
+                           ch["cores_per_camera_at_target"])
+            print(f"  ИТОГО стоимость канала: {cores:.3f} "
                   f"ядра при {ch['target_fps']:.0f} FPS — {cores_verdict} "
                   f"в вилку §16 (≤ {ch['cores_per_camera_spec']} ядра/камера)")
 
