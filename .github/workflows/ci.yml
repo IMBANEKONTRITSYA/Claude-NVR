@@ -277,7 +277,7 @@ jobs:
           tar xzf "$RUNNER_TEMP/mtx.tar.gz" -C "$RUNNER_TEMP/mtx" mediamtx
           pip install psutil
           MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
-            python perf/bench_remux.py --pull --quick 1 4 8 | tee perf-remux.json
+            python perf/bench_remux.py --pull --quick 1 4 8 | tee perf-remux.txt
 
       - name: Run analytics chain benchmark
         # Отдельным шагом, потому что тянет модель `buffalo_s` (~125 МБ) из
@@ -292,7 +292,7 @@ jobs:
             perf-results.json
             perf-chain.json
             perf-rto-hang.txt
-            perf-remux.json
+            perf-remux.txt
 
   frontend:
     runs-on: ubuntu-latest
