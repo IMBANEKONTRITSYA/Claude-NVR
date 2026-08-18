@@ -36,6 +36,7 @@ from record_layer import (
     path_name,
     record_media_root,
     record_path_template,
+    record_root_divergence,
     segments_dir,
     sync_paths,
 )
@@ -264,6 +265,28 @@ def test_segment_naming_survives_custom_media_path(monkeypatch):
     rendered = template.replace("%path", path_name(7)).replace("%s", "1754460000") + ".mp4"
     assert rendered == "/data/archive/segments/cam7_1754460000.mp4"
     assert parse_segment_name(os.path.basename(rendered)) == (7, 1754460000)
+
+
+def test_no_divergence_reported_when_roots_agree():
+    """Штатное развёртывание — предупреждения нет. Позитивный контроль:
+    иначе баннер висел бы всегда и его перестали бы читать."""
+    assert record_root_divergence("/media", "/media") is None
+    assert record_root_divergence("/var/lib/facewatch/media",
+                                  "/var/lib/facewatch/media") is None
+
+
+def test_trailing_slash_is_not_a_divergence():
+    """`MEDIA_PATH=/media/` против `/media` — одно и то же место."""
+    assert record_root_divergence("/media/", "/media") is None
+
+
+def test_divergence_text_names_both_directories():
+    """Расхождение обязано называть оба каталога: иначе предупреждение
+    сообщает, что что-то не так, но не помогает это починить."""
+    msg = record_root_divergence("/media", "/recordings")
+    assert msg is not None
+    assert "/recordings/segments/%path_%s" in msg
+    assert "/media/segments" in msg
 
 
 def test_retention_left_to_worker_not_mediamtx():

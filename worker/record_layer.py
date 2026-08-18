@@ -97,6 +97,27 @@ def segments_dir(media_root: str) -> str:
     return os.path.join(media_root, "segments")
 
 
+def record_root_divergence(media_path: str, record_root: str) -> str | None:
+    """Текст расхождения «куда пишет MediaMTX» и «где ищет архив», либо None.
+
+    Развести пути законно — MediaMTX может видеть тот же том по своему
+    адресу, — но это единственная оставшаяся конфигурация, в которой архив
+    молча оказывается пустым, а retention не удаляет ничего. Поэтому она
+    обязана быть видна: возвращённый текст уезжает в состояние слоя записи
+    и показывается на карточке «Слой записи».
+
+    Живёт здесь, а не в `worker.py`, намеренно: этот модуль на одном
+    stdlib и прогоняется в CI-джобе воркера целиком, тогда как `worker.py`
+    там не импортируется вовсе (нет cv2).
+    """
+    if record_root.rstrip("/") == (media_path or "").rstrip("/"):
+        return None
+    return (f"MediaMTX пишет в {record_path_template(record_root)}, "
+            f"архив сканирует {segments_dir(media_path)}. Это верно, только "
+            f"если оба пути — один и тот же том, смонтированный по-разному "
+            f"(MEDIAMTX_MEDIA_PATH={record_root}, MEDIA_PATH={media_path}).")
+
+
 def path_conf(rtsp_url: str, *, segment_duration_min: int = 5,
               media_root: str | None = None) -> dict:
     """Конфигурация одного пути MediaMTX для камеры слоя записи.

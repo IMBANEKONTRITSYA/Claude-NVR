@@ -51,8 +51,9 @@ from motion_windows import (DEFAULT_GUARD_SEC, MotionWindowTracker,
                             SETTLE_SEC as MOTION_SETTLE_SEC,
                             segments_without_motion)
 from record_layer import (MediaMTXClient, path_conf, path_name,
-                          record_media_root, record_path_template, redact_url,
-                          segments_dir, sync_paths)
+                          record_media_root, record_path_template,
+                          record_root_divergence, redact_url, segments_dir,
+                          sync_paths)
 from record_status import (UNKNOWN, newly_lost, newly_restored, segment_gaps,
                            stream_states, summarize)
 from segment_index import index_new_segments
@@ -1989,18 +1990,11 @@ def log_record_root() -> str | None:
                 extra={"mediamtx_record_path": write, "indexer_scan_dir": scan,
                        "media_path": MEDIA_PATH,
                        "mediamtx_media_root": RECORD_MEDIA_ROOT})
-    if RECORD_MEDIA_ROOT == MEDIA_PATH.rstrip("/"):
-        return None
-    # Развести пути законно (MediaMTX в контейнере видит том по своему
-    # адресу), но это единственная оставшаяся конфигурация, в которой архив
-    # может молча оказаться пустым, — поэтому она обязана быть видна.
-    msg = (f"MEDIAMTX_MEDIA_PATH={RECORD_MEDIA_ROOT} отличается от "
-           f"MEDIA_PATH={MEDIA_PATH}: MediaMTX пишет в {write}, архив "
-           f"сканирует {scan}. Это верно, только если оба пути — один и тот "
-           f"же том, смонтированный по-разному.")
-    logger.warning("слой записи: корни медиаданных разведены",
-                   extra={"mediamtx_record_path": write,
-                          "indexer_scan_dir": scan})
+    msg = record_root_divergence(MEDIA_PATH, RECORD_MEDIA_ROOT)
+    if msg:
+        logger.warning("слой записи: корни медиаданных разведены",
+                       extra={"mediamtx_record_path": write,
+                              "indexer_scan_dir": scan})
     return msg
 
 

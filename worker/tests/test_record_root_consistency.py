@@ -24,7 +24,14 @@ import pytest
 
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 
-import worker  # noqa: E402
+# CI-джоба воркера намеренно не ставит cv2/insightface (см. шапку
+# record_layer.py), а `worker.py` импортирует cv2 на верхнем уровне. Без
+# этой обёртки модуль ронял бы сбор тестов, а не пропускался. Сам разбор
+# путей проверяется без `worker` — в test_record_layer.py, который живёт на
+# одном stdlib и в этой джобе прогоняется целиком.
+worker = pytest.importorskip(
+    "worker", reason="требует полный requirements.txt воркера (cv2 и т.д.)"
+)
 
 
 @pytest.fixture()
