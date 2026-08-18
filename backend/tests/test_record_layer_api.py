@@ -108,6 +108,34 @@ def test_segment_gaps_are_exposed(client, admin_headers, publish_state):
     assert d["segment_gaps"] == [5]
 
 
+def test_record_root_warning_reaches_monitoring(client, admin_headers, publish_state):
+    """SPEC §5 «путь архива конфигурируется под отдельный диск»: если корень
+    записи MediaMTX разведён с корнем архива, сегменты пишутся в один
+    каталог, а индексируются из другого. Наружу это выходит как «пропуск
+    записи» сразу на всех камерах — по такому симптому причина не читается,
+    поэтому воркер передаёт её текстом, а мониторинг обязан её показать."""
+    payload = _payload([{"camera_id": 1, "name": "Вход", "status": "online",
+                         "inbound_bytes": 10, "online_since": None,
+                         "frames_in_error": 0}])
+    payload["record_root_warning"] = "MediaMTX пишет в /recordings/segments, архив сканирует /media/segments"
+    publish_state(payload)
+
+    d = client.get("/api/system/record-layer", headers=admin_headers).json()
+    assert d["record_root_warning"] == payload["record_root_warning"]
+
+
+def test_record_root_warning_absent_when_roots_agree(client, admin_headers, publish_state):
+    """Позитивный контроль: на согласованных каталогах поля нет — иначе
+    предупреждение висело бы на каждом штатном развёртывании и его
+    перестали бы читать."""
+    publish_state(_payload([{"camera_id": 1, "name": "Вход", "status": "online",
+                             "inbound_bytes": 10, "online_since": None,
+                             "frames_in_error": 0}]))
+
+    d = client.get("/api/system/record-layer", headers=admin_headers).json()
+    assert d["record_root_warning"] is None
+
+
 def test_corrupted_redis_payload_does_not_break_endpoint(client, admin_headers, redis_key):
     """Мусор в ключе (чужой писатель, оборванная запись) не должен ронять
     мониторинг — он деградирует до «нет данных»."""

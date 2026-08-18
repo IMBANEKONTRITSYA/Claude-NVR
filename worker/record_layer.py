@@ -48,7 +48,57 @@ def camera_id_from_path(name: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def path_conf(rtsp_url: str, *, segment_duration_min: int = 5) -> dict:
+# Корень медиаданных по умолчанию — тот, что смонтирован в docker-compose.
+# В режиме 2 §26 (.deb + systemd) архив лежит в /var/lib/facewatch/media и
+# «путь архива конфигурируется под отдельный диск» (§5, §26), поэтому
+# захардкоженного значения быть не может.
+DEFAULT_MEDIA_ROOT = "/media"
+
+
+def record_media_root(env: dict | None = None) -> str:
+    """Корень медиаданных **глазами MediaMTX** — то, что подставляется в
+    `recordPath`.
+
+    Два источника, в порядке убывания приоритета:
+
+    * `MEDIAMTX_MEDIA_PATH` — явный переопределитель для случая, когда
+      MediaMTX видит тот же том по другому пути, чем воркер. В
+      docker-compose это не так (оба монтируют том в `/media`), но развести
+      монтирования никто не мешает, и тогда «вывести из `MEDIA_PATH`» даёт
+      молча пустой архив;
+    * `MEDIA_PATH` — общий корень медиаданных сервисов. В режиме 2 §26 все
+      процессы на одном хосте, поэтому он же и есть путь MediaMTX.
+
+    Возвращается путь без хвостового слэша: он склеивается со `/segments/…`.
+    """
+    src = os.environ if env is None else env
+    root = (src.get("MEDIAMTX_MEDIA_PATH") or src.get("MEDIA_PATH")
+            or DEFAULT_MEDIA_ROOT).strip()
+    root = root.rstrip("/")
+    return root or DEFAULT_MEDIA_ROOT
+
+
+def record_path_template(media_root: str | None = None) -> str:
+    """Шаблон `recordPath` для MediaMTX под заданный корень медиаданных.
+
+    `%s` — unix epoch, `%path` — имя пути (`cam{id}`); расширение MediaMTX
+    добавляет сам. Даёт ровно `cam{camera_id}_{unix_ts}.mp4` (SPEC §20) в
+    том же каталоге `segments/`, который сканирует индексация архива и
+    чистит retention.
+    """
+    root = (media_root if media_root is not None
+            else record_media_root()).rstrip("/") or DEFAULT_MEDIA_ROOT
+    return f"{root}/segments/%path_%s"
+
+
+def segments_dir(media_root: str) -> str:
+    """Каталог сегментов внутри корня медиаданных — единая точка, из которой
+    его берут и `recordPath`, и индексация, и ротация."""
+    return os.path.join(media_root, "segments")
+
+
+def path_conf(rtsp_url: str, *, segment_duration_min: int = 5,
+              media_root: str | None = None) -> dict:
     """Конфигурация одного пути MediaMTX для камеры слоя записи.
 
     `sourceOnDemand: False` — принципиально: с `True` MediaMTX тянет камеру
@@ -63,15 +113,16 @@ def path_conf(rtsp_url: str, *, segment_duration_min: int = 5) -> dict:
     ведёт воркер (`cleanup_old()`), потому что он удаляет файл вместе со
     строкой `video_segments`, а MediaMTX о БД не знает и оставил бы
     висячие строки архива, указывающие на несуществующие файлы.
+
+    `media_root` — корень медиаданных глазами MediaMTX; None означает
+    «взять из окружения» (`record_media_root()`).
     """
     return {
         "source": rtsp_url,
         "sourceOnDemand": False,
         "record": True,
         "recordFormat": "fmp4",
-        # %s — unix epoch, %path — имя пути (cam{id}); расширение MediaMTX
-        # добавляет сам. Даёт ровно `cam{camera_id}_{unix_ts}.mp4` (SPEC §20).
-        "recordPath": "/media/segments/%path_%s",
+        "recordPath": record_path_template(media_root),
         "recordSegmentDuration": f"{int(segment_duration_min)}m",
         "recordDeleteAfter": "0s",
     }
@@ -80,7 +131,7 @@ def path_conf(rtsp_url: str, *, segment_duration_min: int = 5) -> dict:
 # Ключи, по которым сверяется уже заведённый в MediaMTX путь. Сравнивать
 # весь ответ `/v3/config/paths/list` бессмысленно: MediaMTX возвращает все
 # ~80 полей PathConf с дефолтами, которых мы не задаём.
-_MANAGED_KEYS = tuple(path_conf("rtsp://x/y").keys())
+_MANAGED_KEYS = tuple(path_conf("rtsp://x/y", media_root=DEFAULT_MEDIA_ROOT).keys())
 
 
 class MediaMTXError(RuntimeError):

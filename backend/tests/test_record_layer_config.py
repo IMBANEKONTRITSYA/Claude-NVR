@@ -95,10 +95,39 @@ def test_record_defaults_are_remux_and_continuous():
     )
 
 
+def _compose_media_path(service: str) -> str:
+    return str(COMPOSE["services"][service]["environment"]["MEDIA_PATH"])
+
+
 def test_record_path_matches_spec_naming():
     """SPEC §20: `cam{camera_id}_{unix_ts}.mp4`. Ротация (`worker/fileage.py`)
     и индексация разбирают именно это имя."""
     assert MEDIAMTX["pathDefaults"]["recordPath"] == "/media/segments/%path_%s"
+
+
+def test_mediamtx_default_record_path_matches_compose_media_path():
+    """Значение из `mediamtx.yml` — это режим 1 §26 (docker-compose), и оно
+    обязано указывать в тот же каталог, который воркер сканирует как
+    `MEDIA_PATH`. Разъедутся — MediaMTX пишет в один каталог, архив
+    индексирует другой, и вся §5 (архив, retention, индикация диска)
+    работает вхолостую: строк в `video_segments` нет, файлы никто не
+    удаляет, диск заполняется до отказа.
+
+    Сам шаблон в коде уже не захардкожен (`record_layer.record_path_template`,
+    цикл 39) — здесь стережётся статический конфиг, до которого код не
+    дотягивается."""
+    media = _compose_media_path("worker").rstrip("/")
+    assert MEDIAMTX["pathDefaults"]["recordPath"] == f"{media}/segments/%path_%s"
+
+
+def test_all_services_share_one_media_path():
+    """Бэкенд, воркер и апскейлер обязаны видеть один и тот же корень
+    медиаданных: по нему считается свободное место (§5 «индикация
+    заполнения диска»), по нему же отдаются файлы архива."""
+    paths = {svc: _compose_media_path(svc)
+             for svc in ("backend", "worker", "upscaler")
+             if "MEDIA_PATH" in (COMPOSE["services"][svc].get("environment") or {})}
+    assert len(set(paths.values())) == 1, paths
 
 
 def _executable_tokens(source: str) -> set[str]:
