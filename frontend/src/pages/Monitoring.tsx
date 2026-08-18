@@ -296,15 +296,38 @@ function AutoConfigPanel() {
   );
 }
 
-/** Калькулятор хранения (SPEC §21): битрейт × камеры × дни → требуемый объём. */
+/** Калькулятор хранения (SPEC §16): битрейт × камеры × дни → требуемый объём.
+ *
+ * Поля «Камер» и «Глубина хранения» при открытии пусты не по недосмотру:
+ * сервер подставляет фактическое число включённых камер и настроенный
+ * retention, и первый ответ относится к ЭТОЙ системе. Раньше в форме
+ * стояло `cameras: 120`, и администратор объекта на 32 камеры при каждом
+ * открытии видел расчёт для 120 — §22 прямо запрещает хардкодить число
+ * камер, а §16 требует «формулы и калькуляторы вместо фиксированных чисел».
+ *
+ * Как только человек введёт своё число, оно и уходит на сервер — сценарий
+ * «что если камер станет вдвое больше» работает как работал.
+ */
 function StorageCalculator() {
-  const [f, setF] = useState({ bitrate_kbps: 2048, cameras: 120, days: 14 });
+  // undefined ≠ 0: «не задано, возьми фактическое» против «ноль камер».
+  const [f, setF] = useState<{ bitrate_kbps: number; cameras?: number; days?: number }>(
+    { bitrate_kbps: 2048, cameras: undefined, days: undefined });
   const [res, setRes] = useState<any>(null);
   const [err, setErr] = useState("");
 
-  const calc = () => api.storageCalc(f.bitrate_kbps, f.cameras, f.days)
-    .then(r => { setRes(r); setErr(""); })
-    .catch(e => { setRes(null); setErr(e.message); });
+  const calc = (over?: { cameras?: number; days?: number }) =>
+    api.storageCalc(f.bitrate_kbps, over?.cameras ?? f.cameras, over?.days ?? f.days)
+      .then(r => {
+        setRes(r); setErr("");
+        // Подставленные сервером значения показываем в полях: иначе форма
+        // пуста, а результат посчитан — непонятно, для чего именно.
+        setF(prev => ({
+          ...prev,
+          cameras: prev.cameras ?? r.cameras,
+          days: prev.days ?? r.days,
+        }));
+      })
+      .catch(e => { setRes(null); setErr(e.message); });
 
   useEffect(() => { calc(); }, []);
 
@@ -322,16 +345,24 @@ function StorageCalculator() {
         </div>
         <div>
           <label>Камер</label>
-          <input type="number" min={1} max={1000} value={f.cameras}
-            onChange={e => setF({ ...f, cameras: Number(e.target.value) })} />
+          <input type="number" min={1} max={1000} value={f.cameras ?? ""}
+            placeholder="сейчас в системе"
+            onChange={e => setF({ ...f, cameras: e.target.value === "" ? undefined : Number(e.target.value) })} />
         </div>
         <div>
           <label>Глубина хранения, суток</label>
-          <input type="number" min={1} max={3650} value={f.days}
-            onChange={e => setF({ ...f, days: Number(e.target.value) })} />
+          <input type="number" min={1} max={3650} value={f.days ?? ""}
+            placeholder="из настроек"
+            onChange={e => setF({ ...f, days: e.target.value === "" ? undefined : Number(e.target.value) })} />
         </div>
       </div>
-      <button className="btn" style={{ marginTop: 8 }} onClick={calc}>Рассчитать</button>
+      {res?.cameras_source === "fallback_empty" && (
+        <div className="muted" style={{ marginTop: 8 }}>
+          Камеры ещё не заведены — расчёт показан для одной. Введите
+          планируемое число.
+        </div>
+      )}
+      <button className="btn" style={{ marginTop: 8 }} onClick={() => calc()}>Рассчитать</button>
       {err && <div className="empty" style={{ marginTop: 8 }}>{err}</div>}
       {res && (
         <div className="row" style={{ marginTop: 12 }}>

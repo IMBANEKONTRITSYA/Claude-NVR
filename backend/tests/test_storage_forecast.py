@@ -190,6 +190,71 @@ def test_calculator_is_admin_only(client, make_user_headers):
     assert r.status_code == 403
 
 
+# --- умолчания калькулятора берутся из системы, а не из константы ---------
+#
+# §22 «Запрещено: хардкодить количество камер», §16 «формулы и калькуляторы
+# вместо фиксированных чисел». До цикла 38 в сигнатуре стояло
+# `cameras: int = Query(120)`, и у администратора объекта на 32 камеры
+# калькулятор при каждом открытии считал объём для 120 — заведомо неверный
+# ответ до того, как человек что-то ввёл.
+
+
+def test_calculator_defaults_to_actual_camera_count(client, admin_headers, make_camera):
+    """Без параметра `cameras` считается фактическое число включённых камер."""
+    make_camera("calc-default-1")
+    make_camera("calc-default-2")
+    make_camera("calc-default-3")
+
+    d = client.get("/api/system/storage/calculator", headers=admin_headers).json()
+    enabled = client.get("/api/system/storage", headers=admin_headers).json()["cameras_recording"]
+
+    assert d["cameras"] == enabled, "калькулятор обязан считать для этой системы"
+    assert d["cameras"] != 120 or enabled == 120, "число 120 больше не подставляется"
+    assert d["cameras_source"] == "actual"
+
+
+def test_calculator_defaults_to_configured_retention(client, admin_headers):
+    """Без параметра `days` берётся настроенный retention, а не константа 14."""
+    client.put("/api/settings", json={"retention_days": 21}, headers=admin_headers)
+    try:
+        d = client.get("/api/system/storage/calculator", headers=admin_headers).json()
+        assert d["days"] == 21
+        assert d["days_source"] == "actual"
+    finally:
+        client.put("/api/settings", json={"retention_days": 14}, headers=admin_headers)
+
+
+def test_explicit_params_still_win(client, admin_headers, make_camera):
+    """Позитивный контроль: сценарий «а что если» обязан работать как раньше.
+
+    Без него «фикс», намертво прибивающий калькулятор к текущему состоянию
+    системы, прошёл бы оба теста выше — и убил бы весь смысл калькулятора,
+    который в том и состоит, чтобы считать для ещё не существующего объёма.
+    """
+    make_camera("calc-explicit")
+    d = client.get("/api/system/storage/calculator",
+                   params={"cameras": 250, "days": 30, "bitrate_kbps": 2000},
+                   headers=admin_headers).json()
+    assert d["cameras"] == 250 and d["days"] == 30
+    assert d["cameras_source"] == "requested" and d["days_source"] == "requested"
+    # И число действительно посчитано по введённым параметрам, а не по факту.
+    assert d["gb_per_day_total"] == pytest.approx(21.6 * 250, rel=0.01)
+
+
+def test_calculator_on_empty_system_does_not_return_zero(client, admin_headers):
+    """Пустая система: ноль камер — это отсутствие данных, а не ответ «0 ГБ».
+
+    Тест идёт на базе, где камеры могли остаться от соседних тестов,
+    поэтому проверяется свойство, а не конкретное число: расчёт не должен
+    вырождаться в ноль ни при каком состоянии БД.
+    """
+    d = client.get("/api/system/storage/calculator", headers=admin_headers).json()
+    assert d["cameras"] >= 1
+    assert d["required_gb"] > 0
+    if d["cameras_source"] == "fallback_empty":
+        assert d["cameras"] == 1
+
+
 # --- retention по камере через API камер (SPEC §5) ------------------------
 
 def test_camera_retention_roundtrip(client, admin_headers, make_camera):

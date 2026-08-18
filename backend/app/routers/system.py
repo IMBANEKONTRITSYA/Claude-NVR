@@ -308,22 +308,61 @@ async def storage_report(_=Depends(require_role("admin", "operator")),
 @router.get("/storage/calculator")
 async def storage_calculator(
     bitrate_kbps: int = Query(2048, ge=64, le=100_000),
-    cameras: int = Query(120, ge=1, le=1000),
-    days: int = Query(14, ge=1, le=3650),
+    cameras: int | None = Query(None, ge=1, le=1000),
+    days: int | None = Query(None, ge=1, le=3650),
     _=Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Калькулятор хранения SPEC §21: битрейт × камеры × дни → требуемый объём.
+    """Калькулятор хранения SPEC §16: битрейт × камеры × дни → требуемый объём.
 
-    Отдельно от `/storage`: там — что происходит сейчас, здесь — «что если»,
-    и параметры приходят от администратора, а не из БД. Границы у всех трёх
-    numeric-параметров заданы явно (`Query(ge=, le=)`), иначе
-    `days=999999999` даёт переполнение в интерфейсе на пустом месте.
+    Отдельно от `/storage`: там — что происходит сейчас, здесь — «что если».
+
+    **Умолчания берутся из системы, а не из константы.** Раньше здесь стояло
+    `cameras = 120` и `days = 14`, и это было нарушением §22 («Запрещено
+    хардкодить количество камер») с прямым следствием для пользователя: у
+    администратора объекта на 32 камеры калькулятор при каждом открытии
+    считал объём для 120 — то есть выдавал заведомо неверный ответ до того,
+    как человек что-то введёт, а §16 требует ровно обратного, «формулы и
+    калькуляторы вместо фиксированных чисел».
+
+    Теперь `cameras` по умолчанию — фактическое число включённых камер, а
+    `days` — глобальная настройка retention. Оба параметра остаются
+    переопределяемыми: смысл калькулятора «что если» никуда не делся, и
+    сценарий «а если камер станет вдвое больше» работает как работал.
+
+    Что именно подставилось, видно в ответе (`cameras_source`,
+    `days_source`): интерфейс обязан отличать «посчитано для вашей системы»
+    от «посчитано для введённого вами числа», иначе подстановка становится
+    новым молчаливым умолчанием — тем же, от которого уходим.
+
+    Границы у всех трёх numeric-параметров заданы явно (`Query(ge=, le=)`),
+    иначе `days=999999999` даёт переполнение в интерфейсе на пустом месте.
     """
+    cameras_source = "requested"
+    if cameras is None:
+        cameras_source = "actual"
+        enabled = (await db.execute(
+            select(func.count()).select_from(Camera).where(Camera.enabled == True)  # noqa: E712
+        )).scalar_one()
+        # Пустая система (камер ещё не завели) — считаем для одной: ноль
+        # обнулил бы весь расчёт и показал «нужно 0 ГБ», что выглядит как
+        # ответ, хотя это отсутствие данных.
+        cameras = max(int(enabled), 1)
+        if not enabled:
+            cameras_source = "fallback_empty"
+
+    days_source = "requested"
+    if days is None:
+        days_source = "actual"
+        days = await _setting_int(db, "retention_days", 14)
+
     gb = required_gb(bitrate_kbps, cameras, days)
     return {
         "bitrate_kbps": bitrate_kbps,
         "cameras": cameras,
+        "cameras_source": cameras_source,
         "days": days,
+        "days_source": days_source,
         "gb_per_day_per_camera": round(nominal_gb_per_day(bitrate_kbps), 2),
         "gb_per_day_total": round(nominal_gb_per_day(bitrate_kbps, cameras), 1),
         "required_gb": round(gb, 1),
