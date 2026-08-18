@@ -20,6 +20,13 @@ os.environ.setdefault("ALLOW_INSECURE_DEFAULT_SECRETS", "true")
 # (test_integration_report_schedules.py), поэтому фоновый цикл в тестах
 # гасится — прогон становится детерминированным. См. main.py:lifespan.
 os.environ.setdefault("FACEWATCH_DISABLE_REPORT_SCHEDULER", "true")
+# Сторож живости убивает процесс, когда цикл событий не отмечался дольше
+# бюджета (app/liveness.py). В прогоне это ложное срабатывание, а не
+# находка: TestClient крутит цикл рывками — между тестами он простаивает,
+# а отладчик или точка останова останавливают его совсем. Решение сторожа
+# проверяется своим набором (test_liveness_watchdog.py) на управляемых
+# часах, поэтому здесь он гасится, а не подстраивается бюджетом.
+os.environ.setdefault("BACKEND_WATCHDOG_ENABLED", "0")
 
 from app.config import settings  # noqa: E402  (после setdefault выше)
 

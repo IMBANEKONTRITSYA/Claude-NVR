@@ -22,6 +22,8 @@ from .routers import system as r_system
 from .routers import onvif as r_onvif
 from .services import thumbs as thumbs_svc
 from .audit import AuditMiddleware
+from .liveness import (LoopHeartbeat, beat_loop,
+                       start_watchdog as start_liveness_watchdog)
 from .logging_utils import configure_logging
 
 logger = configure_logging("facewatch.backend")
@@ -244,9 +246,34 @@ async def lifespan(app: FastAPI):
         None if scheduler_disabled
         else asyncio.create_task(scheduler_loop(reports_stop))
     )
+
+    # Сторож живости (§13 «авторестарт сервисов», §19 RTO ≤ 5 минут).
+    #
+    # Закрывает класс отказа «сервис жив и не отвечает»: Docker НЕ
+    # перезапускает контейнер по проваленному healthcheck — он лишь метит
+    # его `unhealthy`, и заблокированный бэкенд в этом состоянии живёт
+    # сколько угодно. `/api/health` про это честно отвечает 503, но между
+    # «нездоров» и «перезапущен» до цикла 38 не было ничего. Подробности —
+    # `liveness.py`.
+    liveness_stop = asyncio.Event()
+    loop_hb = LoopHeartbeat()
+    loop_beat_task = asyncio.create_task(beat_loop(loop_hb, liveness_stop))
+    app.state.loop_heartbeat = loop_hb
+    loop_watchdog = start_liveness_watchdog(loop_hb)
     try:
         yield
     finally:
+        # Сторож снимается ПЕРВЫМ: дальше идёт штатное завершение, во время
+        # которого отметчик уже не крутится, и сторож принял бы это за
+        # заблокированный цикл — то есть убивал бы процесс на каждой
+        # штатной остановке.
+        if loop_watchdog is not None:
+            loop_watchdog.stop()
+        liveness_stop.set()
+        try:
+            await asyncio.wait_for(loop_beat_task, timeout=5)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            loop_beat_task.cancel()
         reports_stop.set()
         if reports_task is not None:
             try:
@@ -336,6 +363,14 @@ async def health():
     except Exception as e:
         status["ok"] = False
         status["redis"] = f"error: {str(e)[:80]}"
+    # Отставание цикла событий — наблюдаемая величина, по которой сторож
+    # живости принимает решение (liveness.py). Ответ на этот запрос сам по
+    # себе доказывает, что цикл крутится, поэтому здесь это не вердикт, а
+    # число для «Мониторинга»: рост отставания виден до того, как сервис
+    # встанет совсем.
+    hb = getattr(app.state, "loop_heartbeat", None)
+    if hb is not None:
+        status["loop_lag_sec"] = round(hb.lag(), 3)
     return JSONResponse(status, status_code=200 if status["ok"] else 503)
 
 

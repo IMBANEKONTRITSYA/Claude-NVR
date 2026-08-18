@@ -23,11 +23,24 @@
   `Restart=always` systemd с `RestartSec` (по умолчанию 100 мс);
 * **обнаружение** — сколько супервизор считает сервис живым после
   фактической смерти. При падении процесса это ~0 (супервизор видит
-  выход), а вот при **зависании** — это интервал healthcheck и число
-  повторов, и именно это слагаемое доминирует.
+  выход), а при **зависании** это слагаемое доминирует.
 
-Поэтому вывод скрипта — не одно число, а разложение: прогрев измеряется,
-остальное берётся из конфигурации того режима, который проверяется.
+Поэтому вывод скрипта — не одно число, а разложение по классам отказа.
+
+**Что изменилось в цикле 38.** Замер различает два класса отказа, и
+раньше второй из них он показывал неверно:
+
+* **падение процесса** — супервизор видит выход, обнаружение ~0;
+* **зависание** («сервис жив и не отвечает») — до цикла 38 слагаемое
+  брали из интервала healthcheck. Это было ошибкой по существу: Docker
+  **не перезапускает контейнер по проваленному healthcheck**, он лишь
+  метит его `unhealthy`. Механизма восстановления не существовало, то
+  есть настоящий RTO этого класса был **бесконечным**, а скрипт печатал
+  «уложились в 5 минут». Теперь механизм есть (сторож живости,
+  `backend/app/liveness.py` и `worker/liveness.py`), и слагаемое
+  **измеряется**: поднимается настоящий сторож над настоящим
+  заблокированным циклом событий, берётся время от блокировки до выхода
+  процесса и проверяется код выхода.
 
 **Чего замер не покрывает** (перепроверить на сервере, см.
 `docs/DEPLOY_CHECKLIST.md`):
@@ -60,12 +73,33 @@ HEALTH = f"http://127.0.0.1:{PORT}/api/health"
 # Норматив §19.
 RTO_LIMIT_SEC = 5 * 60
 
-# Слагаемые, которые задаёт конфигурация, а не код. Значения — из
-# docker-compose.yml (режим 1 §26): healthcheck бэкенда `interval: 30s`,
-# `retries: 3`, то есть зависший (не упавший) сервис признаётся мёртвым
-# через 30 × 3 = 90 с; перезапуск контейнера — единицы секунд.
-DETECT_HANG_SEC = 30 * 3
+# Перезапуск контейнера супервизором — единицы секунд; берётся из
+# конфигурации, а не меряется (`restart: unless-stopped` в режиме 1 §26,
+# `Restart=always` с `RestartSec` в режиме 2).
 RESTART_SEC = 5
+
+# --- почему слагаемое «обнаружение зависания» больше не константа ---------
+#
+# До цикла 38 здесь стояло `DETECT_HANG_SEC = 30 * 3` с комментарием
+# «healthcheck бэкенда interval: 30s, retries: 3, зависший сервис
+# признаётся мёртвым через 90 с». В этом были неверны **оба** утверждения,
+# и вместе они давали замеру ложное дно:
+#
+# 1. Числа не совпадали с docker-compose.yml: у бэкенда `interval: 15s`,
+#    `retries: 5`.
+# 2. Куда важнее: **Docker не перезапускает контейнер по проваленному
+#    healthcheck.** Он лишь метит его `unhealthy`; на `restart:` это не
+#    влияет. То есть «признаётся мёртвым» не приводило ни к чему, и
+#    настоящий RTO класса «зависание» был не 90 секунд, а **бесконечность**:
+#    сервис не восстанавливался никогда. Замер при этом печатал «уложились
+#    в 5 минут» — то есть успокаивал ровно там, где механизма не было
+#    вовсе.
+#
+# С цикла 38 механизм есть — сторож живости (`backend/app/liveness.py`,
+# `worker/liveness.py`), — и слагаемое **измеряется**, а не постулируется:
+# ниже поднимается настоящий сторож над настоящим заблокированным циклом
+# событий, и берётся время от блокировки до выхода процесса.
+WATCHDOG_EXIT_CODE = 17
 
 
 def health_ok() -> bool:
@@ -104,7 +138,82 @@ def one_run() -> float:
             proc.kill()
 
 
+# Драйвер для замера обнаружения зависания. Отдельным процессом, потому что
+# сторож по срабатывании делает `os._exit()` — внутри процесса замера он
+# унёс бы и сам замер.
+#
+# Блокировка настоящая: `time.sleep` **внутри** корутины держит цикл
+# событий намертво, как его держал бы синхронный вызов в обработчике или
+# дедлок в C-расширении. Подменять её на «перестать отмечаться» было бы
+# замером арифметики порогов, а не механизма.
+_HANG_DRIVER = r"""
+import asyncio, sys, time
+sys.path.insert(0, {backend!r})
+from app.liveness import LoopHeartbeat, LoopWatchdog, beat_loop
+
+async def main():
+    hb = LoopHeartbeat()
+    stop = asyncio.Event()
+    asyncio.create_task(beat_loop(hb, stop, interval=0.2))
+    await asyncio.sleep(1.0)                  # цикл заведомо жив
+    wd = LoopWatchdog(hb, lag_budget_sec={budget}, kill_grace_sec={grace},
+                      interval_sec=0.2)
+    wd.start()
+    # Отметка ровно перед блокировкой: иначе отсчёт отставания начался бы с
+    # предыдущей отметки (до 0.2 с раньше), и замер показывал бы
+    # обнаружение «быстрее суммы порогов» — артефакт, а не свойство.
+    hb.beat()
+    print("BLOCK", time.time(), flush=True)
+    time.sleep({block})                       # цикл событий встал НАМЕРТВО
+    print("SURVIVED", flush=True)             # сюда попадать не должны
+
+asyncio.run(main())
+"""
+
+
+def measure_hang_detection(budget: float, grace: float) -> tuple[float, int]:
+    """Секунды от блокировки цикла событий до выхода процесса, и код выхода.
+
+    Меряется настоящий сторож над настоящим заблокированным циклом. Бюджет
+    и отсрочка занижены против боевых умолчаний (60 + 60 с) — иначе замер
+    шёл бы две минуты; масштабируется линейно, боевое значение считается
+    подстановкой умолчаний.
+    """
+    driver = _HANG_DRIVER.format(backend=BACKEND, budget=budget, grace=grace,
+                                 block=budget + grace + 30)
+    proc = subprocess.Popen([sys.executable, "-c", driver],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True)
+    blocked_at = None
+    for line in proc.stdout:
+        if line.startswith("BLOCK"):
+            blocked_at = time.monotonic()
+            break
+        if line.startswith("SURVIVED"):
+            raise RuntimeError("сторож не сработал: процесс пережил блокировку")
+    if blocked_at is None:
+        raise RuntimeError("драйвер замера не дошёл до блокировки")
+    code = proc.wait(timeout=budget + grace + 60)
+    return time.monotonic() - blocked_at, code
+
+
 def main() -> int:
+    # --hang-only: замер одного слагаемого — обнаружения зависания. Без
+    # Postgres и Redis, поэтому годится для джобы `perf` в CI, где их нет:
+    # так у механизма появляется отслеживание числа от цикла к циклу, а не
+    # только разовый замер в песочнице.
+    if "--hang-only" in sys.argv[1:]:
+        budget, grace = 2.0, 2.0
+        detect, code = measure_hang_detection(budget, grace)
+        overhead = detect - (budget + grace)
+        print(f"обнаружение зависания: {detect:.2f} с при порогах "
+              f"{budget + grace:.2f} с (накладной расход {overhead:.2f} с), "
+              f"код выхода {code}")
+        if code != WATCHDOG_EXIT_CODE:
+            print(f"ОШИБКА: ожидался код выхода {WATCHDOG_EXIT_CODE} — сторож не сработал")
+            return 1
+        return 0
+
     runs = int(sys.argv[1]) if len(sys.argv) > 1 else 5
     if health_ok():
         print(f"порт {PORT} уже занят здоровым сервисом — задайте BENCH_RTO_PORT")
@@ -120,22 +229,59 @@ def main() -> int:
 
     warm = statistics.median(warmups)
     worst = max(warmups)
+
+    # Обнаружение зависания — замер на заниженных порогах, чтобы прогон шёл
+    # секунды, а не две минуты. Проверяется и накладной расход механизма:
+    # насколько фактическое обнаружение превышает сумму порогов.
+    bench_budget, bench_grace = 2.0, 2.0
+    detect_bench, exit_code = measure_hang_detection(bench_budget, bench_grace)
+    overhead = detect_bench - (bench_budget + bench_grace)
+    from_defaults = (
+        liveness_defaults()[0] + liveness_defaults()[1] + max(overhead, 0.0)
+    )
+
     print()
     print("§19 RTO ≤ 5 минут — разложение")
-    print(f"  прогрев (замерено, медиана из {runs})   : {warm:6.2f} с   (худший {worst:.2f} с)")
-    print(f"  рестарт супервизором (конфигурация)     : {RESTART_SEC:6.2f} с")
-    print(f"  обнаружение падения процесса            : {0.0:6.2f} с")
-    print(f"  обнаружение ЗАВИСАНИЯ (healthcheck)     : {DETECT_HANG_SEC:6.2f} с")
+    print(f"  прогрев (замерено, медиана из {runs})           : {warm:6.2f} с   (худший {worst:.2f} с)")
+    print(f"  рестарт супервизором (конфигурация)         : {RESTART_SEC:6.2f} с")
+    print(f"  обнаружение падения процесса                : {0.0:6.2f} с   (супервизор видит выход)")
+    print()
+    print("  обнаружение ЗАВИСАНИЯ — сторож живости (замерено)")
+    print(f"    пороги замера (бюджет + отсрочка)         : {bench_budget + bench_grace:6.2f} с")
+    print(f"    фактически от блокировки до выхода        : {detect_bench:6.2f} с")
+    print(f"    накладной расход механизма                : {overhead:6.2f} с")
+    print(f"    код выхода                                : {exit_code:6d}   "
+          f"({'сторож' if exit_code == WATCHDOG_EXIT_CODE else 'НЕ сторож — проверьте'})")
+    print(f"    то же на боевых порогах "
+          f"({liveness_defaults()[0]:.0f}+{liveness_defaults()[1]:.0f} с) : {from_defaults:6.2f} с")
     print()
     crash = worst + RESTART_SEC
-    hang = worst + RESTART_SEC + DETECT_HANG_SEC
+    hang = worst + RESTART_SEC + from_defaults
     print(f"  RTO при падении процесса : {crash:6.1f} с  "
           f"({'уложились' if crash <= RTO_LIMIT_SEC else 'НЕ уложились'} в {RTO_LIMIT_SEC} с, "
           f"запас {RTO_LIMIT_SEC - crash:.0f} с)")
     print(f"  RTO при зависании        : {hang:6.1f} с  "
           f"({'уложились' if hang <= RTO_LIMIT_SEC else 'НЕ уложились'} в {RTO_LIMIT_SEC} с, "
           f"запас {RTO_LIMIT_SEC - hang:.0f} с)")
+    print()
+    print("  До цикла 38 строки «RTO при зависании» не существовало по существу:")
+    print("  механизма восстановления не было вовсе, а Docker по проваленному")
+    print("  healthcheck контейнер не перезапускает — настоящее значение было ∞.")
+
+    if exit_code != WATCHDOG_EXIT_CODE:
+        return 1
     return 0 if hang <= RTO_LIMIT_SEC else 1
+
+
+def liveness_defaults() -> tuple[float, float]:
+    """Боевые пороги сторожа — из самого модуля, а не переписанные сюда.
+
+    Копия констант разъехалась бы с кодом ровно так, как разъехались
+    константы healthcheck до цикла 38, — и замер снова врал бы.
+    """
+    sys.path.insert(0, BACKEND)
+    from app.liveness import DEFAULT_LAG_BUDGET_SEC, DEFAULT_KILL_GRACE_SEC
+    return DEFAULT_LAG_BUDGET_SEC, DEFAULT_KILL_GRACE_SEC
 
 
 if __name__ == "__main__":
