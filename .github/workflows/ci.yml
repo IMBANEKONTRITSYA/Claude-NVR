@@ -151,10 +151,15 @@ jobs:
           set -euo pipefail
           VER=$(grep -oP 'image:\s*bluenviron/mediamtx:\K\S+' docker-compose.yml)
           echo "MediaMTX $VER"
-          curl -fsSL -o mtx.tar.gz \
+          # Распаковка в отдельный каталог обязательна: в корне репозитория
+          # уже есть КАТАЛОГ mediamtx/ (конфигурация сервера), и tar,
+          # доставая файл с тем же именем в cwd, падает с
+          # «mediamtx: Cannot open: File exists».
+          mkdir -p "$RUNNER_TEMP/mtx"
+          curl -fsSL -o "$RUNNER_TEMP/mtx.tar.gz" \
             "https://github.com/bluenviron/mediamtx/releases/download/v${VER}/mediamtx_v${VER}_linux_amd64.tar.gz"
-          tar xzf mtx.tar.gz mediamtx
-          echo "MEDIAMTX_BIN=$PWD/mediamtx" >> "$GITHUB_ENV"
+          tar xzf "$RUNNER_TEMP/mtx.tar.gz" -C "$RUNNER_TEMP/mtx" mediamtx
+          echo "MEDIAMTX_BIN=$RUNNER_TEMP/mtx/mediamtx" >> "$GITHUB_ENV"
       - name: Install worker test deps
         # Только stdlib-часть: тест живёт в том же модуле record_layer.py,
         # который намеренно не тянет cv2/insightface.
