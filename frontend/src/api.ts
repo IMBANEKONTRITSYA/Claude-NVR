@@ -198,6 +198,11 @@ export const api = {
   personGallery: (id: number) => req(`/api/persons/${id}/gallery`),
   personEnhance: (id: number) => req(`/api/persons/${id}/enhance`, { method: "POST" }),
   personDelete: (id: number) => req(`/api/persons/${id}`, { method: "DELETE" }),
+  // SPEC §24 (152-ФЗ, «удаление данных по требованию»): в отличие от
+  // personDelete сносит вместе с карточкой её события, эмбеддинги и файлы
+  // снимков. Отдельный метод, а не флаг у первого, — чтобы необратимое
+  // действие нельзя было вызвать опечаткой в параметре.
+  personEraseBiometrics: (id: number) => req(`/api/persons/${id}/biometrics`, { method: "DELETE" }),
   searchFace: (form: FormData) => req("/api/search/face", { method: "POST", body: form }),
   events: (limit = 100) => req(`/api/events?limit=${limit}`),
   archive: (params: Record<string, string>) => {
