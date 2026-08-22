@@ -1,6 +1,7 @@
 from datetime import datetime
 from sqlalchemy import (String, Integer, BigInteger, DateTime, ForeignKey, Boolean, Index,
                         JSON, Text, func, text)
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 from .db import Base
@@ -92,8 +93,24 @@ class Person(Base):
     avatar_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     centroid: Mapped[list[float] | None] = mapped_column(Vector(512), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # SPEC §15: «Заметки, теги, watchlist». Массив, а не отдельная таблица:
+    # тег у персоны — свойство карточки, а не сущность со своей жизнью, и
+    # единственный запрос к нему («покажи персон с тегом X») закрывается
+    # GIN-индексом ниже без join. Канонический вид (нижний регистр, без
+    # дублей) держит services/person_tags.py — там же причины.
+    # NOT NULL DEFAULT '{}': пустой список и NULL означали бы одно и то же,
+    # а два способа записать «тегов нет» рано или поздно разъезжаются.
+    tags: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default=text("'{}'::text[]")
+    )
     alert_on_detection: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        # Фильтр «персоны с тегом X» — это `tags @> ARRAY['x']`, то есть
+        # оператор пересечения массивов; его обслуживает только GIN.
+        Index("idx_persons_tags", "tags", postgresql_using="gin"),
+    )
 
 
 class FaceEvent(Base):

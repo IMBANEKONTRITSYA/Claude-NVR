@@ -36,6 +36,7 @@ import redis
 from cryptography.fernet import Fernet
 from sklearn.cluster import DBSCAN
 from sqlalchemy import create_engine, select, text, delete, update, func
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import (Column, Integer, BigInteger, String, DateTime, Boolean,
                         ForeignKey, JSON, Text)
@@ -435,6 +436,15 @@ class Person(Base):
     avatar_path = Column(String)
     centroid = Column(Vector(512))
     alert_on_detection = Column(Boolean, default=False)
+    # SPEC §15: теги персоны. Схему заводит бэкенд (миграции в main.py),
+    # воркер только читает их на публикации события. Но объявить колонку
+    # без умолчания нельзя: SQLAlchemy подставляет в INSERT явный NULL для
+    # колонок без default, а колонка NOT NULL — то есть заведение новой
+    # персоны падало бы NotNullViolation на каждом незнакомом лице.
+    # server_default повторяет схему бэкенда, default=list закрывает путь
+    # ORM. (Тот же класс, что находка цикла 5 про alert_on_detection.)
+    tags = Column(ARRAY(Text), nullable=False,
+                  server_default=text("'{}'::text[]"), default=list)
     created_at = Column(DateTime)
 
 
@@ -1285,9 +1295,9 @@ class _PendingEvent:
     """
 
     __slots__ = ("pid", "name", "is_known", "bbox", "bbox_json", "emb", "snap_rel",
-                 "alert")
+                 "alert", "tags")
 
-    def __init__(self, pid, name, is_known, bbox, bbox_json, emb, alert=False):
+    def __init__(self, pid, name, is_known, bbox, bbox_json, emb, alert=False, tags=None):
         self.pid = pid
         self.name = name
         self.is_known = is_known
@@ -1298,6 +1308,10 @@ class _PendingEvent:
         # остальными полями Person — после закрытия сессии `person` уже
         # недоступна, а флаг нужен на публикации, чтобы Стена подала звук.
         self.alert = alert
+        # Теги персоны на момент детекции — Стена фильтрует ими живую
+        # ленту (SPEC §15 «Фильтры и поиск по ленте»), а событие приходит
+        # к ней по WebSocket, минуя /api/events.
+        self.tags = list(tags or [])
         self.snap_rel = None
 
 
@@ -1344,6 +1358,10 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url
             name = person.name or f"Неизвестный #{pid}"
             is_known = person.status == "known"
             wants_alert = bool(getattr(person, "alert_on_detection", False))
+            # Теги (SPEC §15) снимаются здесь по той же причине, что и
+            # остальные поля: после commit() объект отвязан, а обращение к
+            # атрибуту стоило бы отдельного SELECT'а на каждое лицо кадра.
+            tags = list(getattr(person, "tags", None) or [])
             s.commit()  # фиксируем возможную новую персону сразу
 
             bbox_json = {"x1": bbox[0], "y1": bbox[1], "x2": bbox[2], "y2": bbox[3]}
@@ -1384,7 +1402,7 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url
                     del last_event_at[k]
 
             pending.append(_PendingEvent(pid, name, is_known, bbox, bbox_json, emb,
-                                         is_known and wants_alert))
+                                         is_known and wants_alert, tags))
 
     # Подавляющее большинство кадров не создаёт ни одного события (все лица
     # отсекает cooldown) — для них ни снимок, ни вторая сессия не нужны.
@@ -1483,6 +1501,7 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url
                     "name": p.name,
                     "is_known": p.is_known,
                     "alert": p.alert,
+                    "tags": p.tags,
                     "snapshot": p.snap_rel,
                     "ts": ev.ts.isoformat(),
                     "bbox": p.bbox_json,

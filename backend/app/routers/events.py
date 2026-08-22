@@ -21,7 +21,7 @@ async def recent_events(
 ):
     limit = min(max(1, limit), 200)
     q = (
-        select(FaceEvent, Person.name, Person.status)
+        select(FaceEvent, Person.name, Person.status, Person.tags)
         .outerjoin(Person, Person.id == FaceEvent.person_id)
         .order_by(FaceEvent.id.desc())
         .limit(limit)
@@ -34,7 +34,7 @@ async def recent_events(
         q = q.where(FaceEvent.id < before_id)
     r = await db.execute(q)
     out = []
-    for ev, pname, pstatus in r.all():
+    for ev, pname, pstatus, ptags in r.all():
         name = pname if (pname and pname.strip()) else f"Неизвестный #{ev.person_id}"
         out.append(FaceEventRich(
             id=ev.id,
@@ -45,5 +45,9 @@ async def recent_events(
             snapshot_path=ev.snapshot_path,
             is_known=ev.is_known,
             bbox=ev.bbox,
+            # SPEC §15: «Фильтры и поиск по ленте» — Стена фильтрует
+            # ленту по тегам персоны, поэтому они едут вместе с событием,
+            # а не подтягиваются карточкой на каждый элемент ленты.
+            tags=list(ptags or []),
         ))
     return out

@@ -9,6 +9,9 @@ function mapEvent(e: any) {
   return {
     event_id: e.id, camera_id: e.camera_id, person_id: e.person_id,
     name: e.name, is_known: e.is_known, snapshot: e.snapshot_path, ts: e.ts,
+    // Теги приезжают вместе с событием — и из /api/events, и по WebSocket
+    // от воркера (SPEC §15 «Фильтры и поиск по ленте»).
+    tags: (e.tags || []) as string[],
   };
 }
 
@@ -16,6 +19,7 @@ export function Wall() {
   const [items, setItems] = useState<any[]>([]);
   const [paused, setPaused] = useState(false);
   const [filter, setFilter] = useState<"all" | "known" | "unknown">("all");
+  const [tag, setTag] = useState("");
   const [hasMore, setHasMore] = useState(true);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
@@ -101,8 +105,17 @@ export function Wall() {
     return `${Math.floor(s / 3600)} ч`;
   };
 
+  // Справочник тегов для фильтра ленты. Берётся один раз: теги правят на
+  // карточке персоны, а не здесь, и лента не должна дёргать справочник на
+  // каждое входящее событие.
+  const [tagCatalog, setTagCatalog] = useState<{ tag: string; count: number }[]>([]);
+  useEffect(() => {
+    api.personTags().then((r: any) => setTagCatalog(Array.isArray(r) ? r : [])).catch(() => {});
+  }, []);
+
   const visible = items.filter(i =>
-    filter === "all" || (filter === "known" && i.is_known) || (filter === "unknown" && !i.is_known)
+    (filter === "all" || (filter === "known" && i.is_known) || (filter === "unknown" && !i.is_known))
+    && (!tag || (i.tags || []).includes(tag))
   );
 
   return (
@@ -115,6 +128,10 @@ export function Wall() {
           <option value="known">Только известные</option>
           <option value="unknown">Только неизвестные</option>
         </select>
+        <select value={tag} onChange={e => setTag(e.target.value)} style={{ width: 200 }} aria-label="Фильтр по тегу">
+          <option value="">Все теги</option>
+          {tagCatalog.map(t => <option key={t.tag} value={t.tag}>{t.tag} ({t.count})</option>)}
+        </select>
         <span className="muted">Показано: {visible.length}</span>
       </div>
       <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))" }}>
@@ -124,6 +141,11 @@ export function Wall() {
             <div>
               <div>{i.name}</div>
               <div className="muted" style={{ fontSize: 12 }}>Камера #{i.camera_id} · {ago(i.ts)}</div>
+              {!!(i.tags || []).length && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginTop: 3 }}>
+                  {(i.tags as string[]).map(t => <span key={t} className="chip">{t}</span>)}
+                </div>
+              )}
             </div>
           </div>
         ))}
