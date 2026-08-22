@@ -54,6 +54,19 @@ async def apply_schema_migrations(conn):
         "ALTER TABLE face_events ADD COLUMN IF NOT EXISTS enhanced boolean DEFAULT false",
         "ALTER TABLE face_events ALTER COLUMN enhanced SET DEFAULT false",
         "ALTER TABLE persons ADD COLUMN IF NOT EXISTS notes text",
+        # SPEC §15: теги персон. Порядок операторов важен для БД, где
+        # колонка уже была добавлена без NOT NULL: сначала ADD (no-op на
+        # таких БД), затем засыпка NULL-ов пустым массивом, и только потом
+        # NOT NULL — иначе оператор упал бы на существующих строках и
+        # откатил бы всю транзакцию миграций целиком.
+        "ALTER TABLE persons ADD COLUMN IF NOT EXISTS tags text[] DEFAULT '{}'::text[]",
+        "UPDATE persons SET tags = '{}'::text[] WHERE tags IS NULL",
+        "ALTER TABLE persons ALTER COLUMN tags SET DEFAULT '{}'::text[]",
+        "ALTER TABLE persons ALTER COLUMN tags SET NOT NULL",
+        # Индекс объявлен и в models.py (create_all создаёт его на свежей
+        # БД), здесь — для уже развёрнутых: create_all добавляет таблицы,
+        # но не индексы к существующим.
+        "CREATE INDEX IF NOT EXISTS idx_persons_tags ON persons USING gin (tags)",
         "ALTER TABLE persons ADD COLUMN IF NOT EXISTS alert_on_detection boolean DEFAULT false",
         # ADD COLUMN IF NOT EXISTS выше — no-op на БД, где колонка уже была добавлена
         # раньше без DEFAULT (до этого фикса): raw SQL INSERT в routers/persons.py,

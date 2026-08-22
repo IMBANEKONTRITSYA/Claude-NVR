@@ -223,6 +223,7 @@ class PersonOut(BaseModel):
     status: str
     avatar_path: str | None
     notes: str | None = None
+    tags: list[str] = []
     alert_on_detection: bool = False
     created_at: datetime
 
@@ -234,6 +235,10 @@ class PersonUpdate(BaseModel):
     name: str | None = None
     status: str | None = None
     notes: str | None = None
+    # None — «не трогать теги», пустой список — «снять все теги». Разные
+    # намерения, поэтому не `list[str] = []`: с дефолтом любой PATCH,
+    # меняющий только имя, стирал бы разметку персоны.
+    tags: list[str] | None = None
     alert_on_detection: bool | None = None
 
 
@@ -258,6 +263,7 @@ class FaceEventRich(BaseModel):
     snapshot_path: str | None
     is_known: bool
     bbox: dict | None = None
+    tags: list[str] = []
 
 
 class OnvifProfilesRequest(BaseModel):

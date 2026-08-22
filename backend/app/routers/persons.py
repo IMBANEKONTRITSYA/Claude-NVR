@@ -13,6 +13,7 @@ from ..schemas import PersonOut, PersonUpdate
 from ..pagination import PageParams
 from ..params import limit_param
 from ..services.pubsub import get_redis
+from ..services.person_tags import TagError, merge_tags, normalize_tag, normalize_tags
 
 router = APIRouter(prefix="/api/persons", tags=["persons"])
 
@@ -21,6 +22,7 @@ router = APIRouter(prefix="/api/persons", tags=["persons"])
 async def list_persons(
     status: str | None = None,
     q: str | None = None,
+    tag: str | None = None,
     page: PageParams = Depends(),
     _=Depends(require_role("admin", "operator")),
     db: AsyncSession = Depends(get_db),
@@ -30,6 +32,14 @@ async def list_persons(
         base = base.where(Person.status == status)
     if q:
         base = base.where(Person.name.ilike(f"%{q}%"))
+    if tag:
+        # Значение приводится к тому же каноническому виду, что и на записи
+        # (services/person_tags.py): иначе фильтр по «VIP» не нашёл бы
+        # персону с тегом «vip» и показал бы пустой список вместо ошибки.
+        # `contains` — это `tags @> ARRAY[...]`, то есть идёт по GIN-индексу.
+        canon = normalize_tag(tag)
+        if canon:
+            base = base.where(Person.tags.contains([canon]))
 
     total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0
     rows = (await db.execute(
@@ -40,7 +50,8 @@ async def list_persons(
             {
                 "id": p.id, "name": p.name, "status": p.status,
                 "avatar_path": p.avatar_path,
-                "notes": p.notes, "alert_on_detection": p.alert_on_detection,
+                "notes": p.notes, "tags": list(p.tags or []),
+                "alert_on_detection": p.alert_on_detection,
                 "created_at": p.created_at.isoformat() if p.created_at else None,
             }
             for p in rows
@@ -100,6 +111,29 @@ async def create_person(
     return {"id": pid, "name": name.strip(), "status": "known", "avatar_path": avatar_rel}
 
 
+# Объявлен ДО `/{pid}`: FastAPI разбирает роуты в порядке объявления, и
+# после `/{pid}` этот путь ушёл бы в него как pid="tags" — то есть 422
+# вместо справочника. Порядок закреплён тестом.
+@router.get("/tags")
+async def list_tags(
+    _=Depends(require_role("admin", "operator")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Справочник тегов с числом персон на каждый (SPEC §15).
+
+    Нужен интерфейсу дважды: выпадающим фильтром и подсказкой при вводе.
+    Без него оператор на объекте набирает тег заново каждый раз и получает
+    «подрядчик» и «подрядчики» как два разных — та самая рассинхронизация,
+    ради которой в модуле нормализации сделан нижний регистр.
+    """
+    rows = (await db.execute(text(
+        "SELECT t AS tag, COUNT(*) AS count "
+        "FROM persons, unnest(tags) AS t "
+        "GROUP BY t ORDER BY COUNT(*) DESC, t"
+    ))).all()
+    return [{"tag": r[0], "count": r[1]} for r in rows]
+
+
 @router.get("/{pid}", response_model=PersonOut)
 async def get_person(pid: int, _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
     p = await db.get(Person, pid)
@@ -121,6 +155,12 @@ async def update_person(pid: int, payload: PersonUpdate, _=Depends(require_role(
         p.status = payload.status
     if payload.notes is not None:
         p.notes = payload.notes
+    if payload.tags is not None:
+        try:
+            p.tags = normalize_tags(payload.tags)
+        except TagError as e:
+            # 400 с текстом, а не усечение: см. person_tags.py, решение 2.
+            raise HTTPException(400, str(e))
     if payload.alert_on_detection is not None:
         p.alert_on_detection = payload.alert_on_detection
     await db.commit()
@@ -139,6 +179,14 @@ async def delete_person(pid: int, _=Depends(require_role("admin")), db: AsyncSes
 async def merge_persons(src_id: int, dst_id: int, _=Depends(require_role("admin", "operator")), db: AsyncSession = Depends(get_db)):
     if src_id == dst_id:
         raise HTTPException(400, "Нельзя слить с самой собой")
+    # Теги источника переезжают к цели до его удаления (SPEC §15). Оператор
+    # размечает обе карточки задолго до того, как поймёт, что это один
+    # человек: без объединения слияние молча стирало бы половину разметки,
+    # и заметно это стало бы на фильтре, а не в момент действия.
+    src = await db.get(Person, src_id)
+    dst = await db.get(Person, dst_id)
+    if src is not None and dst is not None:
+        dst.tags = merge_tags(dst.tags, src.tags)
     await db.execute(update(FaceEvent).where(FaceEvent.person_id == src_id).values(person_id=dst_id))
     await db.execute(delete(Person).where(Person.id == src_id))
     await db.commit()

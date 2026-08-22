@@ -184,11 +184,13 @@ export const api = {
     req(`/api/cameras/${id}/ptz/preset/save`, {
       method: "POST", body: JSON.stringify({ name, profile_token }),
     }),
-  persons: (params: { status?: string; q?: string; page?: number; page_size?: number } = {}) => {
+  persons: (params: { status?: string; q?: string; tag?: string; page?: number; page_size?: number } = {}) => {
     const usp = new URLSearchParams();
     Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== "") usp.set(k, String(v)); });
     return req(`/api/persons?${usp.toString()}`);
   },
+  // Справочник тегов (SPEC §15): выпадающий фильтр и подсказка при вводе.
+  personTags: () => req("/api/persons/tags"),
   personCreate: (form: FormData) => req("/api/persons", { method: "POST", body: form }),
   personGet: (id: number) => req(`/api/persons/${id}`),
   personUpdate: (id: number, b: any) => req(`/api/persons/${id}`, { method: "PATCH", body: JSON.stringify(b) }),
