@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Два слоя под нагрузкой одновременно: §19 «CPU ≤ 80 %» и §2 «слои независимы».
+"""Два слоя под нагрузкой одновременно: §19 «CPU ≤ 80 %», «RAM ≤ 80 %», §2 «слои независимы».
 
 **Чего не хватало.** Все замеры проекта до цикла 41 меряли слои по
 отдельности: `bench_remux.py` — стоимость записи при простаивающей
@@ -10,6 +10,13 @@
 
 * §19 «CPU ≤ 80 % при полной нагрузке (запас 20 %)» — величина про
   машину целиком, а не про процесс;
+* §19 «RAM ≤ 80 % от доступной (запас 20 %)» — вторая половина того же
+  требования. До цикла 46 она не измерялась **ни разу ни одним замером
+  проекта**: `bench_load.py` цикла 41 закрыл процессорную половину и
+  оставил память вне поля зрения, а `bench_remux.py` считает RSS
+  медиасервера, но не машины и не при работающей аналитике. Здесь
+  меряются обе величины — потолок машины и удельная стоимость памяти на
+  камеру записи и на канал аналитики (вилки §16);
 * §2 «Отказ аналитики НЕ влияет на запись, и наоборот» — заявлена
   независимость слоёв. Отказ проверялся (остановкой воркера), а
   **деградация под нагрузкой** — нет: вопрос не «переживёт ли запись
@@ -21,6 +28,13 @@
 1. **только запись** — база: CPU машины, CPU медиасервера, темп прироста
    сегментов;
 2. **запись + аналитика** — те же величины, плюс FPS каналов.
+
+Память снимается не одним чтением в конце окна, а **пиком** по выборкам
+раз в полсекунды: потолок §19 — про худший момент, а не про тот, в
+который замер случайно посмотрел. Ровно этот урок цикл 44 записал в
+carryover («число, полученное одним прогоном, — не результат замера, а
+его выборка»); отсюда же `--repeat`, который проверяет норматив по
+**худшему** прогону, а не по последнему.
 
 Сравнение фаз и есть ответ. Если §2 выполняется, во второй фазе у слоя
 записи не должно измениться ни удельное CPU, ни темп сегментов; если
@@ -44,6 +58,7 @@
 
     MEDIAMTX_BIN=/путь/mediamtx python perf/bench_load.py
     MEDIAMTX_BIN=... python perf/bench_load.py --cameras 8 --analytics 2 --json
+    MEDIAMTX_BIN=... python perf/bench_load.py --repeat 3      # норматив по худшему
 """
 from __future__ import annotations
 
@@ -63,9 +78,21 @@ sys.path.insert(0, os.path.join(_ROOT, "worker"))
 
 import bench_remux as remux                                   # noqa: E402
 
-# §19: детекция ≥ 5 FPS/канал; CPU ≤ 80 % при полной нагрузке.
+# §19: детекция ≥ 5 FPS/канал; CPU ≤ 80 % и RAM ≤ 80 % при полной нагрузке.
 DETECTION_FPS_TARGET = 5.0
 CPU_BUDGET_PCT = 80.0
+RAM_BUDGET_PCT = 80.0
+
+# §16, вилки удельной памяти, на которых стоит калькулятор ресурсов
+# (backend/app/services/autoconfig.py). Слой записи — «~50-100 MB на камеру
+# (буферы)», слой аналитики — «~500 MB-2 GB на камеру (модель + буферы)».
+REC_RAM_MB_PER_CAMERA = (50.0, 100.0)
+ANALYTICS_RAM_MB_PER_CHANNEL = (500.0, 2048.0)
+
+# Частота выборок памяти внутри окна. Потолок §19 — про худший момент;
+# одно чтение в конце окна показало бы тот момент, в который замер
+# случайно посмотрел.
+MEM_SAMPLE_SEC = 0.5
 
 # Длительность сегмента замера — см. докстринг.
 SEGMENT_SEC = 10
@@ -101,21 +128,60 @@ def _load_path_conf(source: str, segdir: str) -> dict:
 
 
 class _Sampler:
-    """Замер CPU машины и одного процесса за окно."""
+    """Замер CPU и памяти машины плюс CPU/RSS отдельных процессов за окно.
 
-    def __init__(self, proc):
+    Память снимается фоновой нитью раз в `MEM_SAMPLE_SEC` и сводится
+    **пиком**, а не последним значением: §19 задаёт потолок, то есть
+    вопрос в худшем моменте окна. Нить дешёвая (три чтения /proc в
+    полсекунды) и на измеряемую нагрузку не влияет — проверено тем, что
+    базовая фаза без неё и с ней даёт одинаковое CPU в пределах шума.
+    """
+
+    def __init__(self, proc, self_proc=None):
         import psutil
         self.psutil = psutil
         self.proc = proc
+        # Процесс самого замера: каналы аналитики крутятся его нитями (как
+        # в worker.manager()), поэтому память слоя аналитики — это его RSS.
+        self.self_proc = self_proc or psutil.Process()
+        self._stop = None
+        self._thread = None
+
+    def _sample_loop(self):
+        while not self._stop.wait(MEM_SAMPLE_SEC):
+            self._take()
+
+    def _take(self):
+        vm = self.psutil.virtual_memory()
+        self.machine_ram_pct = max(self.machine_ram_pct, vm.percent)
+        self.machine_ram_used = max(self.machine_ram_used, vm.total - vm.available)
+        for attr, proc in (("proc_rss", self.proc), ("self_rss", self.self_proc)):
+            try:
+                rss = proc.memory_info().rss
+            except Exception:
+                continue
+            setattr(self, attr, max(getattr(self, attr), rss))
 
     def __enter__(self):
+        import threading
+        self.machine_ram_pct = 0.0
+        self.machine_ram_used = 0
+        self.proc_rss = 0
+        self.self_rss = 0
         self.psutil.cpu_percent(interval=None)
         self.proc.cpu_percent(interval=None)
+        self._take()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._sample_loop, daemon=True)
+        self._thread.start()
         self.t0 = time.perf_counter()
         return self
 
     def __exit__(self, *exc):
         self.wall = time.perf_counter() - self.t0
+        self._stop.set()
+        self._thread.join(timeout=MEM_SAMPLE_SEC * 4)
+        self._take()
         # cpu_percent процесса нормирован на ОДНО ядро (может быть > 100),
         # системный — на машину целиком (0..100). Разные шкалы намеренно:
         # §19 задаёт потолок машины, §16 — стоимость на камеру в ядрах.
@@ -226,11 +292,25 @@ def run(cameras: int, analytics: int, warmup: int, measure: int) -> dict:
 
 
 def _phase(sampler, cameras: int, new_files: int, new_bytes: int) -> dict:
+    mb = 1048576
     return {
         "wall_sec": round(sampler.wall, 2),
         "machine_cpu_pct": round(sampler.machine_pct, 1),
         "mediamtx_cores": round(sampler.proc_cores, 3),
         "record_cores_per_camera": round(sampler.proc_cores / cameras, 4) if cameras else None,
+        # --- память (§19 «RAM ≤ 80 %», вилки §16) ------------------------
+        # Пик за окно, а не значение на выходе из него.
+        "machine_ram_pct": round(sampler.machine_ram_pct, 1),
+        "machine_ram_used_mb": round(sampler.machine_ram_used / mb, 1),
+        # RSS медиасервера целиком и на камеру. Второе число — то, что
+        # §16 называет «~50-100 MB на камеру (буферы)»; там эта вилка
+        # писалась под раскладку «процесс на камеру», а MediaMTX — один
+        # процесс на все, поэтому расхождение ожидаемо и его надо видеть.
+        "mediamtx_rss_mb": round(sampler.proc_rss / mb, 1),
+        "record_rss_mb_per_camera": round(sampler.proc_rss / mb / cameras, 2) if cameras else None,
+        # RSS процесса замера: каналы аналитики — его нити, значит это
+        # память слоя аналитики вместе с моделью.
+        "analytics_rss_mb": round(sampler.self_rss / mb, 1),
         "segments_written": new_files,
         # Темп записи — независимая от CPU проверка того, что слой записи не
         # просто «жив», а продолжает писать с той же скоростью. Байты, а не
@@ -251,12 +331,42 @@ def _verdict(base: dict, combined: dict, cameras: int, analytics: int) -> dict:
         record_delta = ((combined["record_cores_per_camera"]
                          - base["record_cores_per_camera"])
                         / base["record_cores_per_camera"] * 100.0)
+    # §16: удельная память. Аналитика считается ПРИРОСТОМ между фазами —
+    # в базовой фазе процесс замера уже держит интерпретатор, psutil и
+    # прочитанный клип, и записывать это в стоимость канала было бы
+    # припиской. Модель у каналов общая (нити, как в worker.manager()),
+    # поэтому число на канал заведомо ниже вилки §16, писавшейся под
+    # «процесс на камеру» — это ожидаемое расхождение, а не находка.
+    analytics_rss_delta = (combined.get("analytics_rss_mb", 0.0)
+                           - base.get("analytics_rss_mb", 0.0))
+    analytics_mb_per_channel = (round(analytics_rss_delta / analytics, 1)
+                                if analytics else None)
+    rec_mb = combined.get("record_rss_mb_per_camera")
     return {
         # §19: потолок машины. Меряется, но на 4 ядрах песочницы это
         # потолок ПЕСОЧНИЦЫ под этой нагрузкой, а не объекта под полной.
         "machine_cpu_pct": combined["machine_cpu_pct"],
         "cpu_budget_pct": CPU_BUDGET_PCT,
         "meets_cpu_budget": combined["machine_cpu_pct"] <= CPU_BUDGET_PCT,
+        # §19, вторая половина: RAM ≤ 80 % от доступной. Та же оговорка про
+        # масштаб, что и у CPU: на объекте камер больше, но и памяти
+        # больше — переносимы отсюда только удельные числа ниже.
+        "machine_ram_pct": combined["machine_ram_pct"],
+        "ram_budget_pct": RAM_BUDGET_PCT,
+        "meets_ram_budget": combined["machine_ram_pct"] <= RAM_BUDGET_PCT,
+        "machine_ram_used_mb": combined["machine_ram_used_mb"],
+        # §16: вилки, на которых стоит калькулятор ресурсов.
+        "record_rss_mb_per_camera": rec_mb,
+        "record_ram_bracket_mb": list(REC_RAM_MB_PER_CAMERA),
+        "record_ram_within_bracket": (
+            REC_RAM_MB_PER_CAMERA[0] <= rec_mb <= REC_RAM_MB_PER_CAMERA[1]
+            if rec_mb is not None else None),
+        "analytics_rss_mb_per_channel": analytics_mb_per_channel,
+        "analytics_ram_bracket_mb": list(ANALYTICS_RAM_MB_PER_CHANNEL),
+        "analytics_ram_within_bracket": (
+            ANALYTICS_RAM_MB_PER_CHANNEL[0] <= analytics_mb_per_channel
+            <= ANALYTICS_RAM_MB_PER_CHANNEL[1]
+            if analytics_mb_per_channel is not None else None),
         # §2: слой записи под нагрузкой аналитики.
         "record_cores_per_camera_delta_pct": round(record_delta, 1)
         if record_delta is not None else None,
@@ -273,8 +383,10 @@ def _verdict(base: dict, combined: dict, cameras: int, analytics: int) -> dict:
         # Экстраполяция к объекту: удельные числа, замеренные СОВМЕСТНО.
         "extrapolation_note": (
             "ядер на объект = камеры × record_cores_per_camera + каналы × "
-            "cores_per_camera_at_target; числа сняты в совместном режиме, "
-            "но на 4 ядрах и с AVX2 — на E5-2670 перемерить"),
+            "cores_per_camera_at_target; ГБ на объект = камеры × "
+            "record_rss_mb_per_camera + каналы × analytics_rss_mb_per_channel "
+            "+ база (модель, СУБД, Redis, nginx); числа сняты в совместном "
+            "режиме, но на 4 ядрах и с AVX2 — на E5-2670 перемерить"),
         "cores_per_analytics_channel": chain.get("cores_per_camera_at_target"),
     }
 
@@ -290,6 +402,43 @@ def _cpu_model() -> str:
     return "неизвестно"
 
 
+def worst_verdict(verdicts: list[dict]) -> dict:
+    """Свести вердикты нескольких прогонов к худшему — по каждой величине
+    отдельно.
+
+    Не «худший прогон целиком», а худшее значение каждого норматива: один
+    прогон может дать пик CPU, другой — просадку темпа архива, и норматив,
+    нарушенный хоть в одном, нарушен. Правило прямо из carryover цикла 44:
+    число, полученное одним прогоном, — выборка, а не результат.
+    """
+    if len(verdicts) == 1:
+        return dict(verdicts[0])
+    out = dict(verdicts[-1])
+    def worst(key, pick):
+        vals = [v[key] for v in verdicts if v.get(key) is not None]
+        return pick(vals) if vals else None
+    out["machine_cpu_pct"] = worst("machine_cpu_pct", max)
+    out["machine_ram_pct"] = worst("machine_ram_pct", max)
+    out["machine_ram_used_mb"] = worst("machine_ram_used_mb", max)
+    out["archive_rate_delta_pct"] = worst("archive_rate_delta_pct", min)
+    out["record_cores_per_camera_delta_pct"] = worst("record_cores_per_camera_delta_pct", max)
+    out["analytics_fps_per_channel"] = worst("analytics_fps_per_channel", min)
+    out["record_rss_mb_per_camera"] = worst("record_rss_mb_per_camera", max)
+    out["analytics_rss_mb_per_channel"] = worst("analytics_rss_mb_per_channel", max)
+    # Булевы вердикты пересчитываются от худших чисел, а не берутся из
+    # последнего прогона: иначе «худшее» осталось бы только в таблице.
+    out["meets_cpu_budget"] = (out["machine_cpu_pct"] or 0) <= CPU_BUDGET_PCT
+    out["meets_ram_budget"] = (out["machine_ram_pct"] or 0) <= RAM_BUDGET_PCT
+    out["layers_independent"] = (out["archive_rate_delta_pct"] is None
+                                 or out["archive_rate_delta_pct"] > -5.0)
+    out["analytics_meets_target"] = (
+        out["analytics_fps_per_channel"] is not None
+        and out["analytics_fps_per_channel"] >= DETECTION_FPS_TARGET)
+    out["segments_kept_growing"] = all(v.get("segments_kept_growing") for v in verdicts)
+    out["runs"] = len(verdicts)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -297,10 +446,28 @@ def main() -> int:
     ap.add_argument("--analytics", type=int, default=2, help="каналов аналитики")
     ap.add_argument("--warmup", type=int, default=12)
     ap.add_argument("--measure", type=int, default=25)
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="прогонов; норматив проверяется по худшему")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    res = run(args.cameras, args.analytics, args.warmup, args.measure)
+    runs = []
+    for _ in range(max(1, args.repeat)):
+        r = run(args.cameras, args.analytics, args.warmup, args.measure)
+        if r.get("skipped") or r.get("error"):
+            res = r
+            break
+        runs.append(r)
+    else:
+        res = dict(runs[-1])
+        res["verdict"] = worst_verdict([r["verdict"] for r in runs])
+        if len(runs) > 1:
+            res["runs"] = [{"machine_cpu_pct": r["verdict"]["machine_cpu_pct"],
+                            "machine_ram_pct": r["verdict"]["machine_ram_pct"],
+                            "archive_rate_delta_pct": r["verdict"]["archive_rate_delta_pct"],
+                            "analytics_fps_per_channel": r["verdict"]["analytics_fps_per_channel"]}
+                           for r in runs]
+
     if args.json:
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0 if not res.get("error") else 1
@@ -316,9 +483,24 @@ def main() -> int:
               f"MediaMTX {p['mediamtx_cores']:>6} ядра "
               f"({p['record_cores_per_camera']} на камеру) | "
               f"архив {p['archive_mb_per_sec']} МБ/с | сегментов {p['segments_written']}")
+        print(f"  {'':<22} RAM машины {p['machine_ram_pct']:>5} % "
+              f"({p['machine_ram_used_mb']} МБ) | MediaMTX {p['mediamtx_rss_mb']} МБ "
+              f"({p['record_rss_mb_per_camera']} МБ на камеру) | "
+              f"аналитика {p['analytics_rss_mb']} МБ")
     v = res["verdict"]
+    if v.get("runs"):
+        print(f"  прогонов: {v['runs']}, норматив проверяется по худшему")
     print(f"  §19 CPU ≤ {v['cpu_budget_pct']} %: {v['machine_cpu_pct']} % — "
           f"{'да' if v['meets_cpu_budget'] else 'НЕТ'}")
+    print(f"  §19 RAM ≤ {v['ram_budget_pct']} %: {v['machine_ram_pct']} % "
+          f"({v['machine_ram_used_mb']} МБ) — "
+          f"{'да' if v['meets_ram_budget'] else 'НЕТ'}")
+    lo, hi = v["record_ram_bracket_mb"]
+    print(f"  §16 запись {lo}-{hi} МБ/камеру: {v['record_rss_mb_per_camera']} МБ — "
+          f"{'в вилке' if v['record_ram_within_bracket'] else 'вне вилки'}")
+    lo, hi = v["analytics_ram_bracket_mb"]
+    print(f"  §16 аналитика {lo}-{hi} МБ/канал: {v['analytics_rss_mb_per_channel']} МБ — "
+          f"{'в вилке' if v['analytics_ram_within_bracket'] else 'вне вилки'}")
     print(f"  §19 ≥ 5 FPS/канал при работающей записи: "
           f"{v['analytics_fps_per_channel']} — "
           f"{'да' if v['analytics_meets_target'] else 'НЕТ'}")
