@@ -73,24 +73,32 @@ def _collect_paths(rows, avatar_path: str | None) -> list[str]:
     return paths
 
 
-async def _still_referenced(db: AsyncSession, rel: str) -> bool:
-    """Ссылается ли на файл хоть одна оставшаяся строка.
+async def _still_referenced(db: AsyncSession, paths: list[str]) -> set[str]:
+    """Какие из `paths` ещё упомянуты выжившими строками.
 
     Проверяется после удаления строк персоны, то есть по выжившим. Случай
     редкий, но настоящий: слияние персон переносит события к цели, а аватар
     источника мог указывать на снимок одного из перенесённых событий. Без
     этой проверки удаление источника выбило бы картинку из-под чужой
     карточки — молча, потому что строка осталась бы на месте.
+
+    Два запроса на весь список, а не два на файл. У персоны, прожившей на
+    объекте месяц, кадров тысячи, и проверка по одному давала бы столько же
+    пар round-trip'ов к Postgres — секунды на ровном месте в обработчике,
+    который и так держит соединение открытым. `IN` по списку строк идёт по
+    тем же индексам, что и сравнение по одной.
     """
-    ev = await db.execute(
-        select(FaceEvent.id).where(
-            (FaceEvent.snapshot_path == rel) | (FaceEvent.orig_snapshot_path == rel)
-        ).limit(1)
+    if not paths:
+        return set()
+    referenced: set[str] = set()
+    for column in (FaceEvent.snapshot_path, FaceEvent.orig_snapshot_path):
+        rows = await db.execute(select(column).where(column.in_(paths)).distinct())
+        referenced.update(r[0] for r in rows if r[0])
+    rows = await db.execute(
+        select(Person.avatar_path).where(Person.avatar_path.in_(paths)).distinct()
     )
-    if ev.first() is not None:
-        return True
-    pe = await db.execute(select(Person.id).where(Person.avatar_path == rel).limit(1))
-    return pe.first() is not None
+    referenced.update(r[0] for r in rows if r[0])
+    return referenced
 
 
 async def erase_person(db: AsyncSession, media_path: str, pid: int) -> dict | None:
@@ -123,9 +131,10 @@ async def erase_person(db: AsyncSession, media_path: str, pid: int) -> dict | No
     await db.commit()
 
     # Шаг 2: файлы. Уже после коммита — см. модульный docstring про порядок.
+    referenced = await _still_referenced(db, paths)
     removed = kept = 0
     for rel in paths:
-        if await _still_referenced(db, rel):
+        if rel in referenced:
             kept += 1
             continue
         abs_path = os.path.join(media_path, rel)

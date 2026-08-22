@@ -194,6 +194,44 @@ def test_erase_keeps_file_shared_with_surviving_person(client, admin_headers, pg
         assert cur.fetchone()[0] == 1
 
 
+def test_erase_sorts_shared_from_unshared_in_one_pass(client, admin_headers, pg_conn,
+                                                      make_camera, request, _seeded):
+    """Смесь: часть файлов персоны разделена с выжившей строкой, часть нет.
+
+    Проверка на список, а не на один файл: ссылки ищутся одним запросом на
+    весь набор (`_still_referenced`), и ошибка сопоставления «какой путь
+    занят» на одном общем файле не видна — там любой ответ выглядит
+    правдоподобно. Здесь удалиться обязаны ровно два файла из трёх.
+    """
+    cam = make_camera(f"cam_{request.node.name}"[:60])["id"]
+    victim, rels = _seed_person_with_faces(pg_conn, _seeded, cam,
+                                           f"mix_{request.node.name}"[:20], n=3)
+    shared = rels[1]
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO persons (name, status, centroid, alert_on_detection, created_at) "
+            "VALUES (%s, 'known', CAST(%s AS vector), false, NOW()) RETURNING id",
+            (f"keep_{request.node.name}"[:60], _vec()),
+        )
+        keeper = cur.fetchone()[0]
+        _seeded["persons"].append(keeper)
+        cur.execute(
+            "INSERT INTO face_events "
+            "(camera_id, person_id, ts, embedding, is_known, enhanced, snapshot_path, orig_snapshot_path) "
+            "VALUES (%s, %s, NOW(), CAST(%s AS vector), true, false, %s, %s)",
+            (cam, keeper, _vec(), shared, shared),
+        )
+
+    r = client.delete(f"/api/persons/{victim}/biometrics", headers=admin_headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["files_removed"] == 2, r.json()
+    assert r.json()["files_kept"] == 1, r.json()
+
+    assert os.path.exists(os.path.join(settings.MEDIA_PATH, shared))
+    for rel in (rels[0], rels[2]):
+        assert not os.path.exists(os.path.join(settings.MEDIA_PATH, rel))
+
+
 def test_erase_is_admin_only(client, make_user, pg_conn, make_camera, request, _seeded):
     """§18: удаление биометрии необратимо, оператору оно недоступно."""
     cam = make_camera(f"cam_{request.node.name}"[:60])["id"]
