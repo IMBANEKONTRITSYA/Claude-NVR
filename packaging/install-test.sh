@@ -77,6 +77,21 @@ for u in facewatch-mediamtx facewatch-backend facewatch-worker; do
 done
 
 step "3. Интерфейс и API через nginx"
+# Сначала сам nginx, потом то, что он отдаёт: если он не поднят, все
+# проверки ниже упали бы одинаковым «connection refused», из которого не
+# видно, виноват веб-сервер или бэкенд. Ровно этот случай и был реальным:
+# на машине, где nginx уже стоял, apt считает зависимость удовлетворённой,
+# postinst nginx не отрабатывает, и служба остаётся выключенной.
+if systemctl is-active --quiet nginx; then
+    ok "nginx активен"
+else
+    bad "nginx не активен — веб-интерфейс не отдаётся (systemctl status nginx)"
+fi
+if [ -L /etc/nginx/sites-enabled/facewatch.conf ]; then
+    ok "сайт facewatch включён в nginx"
+else
+    bad "нет симлинка /etc/nginx/sites-enabled/facewatch.conf"
+fi
 wait_for "GET /api/health отвечает 200" 60 \
     curl -fsS -o /dev/null http://127.0.0.1/api/health || true
 if curl -fsS http://127.0.0.1/ | grep -qi '<div id="root"'; then
@@ -124,7 +139,10 @@ step "5. Миграции применились (SPEC §26)"
 # миграции», даже если бы применял их в другую базу.
 TABLES="$(sudo runuser -u postgres -- psql -d facewatch -tAc \
     "select string_agg(tablename, ',' order by tablename) from pg_tables where schemaname='public'")"
-for t in users cameras faces persons events; do
+# Имена — из backend/app/models.py (__tablename__), а не «на слух»: таблиц
+# faces и events в схеме нет и никогда не было, лица лежат в face_events,
+# записи архива — в video_segments.
+for t in users cameras persons face_events video_segments audit_log; do
     if printf '%s' "$TABLES" | grep -qw "$t"; then
         ok "таблица $t создана"
     else

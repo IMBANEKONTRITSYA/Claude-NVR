@@ -357,3 +357,59 @@ def test_package_declares_its_runtime_dependencies():
     depends = control.split("Depends:", 1)[1].split("\nDescription:", 1)[0]
     for required in ("postgresql", "pgvector", "redis-server", "nginx"):
         assert required in depends, f"в Depends нет {required} (SPEC §26)"
+
+
+# ------------------------------------------------------------- install-тест
+
+
+def _install_test() -> str:
+    return (PKG / "install-test.sh").read_text(encoding="utf-8")
+
+
+def test_install_test_checks_real_table_names():
+    """Install-тест смотрел на таблицы `faces` и `events`, которых в схеме
+    нет: лица лежат в `face_events`, записи архива — в `video_segments`.
+    Проверка «миграции применились» из-за этого падала на здоровом пакете
+    и молчала бы о настоящем отказе миграций. Список имён обязан сходиться
+    с `__tablename__` моделей, иначе он разойдётся снова."""
+    models = (ROOT / "backend" / "app" / "models.py").read_text(encoding="utf-8")
+    real = set(re.findall(r'__tablename__\s*=\s*"([^"]+)"', models))
+    assert real, "не нашёл ни одного __tablename__ — изменился формат models.py"
+
+    checked = re.search(
+        r"^for t in ([^;]+); do$", _install_test(), re.MULTILINE
+    )
+    assert checked, "не нашёл цикл проверки таблиц в install-test.sh"
+    names = checked.group(1).split()
+    assert names, "пустой список таблиц в install-test.sh"
+    missing = sorted(set(names) - real)
+    assert not missing, (
+        f"install-test.sh ждёт таблицы, которых нет среди __tablename__: {missing}; "
+        f"в схеме есть {sorted(real)}"
+    )
+
+
+def test_install_test_verifies_nginx_is_up():
+    """Без явной проверки самого nginx все обращения к интерфейсу падают
+    одинаковым «connection refused», по которому не отличить выключенный
+    веб-сервер от неподнявшегося бэкенда — ровно на этом install-тест
+    однажды и потерял полчаса."""
+    body = _install_test()
+    assert "systemctl is-active --quiet nginx" in body, (
+        "install-тест не проверяет, что nginx вообще запущен"
+    )
+
+
+def test_postinst_starts_nginx_not_only_reloads_it():
+    """Если nginx на машине уже стоял (штатное состояние сервера, где его
+    поставили заранее, и раннеров CI), apt считает зависимость
+    удовлетворённой и postinst самого nginx не отрабатывает — служба
+    остаётся выключенной. Пакет обязан поднять её сам: SPEC §26 —
+    «apt install ./facewatch_*.deb — все сервисы поднимаются автоматически»."""
+    postinst = (DEB / "postinst").read_text(encoding="utf-8")
+    assert "systemctl enable nginx" in postinst, (
+        "postinst не включает nginx — после перезагрузки объекта интерфейс не поднимется"
+    )
+    assert "systemctl start nginx" in postinst, (
+        "postinst только перезагружает nginx: остановленную службу reload не поднимает"
+    )
