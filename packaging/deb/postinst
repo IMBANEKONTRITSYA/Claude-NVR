@@ -96,6 +96,12 @@ configure)
         systemctl enable facewatch.target facewatch-first-run.service \
             facewatch-mediamtx.service facewatch-backend.service \
             facewatch-worker.service facewatch-upscaler.service >/dev/null 2>&1 || true
+        # Таймер бэкапа (SPEC §11) — отдельной командой с --now: он не
+        # входит в facewatch.target (см. комментарий про PartOf в юните),
+        # поэтому `restart facewatch.target` ниже его не поднимет, и без
+        # этой строки «автоматическое раз в сутки» молча не работало бы.
+        systemctl enable --now facewatch-backup.timer >/dev/null 2>&1 || \
+            echo "facewatch: не удалось включить facewatch-backup.timer — бэкап по расписанию не работает"
         # restart, а не start: на апгрейде сервисы уже работают со старым
         # кодом, и start ничего бы не сделал — пакет обновился бы, а на
         # объекте продолжал бы жить прежний бэкенд.

@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, backupDownloadUrl } from "../api";
 import { useUI } from "../ui";
 import { settingsPayload } from "../settingsPayload";
+import { backupHealth, formatBytes, formatStamp } from "../backupView";
 
 // ВАЖНО: Field объявлен вне Settings — компонент, объявленный внутри рендера,
 // пересоздаётся как новый тип на каждый ре-рендер, из-за чего input
@@ -12,6 +13,88 @@ function Field({ label, hint, value, onChange, step, type = "number" }: any) {
       <label>{label}</label>
       <input type={type} step={step || 1} value={value ?? ""} onChange={onChange} />
       {hint && <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>{hint}</div>}
+    </div>
+  );
+}
+
+// SPEC §11 «Резервное копирование: автоматическое раз в сутки + ручной
+// запуск»; §18 отводит бэкапам отдельную строку матрицы прав, и страница
+// настроек admin-only (App.tsx), то есть строка соблюдается маршрутом, а
+// не только проверкой на сервере.
+//
+// До цикла 47 ручной запуск существовал единственным способом — `docker
+// compose exec backup /backup/run.sh`, то есть требовал доступа к
+// докер-сокету сервера; в production (.deb + systemd, §26) бэкапа не было
+// вовсе. Здесь администратор видит, работает ли автоматический бэкап,
+// снимает копию руками и забирает файл.
+function Backups() {
+  const { toast } = useUI();
+  const [state, setState] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = () => api.listBackups().then(setState).catch(() => setState(null));
+  useEffect(() => { load(); }, []);
+
+  const create = async () => {
+    setBusy(true);
+    try {
+      const r: any = await api.createBackup();
+      toast(`Копия снята: ${r.name} (${formatBytes(r.size_bytes)})`, "ok");
+      await load();
+    } catch (e: any) { toast(e.message, "err"); }
+    finally { setBusy(false); }
+  };
+
+  const remove = async (name: string) => {
+    if (!confirm(`Удалить резервную копию ${name}? Действие необратимо.`)) return;
+    try {
+      await api.deleteBackup(name);
+      await load();
+    } catch (e: any) { toast(e.message, "err"); }
+  };
+
+  if (!state) return null;
+  const health = backupHealth(state);
+  const color = health.level === "ok" ? "var(--green)"
+    : health.level === "warn" ? "var(--yellow, #d90)" : "var(--red)";
+  const items: any[] = state.items || [];
+
+  return (
+    <div className="card" style={{ maxWidth: 520, marginBottom: 16 }}>
+      <h3 style={{ marginTop: 0 }}>Резервное копирование</h3>
+      <div style={{ color, fontSize: 13, marginBottom: 8 }}>{health.text}</div>
+      <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+        Каталог: <code>{state.dir}</code><br />
+        Расписание: <code>{state.schedule}</code>, хранение {state.retention_days} дн.
+        {state.free_bytes !== null && <> · свободно {formatBytes(state.free_bytes)}</>}
+        <br />
+        Копий: {state.count} на {formatBytes(state.total_bytes)}
+      </div>
+      <button className="btn" onClick={create} disabled={busy || !state.pg_dump?.ready}>
+        {busy ? "Снимаю дамп..." : "Создать копию сейчас"}
+      </button>
+      {items.length > 0 && (
+        <table style={{ width: "100%", marginTop: 12, fontSize: 12 }}>
+          <tbody>
+            {items.slice(0, 10).map((b: any) => (
+              <tr key={b.name}>
+                <td>{formatStamp(b.name)}</td>
+                <td style={{ textAlign: "right" }}>{formatBytes(b.size_bytes)}</td>
+                <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                  <a href={backupDownloadUrl(b.name)} download>скачать</a>
+                  {" · "}
+                  <a href="#" onClick={e => { e.preventDefault(); remove(b.name); }}>удалить</a>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {items.length > 10 && (
+        <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+          Показаны 10 последних из {items.length}; остальные лежат в каталоге выше.
+        </div>
+      )}
     </div>
   );
 }
@@ -186,6 +269,8 @@ export function Settings() {
           </div>
         </div>
       </div>
+
+      <Backups />
 
       <div style={{ maxWidth: 520 }}>
         {msg && <div style={{ marginBottom: 10, color: msg.type === "ok" ? "var(--green)" : "var(--red)" }}>{msg.text}</div>}

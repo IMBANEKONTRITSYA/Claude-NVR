@@ -27,6 +27,21 @@ class Settings(BaseSettings):
     RTSP_ENCRYPTION_KEY: str = "ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ="
     MEDIA_PATH: str = "/media"
     ADMIN_PASSWORD: str = "admin"
+    # SPEC §11 «Резервное копирование: автоматическое раз в сутки + ручной
+    # запуск». Каталог общий для всех, кто пишет дампы: cron-контейнера
+    # docker-compose, systemd-таймера пакета (§26) и кнопки в интерфейсе —
+    # иначе администратор видел бы в списке не все копии, которые у него
+    # есть. В пакете переопределяется на /var/lib/facewatch/backups.
+    BACKUP_PATH: str = "/backups"
+    BACKUP_RETENTION_DAYS: int = 14
+    # Расписание автоматического дампа. Бэкенд его не исполняет — оно
+    # показывается администратору рядом с возрастом последней копии, чтобы
+    # «сутки прошли, а копии нет» читалось как отказ, а не как «наверное,
+    # так и задумано». Исполняют cron (docker-compose) и systemd-таймер (.deb).
+    BACKUP_SCHEDULE: str = "0 3 * * *"
+    # Имя или абсолютный путь pg_dump. Абсолютный нужен на Debian, где
+    # бинарники лежат в /usr/lib/postgresql/<версия>/bin вне PATH сервиса.
+    BACKUP_PG_DUMP: str = "pg_dump"
     # ТЗ 13: "JWT-токены с refresh-механизмом" — короткий access-токен
     # (был 12 часов, невозможно отозвать до истечения) + долгоживущий
     # refresh-токен, который можно отозвать на сервере (logout, смена

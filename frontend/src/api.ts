@@ -260,6 +260,12 @@ export const api = {
   autoconfigApply: (bitrate_kbps: number, retention_days: number) =>
     req(`/api/system/autoconfig/apply?bitrate_kbps=${bitrate_kbps}&retention_days=${retention_days}`,
         { method: "POST" }),
+  // SPEC §11 «Резервное копирование: автоматическое раз в сутки + ручной
+  // запуск», §18 строка «Управление бэкапами» — все четыре admin-only.
+  listBackups: () => req("/api/system/backups"),
+  createBackup: () => req("/api/system/backups", { method: "POST" }),
+  deleteBackup: (name: string) =>
+    req(`/api/system/backups/${encodeURIComponent(name)}`, { method: "DELETE" }),
   health: async () => {
     const r = await fetch("/api/health");
     try { return await r.json(); } catch { return { ok: false, db: "?", redis: "?" }; }
@@ -290,6 +296,13 @@ export function camerasExportUrl(format: "csv" | "json", includeSecrets: boolean
 // картинок заново при каждом уточнении фильтра.
 export function segmentThumbUrl(id: number): string {
   return `/api/archive/thumb/${id}?token=${getToken()}`;
+}
+
+// SPEC §11. Дамп забирает сам браузер прямой ссылкой (файл на сотни
+// мегабайт незачем тянуть через fetch в память вкладки), поэтому токен —
+// в query string, как у отчётов и выгрузки конфигурации камер.
+export function backupDownloadUrl(name: string): string {
+  return `/api/system/backups/${encodeURIComponent(name)}?token=${getToken()}`;
 }
 
 export function camSnapshotUrl(id: number): string {
