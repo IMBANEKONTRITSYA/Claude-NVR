@@ -58,12 +58,24 @@ class Settings(BaseSettings):
     # отказом (fail-closed), а не пускает без пароля.
     ONVIF_G_USERNAME: str = "onvif"
     ONVIF_G_PASSWORD: str = ""
-    # База RTSP-URI для GetReplayUri. FaceWatch пишет через MediaMTX, который
-    # НЕ отдаёт ONVIF-совместимый RTSP-replay по времени, поэтому адрес
-    # replay-источника задаёт оператор явно (напр. rtsp://mediamtx:8554).
-    # Пусто — GetReplayUri отвечает ter:NotSupported, а не выдаёт ссылку,
-    # которую нечем воспроизвести (см. DEPLOY_CHECKLIST, known gaps).
+    # База RTSP-URI для GetReplayUri. Пусто — используется встроенный
+    # replay-сервер (`services/rtsp_replay.py`), поднимаемый вместе с
+    # приложением. Заполнять нужно только если перед FaceWatch стоит свой
+    # прокси или порт проброшен наружу под другим адресом: угадать это за
+    # оператора нельзя, а выданный VMS адрес должен быть достижим с его
+    # стороны, а не с нашей.
     ONVIF_G_REPLAY_URI_BASE: str = ""
+    # Встроенный RTSP-сервер воспроизведения архива (SPEC §12, Profile G
+    # Replay). MediaMTX воспроизведение по абсолютному времени не умеет —
+    # у него путь либо тянет камеру, либо принимает публикацию, — поэтому
+    # `Range: clock=` обслуживает отдельный слушатель в процессе бэкенда.
+    # Выключатель отдельный от ONVIF_G_ENABLED: поиск по записям может быть
+    # нужен без раздачи самого видео наружу.
+    ONVIF_G_REPLAY_BUILTIN: bool = True
+    # Порт replay. 8554 занят MediaMTX (live), поэтому 8555. Наружу
+    # публиковать не обязательно: VMS ходит по адресу из GetReplayUri.
+    ONVIF_G_REPLAY_PORT: int = 8555
+    ONVIF_G_REPLAY_HOST: str = "0.0.0.0"
 
     class Config:
         env_file = ".env"

@@ -255,6 +255,20 @@ async def lifespan(app: FastAPI):
     # сколько угодно. `/api/health` про это честно отвечает 503, но между
     # «нездоров» и «перезапущен» до цикла 38 не было ничего. Подробности —
     # `liveness.py`.
+    # Воспроизведение архива для внешних VMS (SPEC §12, ONVIF Profile G
+    # Replay). Поднимается только при включённом Profile G и заданном
+    # пароле; при выключенном — `start_replay_server` возвращает None и
+    # порт не занимается вовсе.
+    from .services import rtsp_replay
+    try:
+        replay_server = await rtsp_replay.start_replay_server()
+    except OSError:
+        # Занятый порт не должен ронять бэкенд целиком: §2 «отказ одного
+        # слоя не затрагивает другой», а replay — внешняя интеграция, без
+        # которой запись, live и архив работают полностью.
+        logger.exception("RTSP replay не поднят: порт недоступен")
+        replay_server = None
+
     liveness_stop = asyncio.Event()
     loop_hb = LoopHeartbeat()
     loop_beat_task = asyncio.create_task(beat_loop(loop_hb, liveness_stop))
@@ -274,6 +288,11 @@ async def lifespan(app: FastAPI):
             await asyncio.wait_for(loop_beat_task, timeout=5)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             loop_beat_task.cancel()
+        if replay_server is not None:
+            # Снимается до планировщика: сессии держат живые ffmpeg, и
+            # оставить их после закрытия слушателя значило бы завершиться
+            # с процессами-сиротами (§13 graceful shutdown).
+            await rtsp_replay.stop_replay_server()
         reports_stop.set()
         if reports_task is not None:
             try:

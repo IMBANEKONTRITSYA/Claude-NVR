@@ -246,8 +246,33 @@ def test_search_scope_excludes_other_cameras(client, onvif_on, recorded_camera):
 
 # --- Replay -----------------------------------------------------------------
 
-def test_replay_uri_not_configured_is_fault(client, onvif_on, recorded_camera):
+def test_replay_uri_defaults_to_builtin_server(client, onvif_on, recorded_camera):
+    """Пустой `ONVIF_G_REPLAY_URI_BASE` — это встроенный replay, а не отказ.
+
+    До цикла 44 здесь стоял `ter:NotSupported`, и тест закреплял ровно тот
+    гэп §12, который цикл 44 закрыл: воспроизводить записи было нечем, и
+    оператор должен был поднять источник сам. Теперь ненастроенная база
+    означает «играет наш сервер», а `ter:NotSupported` остаётся только для
+    случая, когда воспроизведение выключено явно.
+    """
     cam_id, _, _ = recorded_camera
+    auth = _security_header(*onvif_on)
+    body = (f"<trp:GetReplayUri><trp:RecordingToken>cam{cam_id}</trp:RecordingToken>"
+            "</trp:GetReplayUri>")
+    r = client.post("/onvif/replay_service",
+                    content=_envelope(body, auth), headers=SOAP_CT)
+    assert r.status_code == 200, r.text
+    uri = _find(r.text, "Uri").text
+    assert uri.startswith("rtsp://")
+    assert uri.endswith(f":{settings.ONVIF_G_REPLAY_PORT}/cam{cam_id}")
+
+
+def test_replay_uri_fault_when_replay_disabled(client, monkeypatch, onvif_on,
+                                               recorded_camera):
+    """Выключенное воспроизведение — честный отказ, а не ссылка в никуда."""
+    cam_id, _, _ = recorded_camera
+    monkeypatch.setattr(settings, "ONVIF_G_REPLAY_BUILTIN", False)
+    monkeypatch.setattr(settings, "ONVIF_G_REPLAY_URI_BASE", "")
     auth = _security_header(*onvif_on)
     body = (f"<trp:GetReplayUri><trp:RecordingToken>cam{cam_id}</trp:RecordingToken>"
             "</trp:GetReplayUri>")
@@ -255,6 +280,19 @@ def test_replay_uri_not_configured_is_fault(client, onvif_on, recorded_camera):
                     content=_envelope(body, auth), headers=SOAP_CT)
     assert r.status_code == 400
     assert "ter:NotSupported" in r.text
+
+
+def test_replay_configuration_reports_session_timeout(client, onvif_on):
+    """GetReplayConfiguration отдаёт тот таймаут, по которому сервер и
+    правда бросает сессии, — иначе VMS рассчитывал бы keepalive не на то."""
+    from app.services import rtsp_replay
+    auth = _security_header(*onvif_on)
+    r = client.post("/onvif/replay_service",
+                    content=_envelope("<trp:GetReplayConfiguration/>", auth),
+                    headers=SOAP_CT)
+    assert r.status_code == 200, r.text
+    assert _find(r.text, "SessionTimeout").text == \
+        f"PT{rtsp_replay.SESSION_TIMEOUT_SEC}S"
 
 
 def test_replay_uri_configured_returns_uri(client, monkeypatch, onvif_on, recorded_camera):
