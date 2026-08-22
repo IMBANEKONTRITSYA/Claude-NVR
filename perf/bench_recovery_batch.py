@@ -31,8 +31,9 @@
 
 Запуск:
 
-    python perf/bench_recovery_batch.py                 # 1, 30, 120 камер
+    python perf/bench_recovery_batch.py                 # 1, 30, 120, 250
     python perf/bench_recovery_batch.py --cameras 240   # свой размер
+    python perf/bench_recovery_batch.py --repeat 5      # больше прогонов
     python perf/bench_recovery_batch.py --json
 """
 from __future__ import annotations
@@ -217,15 +218,44 @@ def measure(total_cameras: int, workers: int | None = None) -> dict:
     }
 
 
+def worst_of(total_cameras: int, workers: int | None, repeat: int) -> dict:
+    """Худший из `repeat` прогонов — им и проверяется норматив.
+
+    Одиночный прогон здесь **не воспроизводится**, и это свойство самого
+    замера, а не шум раннера. После обрыва планировщик назначает каждой
+    камере свой момент следующего опроса, и моменты эти расходятся по
+    ходу разогревочного прохода (опрос идёт пачкой, ответы приходят
+    вразнобой). Попадёт ли вернувшаяся камера в ближайшую партию «созревших»
+    или дождётся следующей — вопрос того, где её опрос оказался в
+    расписании, а не производительности: отсюда разброс от ~0.2 с до
+    потолка паузы опроса `PROBE_MAX_SEC` плюс проход, то есть ~2.5 с.
+
+    Обе величины укладываются в §19, но публиковать надо верхнюю: цикл 44
+    сначала записал в отчёт 0.21 с — лучший случай, — и число не
+    воспроизвелось на первом же повторном прогоне.
+    """
+    runs = [measure(total_cameras, workers) for _ in range(max(1, repeat))]
+    worst = max(runs, key=lambda r: (r["kick_latency_sec"] is None,
+                                     r["kick_latency_sec"] or 0.0))
+    latencies = [r["kick_latency_sec"] for r in runs
+                 if r["kick_latency_sec"] is not None]
+    worst = dict(worst)
+    worst["runs"] = len(runs)
+    worst["best_sec"] = round(min(latencies), 3) if latencies else None
+    return worst
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cameras", type=int, nargs="*", default=list(DEFAULT_SIZES))
     ap.add_argument("--workers", type=int, default=None,
                     help="размер пула опроса (по умолчанию — как в воркере)")
+    ap.add_argument("--repeat", type=int, default=3,
+                    help="прогонов на размер; в отчёт идёт ХУДШИЙ")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    results = [measure(n, args.workers) for n in args.cameras]
+    results = [worst_of(n, args.workers, args.repeat) for n in args.cameras]
     if args.json:
         print(json.dumps({"budget_sec": RECOVERY_BUDGET_SEC,
                           "default_pool": PROBE_WORKERS,
@@ -233,14 +263,17 @@ def main() -> int:
         return 0
 
     print(f"§19 восстановление потока ≤ {RECOVERY_BUDGET_SEC} с — пачка обрывов")
-    print(f"{'камер':>7} {'пул':>5} {'проход, с':>11} {'до kick, с':>12} "
-          f"{'CPU, %':>8} {'§19':>6}")
+    print(f"{'камер':>7} {'пул':>5} {'проход, с':>11} {'худшее, с':>11} "
+          f"{'лучшее, с':>11} {'CPU, %':>8} {'§19':>6}")
     for r in results:
         latency = "—" if r["kick_latency_sec"] is None else f"{r['kick_latency_sec']:.2f}"
+        best = "—" if r.get("best_sec") is None else f"{r['best_sec']:.2f}"
         verdict = "да" if r["within_budget"] else "НЕТ"
         cpu = "—" if r["cpu_pct"] is None else f"{r['cpu_pct']:.1f}"
         print(f"{r['cameras']:>7} {r['pool']:>5} {r['pass_sec']:>11.2f} "
-              f"{latency:>12} {cpu:>8} {verdict:>6}")
+              f"{latency:>11} {best:>11} {cpu:>8} {verdict:>6}")
+    print("\nНорматив проверяется по ХУДШЕМУ из прогонов "
+          f"(--repeat {args.repeat}).")
     return 0 if all(r["within_budget"] for r in results) else 1
 
 
