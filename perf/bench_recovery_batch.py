@@ -53,6 +53,11 @@ from stream_recovery import (  # noqa: E402
     PROBE_WORKERS, RecoveryPlanner, recover_once)
 from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 
+try:  # появился в цикле 48 вместе с неблокирующим опросом
+    from stream_recovery import probe_many
+except ImportError:  # замер должен работать и на коде «до фикса»
+    probe_many = None
+
 try:  # появилась в цикле 44 вместе с фиксом очереди опроса
     from stream_recovery import probe_pool_size
 except ImportError:  # замер должен работать и на коде «до фикса»
@@ -139,7 +144,8 @@ class CountingClient:
         return {}
 
 
-def measure(total_cameras: int, workers: int | None = None) -> dict:
+def measure(total_cameras: int, workers: int | None = None,
+            mode: str = "selector") -> dict:
     """Сколько секунд проходит от возвращения камеры до пересоздания пути.
 
     Одна камера возвращается, остальные `total_cameras - 1` молчат — то
@@ -162,15 +168,23 @@ def measure(total_cameras: int, workers: int | None = None) -> dict:
 
     planner = RecoveryPlanner()
     client = CountingClient()
+    # Два режима, чтобы «до» и «после» мерились одним стендом:
+    #   threads  — пул нитей с потолком PROBE_WORKERS_MAX (до цикла 48);
+    #   selector — неблокирующий проход одним потоком (с цикла 48).
+    use_selector = mode == "selector" and probe_many is not None
     pool = workers if workers is not None else probe_pool_size(len(desired))
-    executor = ThreadPoolExecutor(max_workers=pool,
-                                  thread_name_prefix="bench-probe")
+    executor = None if use_selector else ThreadPoolExecutor(
+        max_workers=pool, thread_name_prefix="bench-probe")
+    batch = probe_many if use_selector else None
+    if use_selector:
+        pool = 1
     returning_path = f"cam{len(cameras) - 1}"
     try:
         # Разогрев: обрыв у всех, планировщик узнаёт про него и назначает
         # опросы. Камера, которая вернётся, здесь ещё молчит — иначе
         # замер начинался бы уже после её пересоздания.
-        recover_once(client, desired, runtime, planner, executor=executor)
+        recover_once(client, desired, runtime, planner, executor=executor,
+                     probe_batch=batch)
         client.kicks.clear()
 
         # Камера вернулась. Дальше — то же, что делает нить супервизора:
@@ -184,7 +198,7 @@ def measure(total_cameras: int, workers: int | None = None) -> dict:
         while time.monotonic() < deadline:
             pass_started = time.monotonic()
             stats = recover_once(client, desired, runtime, planner,
-                                 executor=executor)
+                                 executor=executor, probe_batch=batch)
             if stats.get("probed"):
                 # Интересен проход, в котором опрос действительно шёл:
                 # проход без «созревших» опросов выходит мгновенно и о
@@ -201,12 +215,14 @@ def measure(total_cameras: int, workers: int | None = None) -> dict:
         cpu_sec = time.process_time() - cpu_started
         wall_sec = time.monotonic() - started
     finally:
-        executor.shutdown(wait=False)
+        if executor is not None:
+            executor.shutdown(wait=False)
         for cam in cameras:
             cam.close()
 
     return {
         "cameras": total_cameras,
+        "mode": "selector" if use_selector else "threads",
         "pool": pool,
         "pass_sec": round(pass_sec, 3),
         "cpu_sec": round(cpu_sec, 3),
@@ -218,7 +234,8 @@ def measure(total_cameras: int, workers: int | None = None) -> dict:
     }
 
 
-def worst_of(total_cameras: int, workers: int | None, repeat: int) -> dict:
+def worst_of(total_cameras: int, workers: int | None, repeat: int,
+             mode: str = "selector") -> dict:
     """Худший из `repeat` прогонов — им и проверяется норматив.
 
     Одиночный прогон здесь **не воспроизводится**, и это свойство самого
@@ -234,7 +251,7 @@ def worst_of(total_cameras: int, workers: int | None, repeat: int) -> dict:
     сначала записал в отчёт 0.21 с — лучший случай, — и число не
     воспроизвелось на первом же повторном прогоне.
     """
-    runs = [measure(total_cameras, workers) for _ in range(max(1, repeat))]
+    runs = [measure(total_cameras, workers, mode) for _ in range(max(1, repeat))]
     worst = max(runs, key=lambda r: (r["kick_latency_sec"] is None,
                                      r["kick_latency_sec"] or 0.0))
     latencies = [r["kick_latency_sec"] for r in runs
@@ -252,10 +269,13 @@ def main() -> int:
                     help="размер пула опроса (по умолчанию — как в воркере)")
     ap.add_argument("--repeat", type=int, default=3,
                     help="прогонов на размер; в отчёт идёт ХУДШИЙ")
+    ap.add_argument("--mode", choices=("selector", "threads"), default="selector",
+                    help="selector — неблокирующий проход (боевой с цикла 48); "
+                         "threads — прежний пул нитей, для сравнения")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    results = [worst_of(n, args.workers, args.repeat) for n in args.cameras]
+    results = [worst_of(n, args.workers, args.repeat, args.mode) for n in args.cameras]
     if args.json:
         print(json.dumps({"budget_sec": RECOVERY_BUDGET_SEC,
                           "default_pool": PROBE_WORKERS,
