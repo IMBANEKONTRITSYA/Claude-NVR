@@ -312,6 +312,21 @@ jobs:
           MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
             python perf/bench_recovery.py --no-supervisor | tee perf-recovery-baseline.txt
 
+      - name: Run batch-outage recovery benchmark
+        # Тот же норматив §19, но на отказе, ради которого он и написан:
+        # моргнул коммутатор и отвалились все камеры разом. Замер цикла 43
+        # мерил одну камеру и потому не видел очередь в пуле опроса — на
+        # 120 молчащих камерах вернувшаяся ждала 16.4 с при бюджете в 5 с.
+        #
+        # MediaMTX здесь не нужен: «камеры» — локальные сокеты, а Control
+        # API двойник. Меряется момент, когда до пересоздания пути дошла
+        # очередь, а сколько его исполняет сам MediaMTX, замерил шаг выше.
+        #
+        # Ненулевой код возврата означает нарушение §19 и валит джобу: это
+        # тот случай, когда «замерили и записали в отчёт» недостаточно —
+        # регрессия здесь не видна ни в одном функциональном тесте.
+        run: python perf/bench_recovery_batch.py | tee perf-recovery-batch.txt
+
       - name: Run analytics chain benchmark
         # Отдельным шагом, потому что тянет модель `buffalo_s` (~125 МБ) из
         # сети: отказ скачивания помечается в результате как `skipped` и не
@@ -378,6 +393,7 @@ jobs:
             perf-remux.txt
             perf-recovery.txt
             perf-recovery-baseline.txt
+            perf-recovery-batch.txt
 
   frontend:
     runs-on: ubuntu-latest

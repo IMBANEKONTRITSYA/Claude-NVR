@@ -64,7 +64,7 @@ import socket
 import threading
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from record_layer import MediaMTXError, camera_id_from_path
 from record_status import path_live
@@ -90,7 +90,27 @@ PROBE_TIMEOUT_SEC = 2.0
 # коммутатор, отвалиться могут все сразу, а недоступный хост держит
 # соединение до таймаута; без пула проход опроса растянулся бы на
 # `число камер × PROBE_TIMEOUT_SEC`.
+#
+# Это нижняя граница и размер пула в спокойном состоянии. Фиксированным он
+# был до цикла 44, и цикл 44 его на пачке обрывов **замерил**
+# (`perf/bench_recovery_batch.py`): при 120 молчащих камерах вернувшаяся
+# ждала своей очереди в пуле **16.4 секунды** при бюджете §19 в пять, при
+# 250 — 32.5 с. Норматив нарушался ровно в том отказе, ради которого он и
+# написан: моргнувший коммутатор роняет объект целиком, а не одну камеру.
 PROBE_WORKERS = 16
+
+# Потолок пула. Проход опроса обязан укладываться в один таймаут — тогда
+# вернувшаяся камера ждёт не очередь, а только свой опрос. §1 допускает
+# «от 12 до 250+» камер, отсюда и величина: на типовом объекте вся пачка
+# опрашивается одной волной.
+#
+# 256 нитей — это не 256 занятых ядер: нить опроса стоит в `recv` на
+# сокете и процессор почти не занимает. Замер цикла 44 на 250 молчащих
+# камерах: **4.0 % одного ядра**, и это верхняя оценка — в те же проценты
+# попали 250 сокетов-двойников камер, живущих в том же процессе. Нити
+# заводятся по мере надобности и только под обрыв: в спокойном состоянии
+# список обрыва пуст и пул остаётся в PROBE_WORKERS.
+PROBE_WORKERS_MAX = 256
 
 # Период прохода супервизора. Влияет на то, как быстро мы заметим сам
 # обрыв (то есть когда начнём опрашивать камеру), но не на время
@@ -106,6 +126,16 @@ TICK_SEC = 1.0
 # — не живая: 404 отдаёт и MediaMTX на путь без публикатора, и камера, у
 # которой запрошенный профиль ещё не поднялся.
 ALIVE_STATUSES = frozenset({200, 401, 403})
+
+
+def probe_pool_size(down: int) -> int:
+    """Сколько нитей опроса нужно на `down` камер в обрыве.
+
+    Ровно столько, чтобы проход укладывался в один `PROBE_TIMEOUT_SEC`:
+    иначе вернувшаяся камера ждёт не свой опрос, а очередь из молчащих
+    (замер — в шапке `PROBE_WORKERS`).
+    """
+    return max(PROBE_WORKERS, min(PROBE_WORKERS_MAX, int(down)))
 
 
 def _rtsp_target(url: str) -> tuple[str, int, str]:
@@ -362,16 +392,11 @@ def recover_once(client, desired: dict[str, dict], runtime: dict[str, dict] | No
         return stats
     stats["probed"] = len(targets)
 
-    if executor is not None and len(targets) > 1:
-        results = list(executor.map(lambda t: probe(t[1]), targets))
-    else:
-        results = [probe(url) for _, url in targets]
-
-    for (name, _url), alive in zip(targets, results):
+    def handle(name: str, alive: bool) -> None:
         if alive:
             stats["alive"] += 1
         if not planner.probed(name, alive, clock()):
-            continue
+            return
         try:
             kick_path(client, name, desired[name])
             planner.kicked(name, clock())
@@ -385,6 +410,31 @@ def recover_once(client, desired: dict[str, dict], runtime: dict[str, dict] | No
             planner.kicked(name, clock())
             logger.error("не удалось пересоздать путь записи", exc_info=True,
                          extra={"path": name})
+
+    if executor is not None and len(targets) > 1:
+        # Результаты разбираются **по мере готовности**, а не общим списком
+        # (`executor.map` отдаёт их в порядке аргументов и, главное, только
+        # после самого медленного). Разница видна не на одной камере, а на
+        # пачке: вернувшаяся отвечает за миллисекунды, молчащие держат нить
+        # до таймаута, и в порядке аргументов она ждала бы их всех. Именно
+        # это цикл 44 замерил как 16.4 с при бюджете §19 в 5 с.
+        futures = {executor.submit(probe, url): name for name, url in targets}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                alive = future.result()
+            except Exception:  # noqa: BLE001
+                # `rtsp_alive` исключений не бросает, но подменённый в
+                # тестах probe может: недоступная камера — не повод
+                # ронять весь проход и оставить остальные камеры без
+                # восстановления.
+                logger.debug("опрос камеры завершился ошибкой", exc_info=True,
+                             extra={"path": name})
+                alive = False
+            handle(name, alive)
+    else:
+        for name, url in targets:
+            handle(name, probe(url))
     return stats
 
 
@@ -413,7 +463,31 @@ class RecoverySupervisor:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._executor: ThreadPoolExecutor | None = None
+        self._pool_size = self._workers
         self.last_stats: dict = {}
+
+    def _grow_pool(self, down: int) -> None:
+        """Расширить пул опроса под масштаб обрыва.
+
+        Только вверх и только на время жизни процесса: сжимать его обратно
+        значило бы гасить и заводить нити на каждом моргании, а выигрыш —
+        десятки килобайт. Нити простаивают в `recv`, поэтому лишние стоят
+        памяти, а не процессора.
+        """
+        want = probe_pool_size(down)
+        if want <= self._pool_size and self._executor is not None:
+            return
+        old = self._executor
+        self._executor = ThreadPoolExecutor(max_workers=want,
+                                            thread_name_prefix="rtsp-probe")
+        self._pool_size = want
+        if old is not None:
+            # wait=False: старые нити доигрывают свой опрос и гаснут сами.
+            # Ждать их здесь значило бы задержать проход на таймаут — то
+            # есть на ту самую величину, ради которой пул и расширяется.
+            old.shutdown(wait=False)
+            logger.info("пул опроса расширен под масштаб обрыва",
+                        extra={"down": down, "workers": want})
 
     def tick(self) -> dict:
         desired = self._desired_provider() or {}
@@ -429,6 +503,13 @@ class RecoverySupervisor:
             logger.debug("супервизор: Control API недоступен", exc_info=True)
             return {"down": 0, "probed": 0, "alive": 0, "kicked": 0, "failed": 0,
                     "api_error": True}
+        # Размер пула подбирается под фактический масштаб обрыва ДО
+        # прохода. `down_paths` — чистая функция над двумя словарями (без
+        # сети), поэтому лишний её вызов здесь ничего не стоит, а знать
+        # масштаб к моменту опроса обязательно: пул, подобранный по итогам
+        # прошлого прохода, опоздал бы ровно на тот проход, который и
+        # длится дольше бюджета §19.
+        self._grow_pool(len(down_paths(desired, runtime)))
         stats = recover_once(client, desired, runtime, self.planner,
                              probe=self._probe, executor=self._executor)
         self.last_stats = stats
@@ -446,6 +527,7 @@ class RecoverySupervisor:
     def start(self) -> "RecoverySupervisor":
         self._executor = ThreadPoolExecutor(max_workers=self._workers,
                                             thread_name_prefix="rtsp-probe")
+        self._pool_size = self._workers
         self._thread = threading.Thread(target=self._run, name="record-recovery",
                                         daemon=True)
         self._thread.start()

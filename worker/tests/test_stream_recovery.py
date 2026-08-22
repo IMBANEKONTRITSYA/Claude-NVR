@@ -26,6 +26,9 @@ from stream_recovery import (
     KICK_BASE_SEC,
     PROBE_BASE_SEC,
     PROBE_MAX_SEC,
+    PROBE_WORKERS,
+    PROBE_WORKERS_MAX,
+    probe_pool_size,
     RecoveryPlanner,
     RecoverySupervisor,
     down_paths,
@@ -429,3 +432,101 @@ def test_supervisor_snapshot_shows_what_operator_needs():
     snap = sup.snapshot()
     assert snap[1]["camera_answering"] is True
     assert snap[1]["kicks"] == 1
+
+
+# --- Пачка обрывов (цикл 44) -------------------------------------------------
+
+def test_probe_pool_scales_with_the_outage():
+    """Размер пула опроса — следствие §19, а не константа.
+
+    Пул фиксированной величины (16 нитей до цикла 44) означает, что проход
+    опроса длится `камер / 16 × таймаут`: на 120 молчащих камерах это
+    16.4 с при бюджете §19 в 5 с — замерено `perf/bench_recovery_batch.py`.
+    Пул обязан расти до размера обрыва, чтобы проход укладывался в один
+    таймаут.
+    """
+    assert probe_pool_size(0) == PROBE_WORKERS
+    assert probe_pool_size(5) == PROBE_WORKERS
+    assert probe_pool_size(120) == 120
+    # Потолок: 250+ камер (§1) укладываются в одну волну, но пул не растёт
+    # безгранично на испорченном списке путей.
+    assert probe_pool_size(10_000) == PROBE_WORKERS_MAX
+
+
+def test_answering_camera_is_kicked_without_waiting_for_the_silent_ones():
+    """Вернувшаяся камера не ждёт очередь из молчащих.
+
+    Это регрессия ровно на `executor.map`, который отдавал результаты
+    только после самого медленного опроса: камера, ответившая за
+    миллисекунды, ждала таймаута всех остальных. Здесь молчащие держат
+    нить искусственно, а проверяется момент пинка относительно них.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    silent = {f"cam{i}": _conf(f"rtsp://10.0.0.{i}:554/s") for i in range(2, 10)}
+    desired = {"cam1": _conf("rtsp://10.0.0.1:554/s"), **silent}
+    runtime = {name: _live(False) for name in desired}
+
+    # Молчащие держат нить, пока вернувшуюся не пересоздали. Проход,
+    # разбирающий результаты по мере готовности, освобождает их сам и
+    # укладывается в доли секунды; проход, ждущий весь пакет, простоит
+    # весь SILENT_HOLD. Разрыв между величинами кратный, а не на грани, —
+    # иначе тест был бы зелёным и на старом поведении (проверено откатом).
+    SILENT_HOLD = 30.0
+    MAX_PASS = 5.0
+
+    kicked_at: list[float] = []
+    released = threading.Event()
+
+    def probe(url: str) -> bool:
+        if url.endswith("10.0.0.1:554/s"):
+            return True
+        released.wait(timeout=SILENT_HOLD)
+        return False
+
+    class Recorder(FakeClient):
+        def delete_path(self, name: str) -> None:
+            if name == "cam1":
+                kicked_at.append(time.monotonic())
+                released.set()
+            super().delete_path(name)
+
+    client = Recorder(runtime)
+    executor = ThreadPoolExecutor(max_workers=16)
+    started = time.monotonic()
+    try:
+        stats = recover_once(client, desired, runtime, RecoveryPlanner(),
+                             probe=probe, executor=executor)
+    finally:
+        executor.shutdown(wait=False)
+    elapsed = time.monotonic() - started
+    assert kicked_at, "вернувшуюся камеру не пересоздали вовсе"
+    assert stats["kicked"] == 1
+    assert elapsed < MAX_PASS, (
+        f"проход занял {elapsed:.1f} с: вернувшаяся камера ждала молчащих")
+
+
+def test_supervisor_grows_its_pool_under_a_mass_outage():
+    """Пул расширяется по факту обрыва, а не по числу заведённых камер.
+
+    Порядок здесь существенный: узнать масштаб надо ДО прохода. Пул,
+    подобранный по итогам прошлого прохода, опоздал бы ровно на тот
+    проход, который и длится дольше бюджета §19.
+    """
+    desired = {f"cam{i}": _conf(f"rtsp://10.0.0.{i}:554/s") for i in range(1, 41)}
+    runtime = {name: _live(False) for name in desired}
+    # Проходы вызываются вручную: нить супервизора тикает сразу после
+    # start(), и к первой же проверке пул был бы уже расширен — тест
+    # проходил бы, не проверив ничего.
+    sup = RecoverySupervisor(lambda: FakeClient(runtime), lambda: desired,
+                             probe=lambda url: False)
+    try:
+        assert sup._pool_size == PROBE_WORKERS
+        sup.tick()
+        assert sup._pool_size == 40, "пул не подстроился под масштаб обрыва"
+        # Обрыв кончился — пул не сжимается: гасить и заводить нити на
+        # каждом моргании дороже, чем держать их простаивающими.
+        sup.tick()
+        assert sup._pool_size == 40
+    finally:
+        sup.stop()
