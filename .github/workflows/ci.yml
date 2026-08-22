@@ -380,6 +380,35 @@ jobs:
         run: |
           MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
             python perf/bench_load.py --cameras 8 --analytics 2 --json | tee perf-load.json
+
+      - name: Measure live latency to the browser (SPEC §4, §19 ≤ 3 с)
+        # Норматив «задержка live ≤ 3 секунд» — про то, что видит
+        # оператор, то есть про всю цепочку до картинки на экране. Цикл 33
+        # померил только серверную часть (160 мс до отдачи сегмента) и
+        # записал в carryover, что два слагаемых из трёх требуют браузера;
+        # с тех пор норматив 12 циклов числился незакрытым. Здесь он
+        # меряется целиком: ffmpeg → MediaMTX → LL-HLS → Chrome + hls.js →
+        # <video>, по мигающему кадру, без OCR.
+        #
+        # Chrome, а не chromium из apt: поток несёт H.264, а сборки без
+        # проприетарных кодеков его не декодируют — замер упёрся бы не в
+        # задержку, а в отсутствие кодека. На раннерах GitHub Chrome
+        # предустановлен.
+        #
+        # hls.js берётся из frontend/node_modules: плеер обязан быть тем
+        # же, что у оператора, иначе меряется чужой профиль буфера.
+        #
+        # Ненулевой код возврата означает нарушение §4/§19 и валит джобу
+        # (в пределах continue-on-error всей джобы): регрессия задержки не
+        # видна ни в одном функциональном тесте.
+        run: |
+          set -euo pipefail
+          pip install playwright
+          (cd frontend && npm ci --no-audit --no-fund)
+          MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
+          BENCH_CHROMIUM="$(command -v google-chrome || command -v google-chrome-stable)" \
+            python perf/bench_live_latency.py --json | tee perf-live-latency.json
+
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
@@ -394,6 +423,7 @@ jobs:
             perf-recovery.txt
             perf-recovery-baseline.txt
             perf-recovery-batch.txt
+            perf-live-latency.json
 
   frontend:
     runs-on: ubuntu-latest
