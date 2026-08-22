@@ -160,13 +160,34 @@ def test_roi_is_rejected_for_record_only_camera(client, admin_headers, make_came
 
 
 def test_analytics_limit_setting_bounds(client, admin_headers):
+    """Границы поля берутся из масштаба объекта (§1), а не из числа в схеме.
+
+    До цикла 47 верхняя граница была 16 — хардкод, запрещённый §22
+    («Запрещено: хардкодить количество камер или аналитики») и
+    обоснованный ссылкой на «§23 (2-3 ядра на аналитику)», раздела с
+    таким содержанием в действующем ТЗ нет. Он связывал калькулятор §16:
+    на сервере из §20 по ресурсам проходило около 29 каналов, а
+    применить можно было только 16.
+
+    Ожидания считаются ОТ константы, а не повторяют её числом: иначе
+    тест сторожил бы конкретную цифру, а не правило.
+    """
+    from app.services.autoconfig import MAX_ANALYTICS_CAMERAS
+
     before = client.get("/api/settings", headers=admin_headers).json()["analytics_cameras_max"]
     try:
         assert client.put("/api/settings", json={"analytics_cameras_max": 0},
                           headers=admin_headers).status_code == 400
-        assert client.put("/api/settings", json={"analytics_cameras_max": 17},
+        assert client.put("/api/settings",
+                          json={"analytics_cameras_max": MAX_ANALYTICS_CAMERAS + 1},
                           headers=admin_headers).status_code == 400
-        assert client.put("/api/settings", json={"analytics_cameras_max": 16},
+        assert client.put("/api/settings",
+                          json={"analytics_cameras_max": MAX_ANALYTICS_CAMERAS},
+                          headers=admin_headers).status_code == 200
+        # Та самая регрессия, ради которой граница и менялась: значение
+        # выше прежнего потолка в 16 обязано приниматься. Без этой
+        # строки тест прошёл бы и на старой схеме.
+        assert client.put("/api/settings", json={"analytics_cameras_max": 29},
                           headers=admin_headers).status_code == 200
     finally:
         client.put("/api/settings", json={"analytics_cameras_max": int(before)},

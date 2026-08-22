@@ -87,17 +87,64 @@ def test_headroom_is_subtracted_before_anything_else():
 
 
 def test_analytics_recommendation_never_exceeds_setting_bounds():
-    """Предложение обязано быть применимо (SCHEMA: analytics_cameras_max ≤ 16).
+    """Предложение обязано быть применимо: оно не выходит за границу схемы.
 
     Иначе «применить» упрётся в валидацию настроек, и единственным
     результатом кнопки станет 400 — то есть функция §16 не работает
     ровно на том железе, где она интереснее всего.
+
+    Верхняя граница проверяется через саму константу и через SCHEMA
+    роутера: до цикла 47 это были две независимые копии числа 16, и
+    расходились бы они молча.
     """
-    huge = ac.plan(cores=256, ram_mb=1024 * 1024, disk_free_gb=500 * 1024)
+    from app.routers.settings import SCHEMA
+
+    assert SCHEMA["analytics_cameras_max"][2] == ac.ANALYTICS_SETTING_MAX
+
+    huge = ac.plan(cores=4096, ram_mb=16 * 1024 * 1024, disk_free_gb=5000 * 1024)
     assert huge["analytics_max"] <= ac.ANALYTICS_SETTING_MAX
     # При этом честный расчёт по ресурсам остаётся виден рядом.
     assert huge["analytics_by_resources"] > ac.ANALYTICS_SETTING_MAX
-    assert any("GPU" in w for w in huge["warnings"])
+    assert any("§1" in w for w in huge["warnings"])
+
+
+def test_target_server_gets_more_than_the_old_hardcoded_sixteen():
+    """Сервер из §20 («Большой объект», 2× CPU) получает то, что вывозит.
+
+    Это и есть регрессия, ради которой границу меняли: до цикла 47
+    предложение упиралось в 16 — число, выведенное из «2-3 ядер на
+    аналитику» удалённой редакции ТЗ и записанное в схему валидации,
+    хотя §22 прямо запрещает хардкодить количество аналитики.
+
+    Ожидание сформулировано как «больше прежнего потолка», а не «ровно
+    29»: 29 — следствие вилок §16, и привязываться к нему значило бы
+    ломать тест при первой же их правке по замеру.
+    """
+    plan = ac.plan(cores=64, ram_mb=128 * 1024, disk_free_gb=40_000)
+    assert plan["analytics_by_resources"] > 16
+    assert plan["analytics_max"] == plan["analytics_by_resources"]
+
+
+def test_gpu_advice_appears_where_spec_20_puts_it():
+    """Совет про ускоритель привязан к отметке §20, а не к потолку схемы.
+
+    Прежнее предупреждение говорило «выше 16 нужен GPU» — то есть про
+    границу настройки, а не про железо, и на сервере, где по ресурсам
+    проходит 29 каналов, администратор не узнавал главного: §20
+    рекомендует ускоритель уже с 20.
+    """
+    many = ac.plan(cores=64, ram_mb=128 * 1024, disk_free_gb=40_000)
+    assert many["analytics_by_resources"] > ac.GPU_RECOMMENDED_ABOVE
+    assert any("ускоритель" in w for w in many["warnings"])
+
+    # С ускорителем совет не нужен и не показывается.
+    with_gpu = ac.plan(cores=64, ram_mb=128 * 1024, disk_free_gb=40_000, gpu=True)
+    assert not any("ускоритель" in w for w in with_gpu["warnings"])
+
+    # Ниже отметки §20 — тоже не показывается.
+    few = ac.plan(cores=12, ram_mb=32 * 1024, disk_free_gb=8_000)
+    assert few["analytics_by_resources"] <= ac.GPU_RECOMMENDED_ABOVE
+    assert not any("ускоритель" in w for w in few["warnings"])
 
 
 def test_weak_server_gets_zero_analytics_and_says_why():
@@ -187,16 +234,84 @@ def test_storage_formula_matches_spec_and_storage_module():
         storage.nominal_gb_per_day(2048), rel=1e-9)
 
 
-def test_constants_are_the_upper_edge_of_spec_ranges():
-    """Константы §16 — верх вилок, а не низ и не середина.
+def test_cpu_constants_are_the_upper_edge_of_spec_ranges():
+    """Вилки §16 по ПРОЦЕССОРУ берутся сверху, а не снизу и не по середине.
 
     Ошибка в эту сторону даёт заниженное предложение (видно сразу,
     ничего не ломает); в обратную — завышенное, которое обнаружится
     через сутки по пропущенным сегментам. Тест стережёт направление.
     """
     assert ac.REC_CORES_PER_CAMERA == 0.04        # §16: 0.02-0.04
-    assert ac.REC_RAM_MB_PER_CAMERA == 100        # §16: 50-100 MB
     assert ac.ANALYTICS_CORES_PER_CAMERA == 1.5   # §16: 0.5-1.5
-    assert ac.ANALYTICS_RAM_MB_PER_CAMERA == 2048  # §16: 500 MB - 2 GB
     assert ac.ANALYTICS_CORES_PER_CAMERA_GPU == 0.1  # §16: ~0.1 ядра с GPU
     assert ac.HEADROOM == 0.8                     # §19: запас 20%
+
+
+def test_memory_is_modelled_as_a_constant_plus_a_per_camera_cost():
+    """Память — «постоянная часть + N × камеру», а не «N × камеру».
+
+    Вилки §16 по памяти (50-100 МБ и 500 МБ-2 ГБ на камеру) писались под
+    раскладку «процесс на камеру». Реализовано иначе: один MediaMTX на
+    все камеры записи, одна модель на все каналы аналитики. Деление всей
+    памяти на удельный расход в такой раскладке заставляет платить
+    постоянную часть заново за каждую камеру — на сервере из §20 с 32 ГБ
+    это давало 4 канала аналитики там, где по процессору проходит 29, и
+    советовало администратору докупать память вместо процессора.
+
+    Проверяется форма модели, а не конкретные мегабайты: числа приходят
+    из замера (`perf/bench_ram_scaling.py`) и меняются с каждым уточнением.
+    """
+    # Постоянная часть существует и вычитается: удвоение памяти даёт
+    # БОЛЬШЕ чем удвоение числа камер, потому что константу платят один раз.
+    small = ac.analytics_capacity(cores=1000, ram_mb=8192)["by_ram"]
+    big = ac.analytics_capacity(cores=1000, ram_mb=16384)["by_ram"]
+    assert big > small * 2
+
+    # Памяти меньше постоянной части — ноль камер, а не отрицательное число.
+    assert ac.analytics_capacity(
+        cores=1000, ram_mb=ac.ANALYTICS_RAM_CONSTANT_MB - 1)["by_ram"] == 0
+
+    # Стоимость камеры строго ниже вилки §16: вилка писалась под другую
+    # раскладку, и совпадение с ней означало бы, что правку откатили.
+    assert ac.ANALYTICS_RAM_MB_PER_CAMERA < 500
+    assert ac.REC_RAM_MB_PER_CAMERA < 50
+
+
+def test_analytics_is_bound_by_cpu_not_memory_on_the_target_server():
+    """На сервере из §20 аналитику ограничивает процессор, а не память.
+
+    Это следствие того, что модель общая: память слоя почти не растёт с
+    числом каналов (замер цикла 47 — 56 МБ на канал против 434 МБ
+    постоянной части), а процессор растёт линейно. До цикла 47 расчёт
+    говорил обратное и на 32-64 ГБ показывал «упирается в оперативную
+    память» — то есть советовал докупать не то.
+    """
+    for ram_gb in (32, 64, 128):
+        plan = ac.plan(cores=64, ram_mb=ram_gb * 1024, disk_free_gb=40_000)
+        assert plan["analytics"]["bound_by"] == "cpu", ram_gb
+
+
+def test_render_node_alone_is_not_an_inference_accelerator(monkeypatch):
+    """`/dev/dri` — не признак ускорителя для инференса.
+
+    Ответ «да» переключает расчёт с 1.5 ядра на камеру на 0.1 (§16), то
+    есть завышает предел аналитики в пятнадцать раз. До цикла 47 его
+    давал любой узел рендера — то есть любая встроенная графика на
+    сервере, где сборка ONNX Runtime CPU-шная и считать на iGPU нечем.
+    Ошибка шла ровно в ту сторону, которую докстринг модуля обещает не
+    допускать («по верхней границе система обещает меньше»).
+
+    Проверяется поведением, а не чтением исходника: подменяется и
+    `shutil.which`, и `os.path.exists`.
+    """
+    import os as _os
+    import shutil as _shutil
+
+    monkeypatch.setattr(_shutil, "which", lambda name: None)
+    monkeypatch.setattr(_os.path, "exists", lambda path: True)
+    assert ac.detect_gpu() is False
+
+    # NVIDIA с nvidia-smi по-прежнему считается ускорителем.
+    monkeypatch.setattr(_shutil, "which",
+                        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+    assert ac.detect_gpu() is True
