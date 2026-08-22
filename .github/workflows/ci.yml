@@ -322,6 +322,30 @@ jobs:
           MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
             python perf/bench_recovery.py --no-supervisor | tee perf-recovery-baseline.txt
 
+      - name: Measure segment continuity (SPEC §19, «0 пропущенных сегментов»)
+        # Последний норматив §19, который не измерялся ни разу за 49 циклов.
+        # Остальные меряются одним процессом, а этот требует, чтобы
+        # настоящий MediaMTX несколько раз перевернул сегмент на настоящем
+        # потоке: норматив нарушается на СТЫКЕ файлов, и ни двойник Control
+        # API, ни `test_segments_land_in_the_configured_media_root` (он
+        # считает файлы, а не секунды) этого места не касаются.
+        #
+        # Считаются секунды потерянного видео: имя файла даёт начало
+        # сегмента, ffprobe — фактическую длительность, разница на стыке —
+        # разрыв. Минутный сегмент вместо боевого пятиминутного (§20) —
+        # единственное отклонение, и оно консервативно: за три минуты
+        # выходит три переворота вместо половины одного.
+        #
+        # Ненулевой код возврата валит джобу по той же причине, что и
+        # batch-outage ниже: пропуски записи не видны ни в одном
+        # функциональном тесте, а восстанавливать по ним архив уже поздно.
+        #
+        # Бинарник MediaMTX скачан шагом замера remux выше.
+        run: |
+          MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
+            python perf/bench_segment_continuity.py --minutes 3 \
+            | tee perf-segment-continuity.txt
+
       - name: Run batch-outage recovery benchmark
         # Тот же норматив §19, но на отказе, ради которого он и написан:
         # моргнул коммутатор и отвалились все камеры разом. Замер цикла 43
@@ -471,6 +495,7 @@ jobs:
             perf-recovery.txt
             perf-recovery-baseline.txt
             perf-recovery-batch.txt
+            perf-segment-continuity.txt
             perf-live-latency.json
 
   frontend:
