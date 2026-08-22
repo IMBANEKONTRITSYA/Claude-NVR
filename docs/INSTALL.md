@@ -1,7 +1,12 @@
-# INSTALL — установка FaceWatch на Windows
+# INSTALL — установка FaceWatch на Windows (разработка и тестирование)
 
 Подробная инструкция для развёртывания на Windows 10/11 Pro. Краткая версия — в
 [README.md](../README.md#запуск-под-windows).
+
+> **Это не production-режим.** SPEC §26 поддерживает ровно два способа
+> развёртывания: Docker Compose (разработка, тестирование, CI, демо — эта
+> страница) и .deb + systemd на Debian 12+/Ubuntu 24.04+ для эксплуатации
+> 24/7. Установка на объекте — [INSTALL_LINUX.md](INSTALL_LINUX.md).
 
 ## 1. Требования
 

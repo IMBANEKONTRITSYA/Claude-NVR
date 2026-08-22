@@ -1,0 +1,123 @@
+#!/bin/sh
+# postinst пакета facewatch (SPEC §26).
+set -e
+
+PREFIX=@PREFIX@
+USER=facewatch
+DATA=/var/lib/facewatch
+
+# Работает ли nginx на самом деле. systemctl есть не везде (chroot сборки,
+# контейнер), поэтому сначала он, потом sysv-статус, потом сам бинарник по
+# pid-файлу — годится в любом из трёх окружений.
+nginx_is_running() {
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active --quiet nginx && return 0
+        return 1
+    fi
+    if [ -x /etc/init.d/nginx ]; then
+        /etc/init.d/nginx status >/dev/null 2>&1 && return 0
+    fi
+    [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null
+}
+
+case "$1" in
+configure)
+    # ------------------------------------------------------- пользователь
+    # Системная учётка без оболочки: сервисы не должны иметь возможности
+    # логина, а домашний каталог совпадает с каталогом данных, потому что
+    # InsightFace ищет веса в ~/.insightface.
+    if ! getent passwd "$USER" >/dev/null; then
+        adduser --system --group --home "$DATA" --no-create-home \
+                --shell /usr/sbin/nologin --quiet "$USER"
+    fi
+
+    # ------------------------------------------------------ первый запуск
+    # Секреты, каталоги, TLS, роль и база PostgreSQL. Идемпотентен: на
+    # апгрейде существующая конфигурация не трогается (SPEC §26 —
+    # «переустановка и апгрейд без потери данных»).
+    /usr/sbin/facewatch-first-run || {
+        echo "facewatch: скрипт первого запуска завершился с ошибкой."
+        echo "facewatch: после устранения причины повторите:"
+        echo "facewatch:   systemctl start facewatch-first-run"
+    }
+
+    # ------------------------------------------------------------- nginx
+    if [ -d /etc/nginx/sites-enabled ]; then
+        ln -sf ../sites-available/facewatch.conf /etc/nginx/sites-enabled/facewatch.conf
+        # Дефолтный сайт дистрибутива слушает тот же 80-й порт, и с двумя
+        # default_server nginx не стартует вовсе. Убирается только штатный
+        # симлинк на sites-available/default — то есть ровно то, что кладёт
+        # сам дистрибутив; чужие сайты оператора не трогаются.
+        if [ -L /etc/nginx/sites-enabled/default ] && \
+           [ "$(readlink /etc/nginx/sites-enabled/default)" = "/etc/nginx/sites-available/default" ]; then
+            echo "facewatch: отключаю дефолтный сайт nginx (занимает порт 80)"
+            rm -f /etc/nginx/sites-enabled/default
+        fi
+        if nginx -t >/dev/null 2>&1; then
+            # nginx нельзя просто перезагрузить: если он на машине уже стоял,
+            # но был остановлен или выключен, apt считает зависимость
+            # удовлетворённой и postinst самого nginx не отрабатывает — его
+            # никто не поднимает. Установка при этом проходит «успешно», а
+            # веб-интерфейса на объекте нет вовсе. SPEC §26 требует, чтобы
+            # после `apt install ./facewatch.deb` службы поднимались
+            # автоматически, поэтому здесь nginx включается и стартует явно.
+            if [ -d /run/systemd/system ]; then
+                systemctl enable nginx >/dev/null 2>&1 || true
+                if systemctl is-active --quiet nginx; then
+                    systemctl reload nginx >/dev/null 2>&1 || \
+                        systemctl restart nginx >/dev/null 2>&1 || true
+                else
+                    systemctl start nginx >/dev/null 2>&1 || true
+                fi
+            else
+                # Без systemd — sysv-путь. invoke-rc.d уважает policy-rc.d
+                # (сборочные окружения и контейнеры запрещают запуск служб).
+                invoke-rc.d nginx reload >/dev/null 2>&1 || \
+                    invoke-rc.d nginx restart >/dev/null 2>&1 || true
+            fi
+            # Молчаливое «не поднялся» — это мёртвый интерфейс, о котором
+            # оператор узнает только когда откроет браузер. Говорим сразу.
+            if ! nginx_is_running; then
+                echo "facewatch: nginx не запустился — веб-интерфейс недоступен."
+                echo "facewatch: диагностика: systemctl status nginx; journalctl -u nginx -n 50"
+            fi
+        else
+            echo "facewatch: nginx -t не прошёл, сайт включён, но nginx не перезагружен:"
+            nginx -t 2>&1 | sed 's/^/facewatch:   /' || true
+        fi
+    fi
+
+    # ----------------------------------------------------------- systemd
+    # Весь блок под проверкой /run/systemd/system: на машине без
+    # запущенного systemd (chroot сборки, контейнер, песочница CI без PID 1)
+    # установка обязана пройти до конца, просто без запуска служб.
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable facewatch.target facewatch-first-run.service \
+            facewatch-mediamtx.service facewatch-backend.service \
+            facewatch-worker.service facewatch-upscaler.service >/dev/null 2>&1 || true
+        # restart, а не start: на апгрейде сервисы уже работают со старым
+        # кодом, и start ничего бы не сделал — пакет обновился бы, а на
+        # объекте продолжал бы жить прежний бэкенд.
+        systemctl restart facewatch.target >/dev/null 2>&1 || \
+            echo "facewatch: не удалось запустить facewatch.target, смотрите journalctl -u facewatch-backend"
+    else
+        echo "facewatch: systemd не запущен — службы не активированы."
+        echo "facewatch: после загрузки с systemd: systemctl enable --now facewatch.target"
+    fi
+
+    cat <<'EOF'
+facewatch: установка завершена.
+facewatch:   интерфейс:  https://<адрес сервера>/   (самоподписанный сертификат)
+facewatch:   логин:      admin
+facewatch:   пароль:     /etc/facewatch/ADMIN_PASSWORD  (смените и удалите файл)
+facewatch:   настройки:  /etc/facewatch/facewatch.env
+facewatch:   данные:     /var/lib/facewatch/
+facewatch:   логи:       journalctl -u facewatch-backend -f
+EOF
+    ;;
+abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+esac
+
+exit 0

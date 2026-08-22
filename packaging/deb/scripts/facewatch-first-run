@@ -1,0 +1,165 @@
+#!/bin/sh
+# Скрипт первого запуска FaceWatch (SPEC §26).
+#
+# Делает всё, что нельзя вложить в пакет, потому что оно уникально для
+# конкретной установки: секреты, роль и база PostgreSQL, самоподписанный
+# TLS-сертификат, каталоги данных, вложенная модель распознавания.
+#
+# ИДЕМПОТЕНТЕН — это требование SPEC §26 («повторный запуск скрипта первого
+# запуска безопасен»), а не пожелание: он выполняется и из postinst, и
+# юнитом facewatch-first-run.service на каждой загрузке. Второй проход не
+# перегенерирует ни одного секрета и не трогает ни одной правки оператора;
+# он только доделывает то, чего не хватает — например, если при установке
+# PostgreSQL ещё не отвечал.
+#
+# Ничего не удаляет. Единственное деструктивное действие во всём пакете —
+# `apt purge`, и оно тоже не трогает /var/lib/facewatch (см. postrm).
+set -eu
+
+ETC=/etc/facewatch
+DATA=/var/lib/facewatch
+TEMPLATE=/usr/share/facewatch/facewatch.env.template
+PREFIX_MODELS=/opt/facewatch/models/.insightface
+USER=facewatch
+
+log() { echo "[facewatch-first-run] $*"; }
+
+# Случайная строка из алфавита, безопасного внутри URL: пароль БД попадает в
+# DATABASE_URL, и '@', ':' или '/' в нём порвали бы разбор строки
+# подключения (класс отказа, который проявляется не при установке, а при
+# первом старте сервиса).
+rand() { LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-32}"; }
+
+umask 027
+mkdir -p "$ETC" "$ETC/tls" \
+         "$DATA" "$DATA/media/segments" "$DATA/media/snapshots" \
+         "$DATA/media/avatars" "$DATA/media/uploads" "$DATA/media/thumbs" \
+         "$DATA/backups"
+
+# --------------------------------------------------------------- секреты
+if [ ! -f "$ETC/facewatch.env" ]; then
+    log "генерирую секреты в $ETC/facewatch.env"
+    SECRET_KEY="$(rand 48)"
+    # Fernet-ключ: ровно 32 байта, закодированные urlsafe-base64. Формат
+    # проверяется библиотекой при старте, случайной строкой его не подменить.
+    RTSP_KEY="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_')"
+    # Пароль администратора обязан пройти политику backend/app/config.py
+    # (длина + классы символов), иначе первый вход невозможен, а причина
+    # видна только в journal. Отсюда явные буквы, цифра и спецсимвол.
+    ADMIN_PASSWORD="$(rand 20)aA1!"
+    MEDIAMTX_API_PASSWORD="$(rand 32)"
+    DB_PASSWORD="$(rand 32)"
+
+    sed -e "s#@SECRET_KEY@#$SECRET_KEY#" \
+        -e "s#@RTSP_ENCRYPTION_KEY@#$RTSP_KEY#" \
+        -e "s#@ADMIN_PASSWORD@#$ADMIN_PASSWORD#" \
+        -e "s#@MEDIAMTX_API_PASSWORD@#$MEDIAMTX_API_PASSWORD#g" \
+        -e "s#@DB_PASSWORD@#$DB_PASSWORD#" \
+        "$TEMPLATE" > "$ETC/facewatch.env"
+
+    # Асинхронная форма URL для asyncpg — отдельным файлом, см. комментарий
+    # в facewatch-backend.service.
+    cat > "$ETC/backend.env" <<EOF
+# Создан /usr/sbin/facewatch-first-run. Асинхронная форма DATABASE_URL для
+# бэкенда (asyncpg); синхронная, для worker/upscaler, — в facewatch.env.
+DATABASE_URL=postgresql+asyncpg://facewatch:$DB_PASSWORD@127.0.0.1:5432/facewatch
+EOF
+
+    cat > "$ETC/mediamtx.env" <<EOF
+# Создан /usr/sbin/facewatch-first-run. Пароль Control API MediaMTX;
+# индекс 1 — вторая запись authInternalUsers в /etc/facewatch/mediamtx.yml
+# (пользователь facewatch). Обязан совпадать с MEDIAMTX_API_URL в
+# facewatch.env, иначе слой записи молча остаётся без путей.
+MTX_AUTHINTERNALUSERS_1_PASS=$MEDIAMTX_API_PASSWORD
+EOF
+
+    # Пароль администратора — отдельным файлом, который оператор прочитает и
+    # удалит. В journal он не печатается: journal читают все, кто состоит в
+    # systemd-journal, и он переживает установку надолго.
+    printf '%s\n' "$ADMIN_PASSWORD" > "$ETC/ADMIN_PASSWORD"
+    chmod 0600 "$ETC/ADMIN_PASSWORD"
+    log "пароль администратора записан в $ETC/ADMIN_PASSWORD (логин: admin)"
+    log "смените его в интерфейсе и удалите этот файл"
+else
+    log "конфигурация уже есть, секреты не трогаю"
+fi
+
+chmod 0640 "$ETC/facewatch.env" "$ETC/backend.env" "$ETC/mediamtx.env" 2>/dev/null || true
+chown root:"$USER" "$ETC/facewatch.env" "$ETC/backend.env" "$ETC/mediamtx.env" 2>/dev/null || true
+# Владелец правится только на самих каталогах, БЕЗ -R: рекурсия по
+# /var/lib/facewatch на объекте — это обход миллионов файлов сегментов на
+# каждой загрузке (120 камер × 14 суток × сегмент 5 минут ≈ 480 000 файлов
+# только в segments). Права на уже лежащие там файлы и так верные: их
+# создали те же сервисы под тем же пользователем.
+chown "$USER":"$USER" "$DATA" "$DATA/media" "$DATA/media/segments" \
+      "$DATA/media/snapshots" "$DATA/media/avatars" "$DATA/media/uploads" \
+      "$DATA/media/thumbs" "$DATA/backups"
+chmod 0750 "$DATA"
+
+# ------------------------------------------------------------------- TLS
+# SPEC §26: «самоподписанный сертификат генерируется при установке,
+# заменяем на боевой». Файлы в /etc/facewatch/tls переживают apt upgrade,
+# поэтому браузеру не придётся заново доверять новому сертификату.
+if [ ! -f "$ETC/tls/fullchain.pem" ] || [ ! -f "$ETC/tls/privkey.pem" ]; then
+    log "генерирую самоподписанный TLS-сертификат (10 лет)"
+    openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+        -keyout "$ETC/tls/privkey.pem" -out "$ETC/tls/fullchain.pem" \
+        -subj "/CN=facewatch.local" \
+        -addext "subjectAltName=DNS:localhost,DNS:facewatch.local,IP:127.0.0.1" \
+        >/dev/null 2>&1
+    chmod 0640 "$ETC/tls/privkey.pem"
+    chown root:"$USER" "$ETC/tls/privkey.pem"
+    # nginx читает ключ от root (мастер-процесс), группа facewatch — на
+    # случай, если оператор переведёт nginx на другого пользователя.
+fi
+
+# -------------------------------------------------------------- PostgreSQL
+# Роль, база и расширение pgvector. Всё три проверки — «есть ли уже», а не
+# «создать»: скрипт выполняется на каждой загрузке.
+DB_PASSWORD_NOW="$(sed -n 's#^DATABASE_URL=postgresql://facewatch:\([^@]*\)@.*#\1#p' "$ETC/facewatch.env" | head -1)"
+if [ -z "$DB_PASSWORD_NOW" ]; then
+    log "ВНИМАНИЕ: не смог прочитать пароль БД из $ETC/facewatch.env — пропускаю настройку PostgreSQL"
+elif ! command -v runuser >/dev/null 2>&1; then
+    log "ВНИМАНИЕ: нет runuser — настройте роль и базу PostgreSQL вручную"
+elif ! runuser -u postgres -- psql -tAc 'select 1' >/dev/null 2>&1; then
+    log "ВНИМАНИЕ: PostgreSQL не отвечает — роль и база не созданы."
+    log "Запустите СУБД и повторите: systemctl start facewatch-first-run"
+else
+    psql_su() { runuser -u postgres -- psql -v ON_ERROR_STOP=1 "$@"; }
+    if [ "$(psql_su -tAc "select count(*) from pg_roles where rolname='facewatch'")" = "0" ]; then
+        log "создаю роль facewatch"
+        psql_su -c "CREATE ROLE facewatch LOGIN PASSWORD '$DB_PASSWORD_NOW'" >/dev/null
+    else
+        # Пароль синхронизируется всегда: роль могла остаться от прошлой
+        # установки с другим паролем, и тогда сервисы не подключились бы,
+        # а причина («password authentication failed») выглядела бы как
+        # проблема СУБД, а не как след прежней установки.
+        psql_su -c "ALTER ROLE facewatch LOGIN PASSWORD '$DB_PASSWORD_NOW'" >/dev/null
+    fi
+    if [ "$(psql_su -tAc "select count(*) from pg_database where datname='facewatch'")" = "0" ]; then
+        log "создаю базу facewatch"
+        psql_su -c "CREATE DATABASE facewatch OWNER facewatch" >/dev/null
+    fi
+    if ! psql_su -d facewatch -tAc "select 1 from pg_extension where extname='vector'" | grep -q 1; then
+        log "включаю расширение pgvector"
+        if ! psql_su -d facewatch -c "CREATE EXTENSION IF NOT EXISTS vector" >/dev/null 2>&1; then
+            log "ВНИМАНИЕ: не удалось включить pgvector — поиск по лицам работать не будет."
+            log "Проверьте, что установлен postgresql-<версия>-pgvector."
+        fi
+    fi
+    # Схему создаёт сам бэкенд при старте (идемпотентные миграции,
+    # backend/app/main.py::apply_schema_migrations) — здесь только то, без
+    # чего он не подключится.
+fi
+
+# ------------------------------------------------------------------ модель
+# Вложенная в пакет модель распознавания копируется в каталог данных, а не
+# используется прямо из /opt: оператор изолированного объекта кладёт туда же
+# свою, и апгрейд пакета не должен её затирать.
+if [ -d "$PREFIX_MODELS" ] && [ ! -d "$DATA/.insightface" ]; then
+    log "раскладываю вложенную модель распознавания в $DATA/.insightface"
+    cp -a "$PREFIX_MODELS" "$DATA/.insightface"
+    chown -R "$USER":"$USER" "$DATA/.insightface"
+fi
+
+log "готово"

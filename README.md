@@ -1,7 +1,14 @@
 # FaceWatch
 
 Локальная система видеонаблюдения с распознаванием лиц для IP-камер по RTSP.
-Развёртывание на Windows 10/11 Pro одной командой через Docker Desktop.
+
+Два способа развёртывания (SPEC §26):
+
+* **Production, объект 24/7** — .deb-пакет + systemd на Debian 12+ /
+  Ubuntu 24.04+: `sudo apt install ./facewatch_*.deb`. См.
+  [docs/INSTALL_LINUX.md](docs/INSTALL_LINUX.md).
+* **Разработка, тестирование, CI, демо** — Docker Compose одной командой,
+  в том числе на Windows 10/11 Pro. См. [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Возможности
 
@@ -266,7 +273,9 @@ CI (GitHub Actions, `.github/workflows/ci.yml`) на каждый push прог�
 
 | Документ | Содержание |
 |---|---|
-| [docs/INSTALL.md](docs/INSTALL.md) | Подробная установка на Windows: требования, устранение неполадок |
+| [docs/INSTALL_LINUX.md](docs/INSTALL_LINUX.md) | **Production-установка на объекте**: .deb + systemd, обновление, боевой TLS, удаление |
+| [docs/INSTALL.md](docs/INSTALL.md) | Установка на Windows под Docker (разработка и тестирование) |
+| [packaging/README.md](packaging/README.md) | Состав .deb, сборка пакета, install-тест |
 | [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Руководство пользователя по ролям: камеры, архив, поиск, отчёты |
 | [docs/ADMIN_GUIDE.md](docs/ADMIN_GUIDE.md) | Администрирование: мониторинг, безопасность, бэкапы, пользователи |
 | [docs/API_DOCS.md](docs/API_DOCS.md) | REST API и WebSocket (плюс Swagger UI на `/docs`) |

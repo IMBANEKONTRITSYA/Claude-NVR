@@ -1,0 +1,115 @@
+name: package
+
+# Сборка production-пакета и install-тест (SPEC §26: «Сборка .deb в CI
+# (nfpm/fpm) на каждый тег + install-тест на чистом раннере с systemd:
+# пакет ставится, сервисы active, логин работает, миграции применились»).
+#
+# Отдельный workflow, а не джоба в ci.yml, ровно из-за фильтра по путям:
+# сборка тянет ~1 ГБ колёс и разворачивает многогигабайтное дерево, и
+# гонять её на каждой правке фронтенда незачем. Условия запуска:
+#   * тег v* — как требует SPEC, полный профиль, артефакт сохраняется;
+#   * PR, трогающий упаковку или то, из чего она собирается;
+#   * руками из вкладки Actions (можно выбрать профиль).
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "packaging/**"
+      - ".github/workflows/package.yml"
+      - "VERSION"
+      - "backend/requirements.txt"
+      - "worker/requirements.txt"
+      - "upscaler/requirements.txt"
+      - "docker-compose.yml"
+      - "mediamtx/mediamtx.yml"
+      - "frontend/nginx.conf"
+      - "frontend/nginx-locations.conf"
+      - "frontend/nginx-security-headers.conf"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Профиль сборки (full — с torch/GFPGAN, core — без)"
+        type: choice
+        options: ["core", "full"]
+        default: "core"
+
+jobs:
+  deb:
+    # Раннер именно с systemd (на ubuntu-раннерах GitHub systemd — PID 1):
+    # без него проверять «сервисы active» негде, а это половина требования
+    # SPEC §26. Версия зафиксирована, а не ubuntu-latest: пакет объявляет
+    # Depends на postgresql-16-pgvector, и молчаливый переезд раннера на
+    # следующий LTS сменил бы проверяемую цель.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # VERSION + короткий хеш образуют версию пакета; без истории
+          # rev-parse отработает, но fetch-depth 0 дешёв и оставляет
+          # возможность перейти на git describe.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Выбрать профиль
+        id: profile
+        # Тег — это релиз, он собирается целиком. PR проверяет упаковку, а
+        # не веса моделей: core экономит ~2.5 ГБ колёс torch и минут десять
+        # сборки, а всё, что требует SPEC §26 от install-теста (сервисы,
+        # логин, миграции), в нём проверяется полностью.
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "value=full" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ inputs.profile || 'core' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Место на диске до сборки
+        run: df -h / | tail -1
+
+      - name: Собрать .deb
+        run: |
+          sudo --preserve-env=PATH ./packaging/build-deb.sh \
+              --profile "${{ steps.profile.outputs.value }}" \
+              --out "$GITHUB_WORKSPACE/dist"
+          ls -lh "$GITHUB_WORKSPACE/dist"
+
+      - name: Проверить метаданные пакета
+        # Дешёвая проверка до дорогой: битый control или пустой список
+        # файлов виден здесь за секунду, а не после десятиминутной установки.
+        run: |
+          DEB=$(ls "$GITHUB_WORKSPACE"/dist/*.deb)
+          dpkg-deb --info "$DEB"
+          dpkg-deb --contents "$DEB" | wc -l
+          # Секретов в пакете быть не должно ни одного: они генерируются на
+          # объекте скриптом первого запуска. Файл с плейсхолдерами —
+          # шаблон, он и обязан там лежать.
+          if dpkg-deb --contents "$DEB" | grep -E '/etc/facewatch/(facewatch|backend|mediamtx)\.env$'; then
+            echo "в пакет попал файл с секретами" >&2
+            exit 1
+          fi
+
+      - name: Подготовить машину под install-тест
+        # На раннере GitHub PostgreSQL предустановлен, но остановлен —
+        # артефакт образа раннера, а не свойство чистой машины. На чистой
+        # Debian/Ubuntu его поднимет apt как зависимость пакета; здесь
+        # зависимость уже удовлетворена, и без явного старта скрипт
+        # первого запуска не нашёл бы СУБД.
+        run: |
+          sudo systemctl start postgresql || sudo systemctl start postgresql@16-main
+          sudo -u postgres psql -tAc 'select version()'
+
+      - name: Install-тест (SPEC §26)
+        run: sudo ./packaging/install-test.sh "$(ls "$GITHUB_WORKSPACE"/dist/*.deb)"
+
+      - name: Сохранить пакет
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: facewatch-deb-${{ steps.profile.outputs.value }}
+          path: dist/*.deb
+          # Тег — это релиз, его артефакт живёт дольше проверочного.
+          retention-days: ${{ github.event_name == 'push' && 90 || 7 }}
