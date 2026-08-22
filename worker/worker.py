@@ -56,8 +56,8 @@ from record_layer import (MediaMTXClient, path_conf, path_name,
                           record_media_root, record_path_template,
                           record_root_divergence, redact_url, segments_dir,
                           sync_paths)
-from record_status import (UNKNOWN, newly_lost, newly_restored, segment_gaps,
-                           stream_states, summarize)
+from record_status import (UNKNOWN, alert_batch, newly_lost, newly_restored,
+                           segment_gaps, stream_states, summarize)
 from stream_recovery import RecoverySupervisor
 from segment_index import index_new_segments
 from snapshot_http import fetch_snapshot_bytes
@@ -1834,6 +1834,60 @@ def check_disk_alerts() -> str | None:
     return level
 
 
+def _record_alert_due(kind: str, camera_id: int) -> bool:
+    """True, если по этой камере и этому виду события кулдаун истёк.
+
+    Кулдаун **на камеру**, а не общий на вид события: общий проглотил бы
+    вторую камеру, отвалившуюся через минуту после первой, — а это как раз
+    развитие аварии, ради которого алерт и заведён.
+
+    Для «пропуска записи» кулдаун обязателен по другой причине:
+    `segment_gaps()` возвращает текущие пропуски **на каждом проходе**, а не
+    переходы, поэтому без него одна невосстановленная камера слала бы
+    сообщение каждые десять секунд, пока её не починят.
+
+    Недоступность Redis трактуется как «кулдаун истёк» — так же, как в
+    `_alert_cooldown_passed`: молчащий алертинг хуже повторов.
+    """
+    try:
+        return r.set(f"alert:record:{kind}:{camera_id}", "1",
+                     ex=CONFIG["alert_cooldown_sec"], nx=True) is not None
+    except Exception:
+        return True
+
+
+def send_record_layer_alert(kind: str, camera_ids: list[int]) -> list[int]:
+    """Оповещение по слою записи (SPEC §9). Возвращает камеры, о которых
+    сообщили, — вызывающему и тесту нужно видеть решение, а не гадать.
+
+    §9 требует алертов на «потерю потока» и «пропуск записи» наравне с
+    переполнением диска. У диска оповещение есть с цикла 29 и там же
+    записана причина: «журнал на объекте никто не читает, пока архив не
+    начал стираться». К этим двум тот же довод приложим сильнее — камера,
+    переставшая писаться ночью, не оставляет по себе ничего, кроме дыры в
+    архиве, которую найдут в день, когда запись понадобится.
+
+    Что и как сказать — решает `record_status.alert_batch()`: она чистая и
+    потому проверяется в лёгкой CI-джобе воркера, которая не ставит cv2.
+    Здесь остаётся сетевое — кулдаун через Redis и сама отправка.
+    """
+    batch = alert_batch(kind, camera_ids, lambda cid: _record_alert_due(kind, cid))
+    if batch is None:
+        return []
+    fresh, subject, text_msg = batch
+    # Из фоновой нити по той же причине, что и алерт диска: обе отправки
+    # сетевые, а зовут их из цикла менеджера, который обходит камеры.
+    threading.Thread(
+        target=_send_record_alert_channels, args=(subject, text_msg), daemon=True,
+    ).start()
+    return fresh
+
+
+def _send_record_alert_channels(subject: str, text_msg: str) -> None:
+    send_telegram_alert(text_msg)
+    send_email_alert(f"FaceWatch: {subject.lower()}", text_msg)
+
+
 def record_layer_sync(cams) -> None:
     """Приводит пути MediaMTX к списку включённых камер (SPEC §2, §20).
 
@@ -1912,9 +1966,12 @@ def publish_record_layer_status(cam_names) -> dict:
     # Потеря и восстановление потока — в аудит и алертинг (SPEC §14).
     # Считается переход, а не текущее состояние: иначе физически
     # выключенная камера слала бы алерт каждые десять секунд.
-    for cam_id in newly_lost(_record_prev_status, states):
+    lost = newly_lost(_record_prev_status, states)
+    for cam_id in lost:
         logger.error("потерян поток слоя записи",
                      extra={"camera_id": cam_id, "event": "record_stream_lost"})
+    if lost:
+        send_record_layer_alert("stream_lost", lost)
     for cam_id in newly_restored(_record_prev_status, states):
         logger.info("поток слоя записи восстановлен",
                     extra={"camera_id": cam_id, "event": "record_stream_restored"})
@@ -1934,6 +1991,8 @@ def publish_record_layer_status(cam_names) -> dict:
         for cam_id in gaps:
             logger.error("пропуск записи сегмента",
                          extra={"camera_id": cam_id, "event": "record_segment_missing"})
+        if gaps:
+            send_record_layer_alert("segment_missing", list(gaps))
     except Exception:
         logger.error("не удалось проверить пропуски сегментов", exc_info=True)
         gaps = []
