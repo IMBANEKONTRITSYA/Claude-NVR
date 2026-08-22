@@ -103,13 +103,39 @@ export function Persons() {
     await saveTags(r.tags);
   };
 
+  const label = () => sel.name || `Неизвестный #${sel.id}`;
+
+  // Текст диалога раньше обещал «и все её снимки», а бэкенд сносил только
+  // карточку: снимки и эмбеддинги оставались в базе и находились поиском по
+  // фото. Обещание и действие разведены на две кнопки, и каждая говорит
+  // ровно то, что делает.
   const remove = async () => {
-    if (!(await confirm(`Удалить персону «${sel.name || `Неизвестный #${sel.id}`}» и все её снимки?`))) return;
+    if (!(await confirm(
+      `Удалить карточку «${label()}»? Снимки и события останутся в архиве без владельца. ` +
+      `Чтобы стереть и их, используйте «Удалить с биометрией».`
+    ))) return;
     try {
       await api.personDelete(sel.id);
       setSel(null);
       load();
-      toast("Персона удалена", "ok");
+      toast("Карточка удалена, архив не тронут", "ok");
+    } catch (e: any) { toast(e.message, "err"); }
+  };
+
+  // SPEC §24: удаление биометрии по требованию. Необратимо и затрагивает
+  // архив, поэтому подтверждение называет число кадров, которые исчезнут, —
+  // оно же и подтверждает исполнение требования в ответе.
+  const erase = async () => {
+    if (!(await confirm(
+      `Стереть биометрию «${label()}» (SPEC §24)? Будут удалены карточка, ` +
+      `${gallery.length ? `все её кадры (в галерее ${gallery.length})` : "все её кадры"}, ` +
+      `эмбеддинги и файлы снимков. Действие необратимо.`
+    ))) return;
+    try {
+      const r: any = await api.personEraseBiometrics(sel.id);
+      setSel(null);
+      load();
+      toast(`Биометрия удалена: событий ${r.events_removed}, файлов ${r.files_removed}`, "ok");
     } catch (e: any) { toast(e.message, "err"); }
   };
 
@@ -182,7 +208,11 @@ export function Persons() {
                 <button className="btn secondary" onClick={enhance}>Улучшить качество</button>
                 <input type="number" placeholder="ID для слияния" value={mergeTarget ?? ""} onChange={e => setMergeTarget(parseInt(e.target.value) || null)} style={{ width: 160 }} />
                 <button className="btn secondary" onClick={merge} disabled={!mergeTarget}>Слить</button>
-                <button className="btn danger" onClick={remove}>Удалить</button>
+                <button className="btn danger" onClick={remove}>Удалить карточку</button>
+                <button className="btn danger" onClick={erase}
+                        title="SPEC §24: удалить карточку вместе с кадрами, эмбеддингами и файлами снимков">
+                  Удалить с биометрией
+                </button>
               </div>
               {enhMsg && <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>{enhMsg}</div>}
               <div style={{ marginTop: 12 }}>

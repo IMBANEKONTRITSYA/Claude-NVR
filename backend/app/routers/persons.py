@@ -12,6 +12,7 @@ from ..auth import require_role
 from ..schemas import PersonOut, PersonUpdate
 from ..pagination import PageParams
 from ..params import limit_param
+from ..services.biometrics import erase_person
 from ..services.pubsub import get_redis
 from ..services.person_tags import TagError, merge_tags, normalize_tag, normalize_tags
 
@@ -170,9 +171,34 @@ async def update_person(pid: int, payload: PersonUpdate, _=Depends(require_role(
 
 @router.delete("/{pid}")
 async def delete_person(pid: int, _=Depends(require_role("admin")), db: AsyncSession = Depends(get_db)):
+    """Снимает карточку. События остаются в архиве, но без владельца.
+
+    Это НЕ удаление биометрии: внешний ключ `face_events.person_id` объявлен
+    `ON DELETE SET NULL`, поэтому снимки лица и эмбеддинги остаются в базе и
+    остаются находимыми поиском по фото. Требование §24 «удаление данных по
+    требованию» закрывает соседний роут `/{pid}/biometrics`.
+    """
     await db.execute(delete(Person).where(Person.id == pid))
     await db.commit()
     return {"ok": True}
+
+
+@router.delete("/{pid}/biometrics")
+async def erase_person_biometrics(
+    pid: int,
+    _=Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Удаление биометрии человека по требованию (SPEC §24, 152-ФЗ).
+
+    Сносит карточку вместе с её событиями, эмбеддингами и файлами снимков —
+    в отличие от `DELETE /{pid}`, который оставляет всё это в базе. Только
+    admin: операция необратима и затрагивает архив, а не одну карточку.
+    """
+    result = await erase_person(db, settings.MEDIA_PATH, pid)
+    if result is None:
+        raise HTTPException(404, "Персона не найдена")
+    return {"ok": True, **result}
 
 
 @router.post("/{src_id}/merge/{dst_id}")
