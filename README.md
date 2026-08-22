@@ -12,7 +12,8 @@
 
 ## Возможности
 
-- Подключение до 16 IP-камер по RTSP (добавление через веб-интерфейс, проверка подключения)
+- Подключение IP-камер по RTSP: от 12 до 250+ (SPEC §1, число настраивается под объект;
+  калькулятор ресурсов и автоконфигурация по железу — в админ-панели)
 - Просмотр в реальном времени (мозаика + полноэкранный режим), bounding box'ы лиц с именами
 - Детекция движения и лиц (InsightFace), извлечение эмбеддингов 512D
 - **Нейросетевой апскейл лиц** (GFPGAN) — асинхронная очередь, улучшает скриншоты и аватары
@@ -137,15 +138,26 @@ docker run --rm python:3.11-slim sh -c "pip install cryptography -q && python -c
 
 ## Архитектура
 
+Два независимых слоя (SPEC §2): запись не проходит через воркер, поэтому
+отказ аналитики её не затрагивает — и наоборот.
+
 ```
-[ IP-камеры ] --RTSP--> [ Worker (OpenCV + InsightFace) ] --ffmpeg--> [ MediaMTX ] --HLS-->
+СЛОЙ ЗАПИСИ (все камеры)
+[ IP-камеры ] --RTSP(pull)--> [ MediaMTX ] --remux--> /media/segments (без декодирования)
+                                    │  └--HLS--> live-просмотр (повторных pull с камер нет)
+                                    ↑
+                          Control API: воркер только заводит/снимает пути
+
+СЛОЙ АНАЛИТИКИ (только камеры в режиме analytics)
+[ IP-камеры ] --RTSP--> [ Worker (OpenCV + InsightFace) ]
                                   │  embed-API :9000 (поиск по фото)
                                   ├──> PostgreSQL+pgvector (персоны, события, сегменты)
                                   ├──> Redis: pub/sub (faces:new, faces:enhanced) + очередь upscale:queue
-                                  └──> /media (snapshots, segments)
+                                  └──> /media/snapshots
                                           │
 [ Upscaler (GFPGAN) ] <--upscale:queue---┘  улучшает снимок → faces:enhanced
 
+СЛОЙ ПРИЛОЖЕНИЯ
 [ Браузер ] <--HTTP/WS--> [ Nginx ] --> [ FastAPI backend ] --> Postgres / Redis / Media
                                   └--/hls/--> MediaMTX        └--/embed--> Worker (поиск по фото)
 ```
