@@ -1,0 +1,52 @@
+#!/bin/sh
+# postrm пакета facewatch.
+set -e
+
+case "$1" in
+remove)
+    if [ -d /etc/nginx/sites-enabled ]; then
+        rm -f /etc/nginx/sites-enabled/facewatch.conf
+        if [ -d /run/systemd/system ] && nginx -t >/dev/null 2>&1; then
+            invoke-rc.d nginx reload >/dev/null 2>&1 || true
+        fi
+    fi
+    [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1 || true
+    # Каталог с venv'ами: dpkg удаляет только файлы, которые он положил, а
+    # при установке пакета pip дописал в venv скомпилированные .pyc и
+    # каталоги __pycache__ — они остаются и мешают чистой переустановке.
+    rm -rf /opt/facewatch
+    ;;
+purge)
+    # ВНИМАНИЕ, важное разделение (SPEC §26 «без потери данных»):
+    #   purge удаляет КОНФИГУРАЦИЮ (/etc/facewatch) — так требует политика
+    #   Debian, и это то, что оператор ожидает от purge;
+    #   purge НЕ удаляет ДАННЫЕ (/var/lib/facewatch) — там архив
+    #   видеонаблюдения, который может быть единственной копией записей
+    #   инцидента. Пакет не тот инструмент, которым такое стирают: снести
+    #   каталог оператор всегда успеет руками, а вернуть — нет.
+    # База PostgreSQL по той же причине остаётся: она хранит события,
+    # персон и эмбеддинги.
+    rm -rf /etc/facewatch
+    rm -f /etc/nginx/sites-enabled/facewatch.conf
+    rm -rf /opt/facewatch
+    if [ -d /var/lib/facewatch ]; then
+        echo "facewatch: /var/lib/facewatch (архив и данные) НЕ удалён — сотрите вручную, если он больше не нужен."
+        echo "facewatch: база PostgreSQL 'facewatch' тоже сохранена."
+    fi
+    # Дефолтный сайт nginx, отключённый при установке, обратно НЕ
+    # включается: за время эксплуатации оператор мог настроить на этой
+    # машине что-то своё, и втихую поднять сайт-заглушку дистрибутива на
+    # 80-м порту хуже, чем оставить его выключенным и сказать об этом.
+    if [ -e /etc/nginx/sites-available/default ] && \
+       [ ! -e /etc/nginx/sites-enabled/default ]; then
+        echo "facewatch: дефолтный сайт nginx остался отключённым — включите при необходимости:"
+        echo "facewatch:   ln -s ../sites-available/default /etc/nginx/sites-enabled/default && systemctl reload nginx"
+    fi
+    # Учётная запись остаётся владельцем файлов архива: удалив её, мы
+    # оставили бы каталог с числовым UID и сломали бы повторную установку.
+    ;;
+upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    ;;
+esac
+
+exit 0
