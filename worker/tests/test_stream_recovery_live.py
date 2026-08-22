@@ -34,7 +34,8 @@ import pytest
 from record_layer import (MediaMTXClient, path_conf, path_name, segments_dir,
                           sync_paths)
 from record_status import path_live
-from stream_recovery import RecoveryPlanner, recover_once, rtsp_alive
+from stream_recovery import (RecoveryPlanner, probe_many, recover_once,
+                             rtsp_alive)
 
 ROOT = Path(__file__).resolve().parents[2]
 MEDIAMTX_BIN = os.environ.get("MEDIAMTX_BIN")
@@ -173,6 +174,30 @@ def test_probe_tells_a_live_stream_from_a_dead_one(live):
     live["camera"].stop()
     _wait(lambda: rtsp_alive(url, timeout=3.0) is False, 30,
           "проба не увидела пропавший поток")
+
+
+def test_nonblocking_pass_agrees_with_the_single_probe_on_a_real_server(live):
+    """Неблокирующий проход (боевой с цикла 48) обязан отвечать то же
+    самое, что и одиночная проба, — на НАСТОЯЩЕМ медиасервере.
+
+    Локальные двойники из `test_stream_recovery.py` отвечают мгновенно и
+    ровно то, что им велено; здесь на другом конце MediaMTX 1.16.0 со
+    своим порядком ответов, своим SDP и своим поведением на пути без
+    публикатора. Расхождение между двумя пробами означало бы, что
+    супервизор в боевом режиме видит не то же, что видят тесты.
+    """
+    url = live["source"]
+    targets = [("cam1", url)]
+    assert dict(probe_many(targets, timeout=3.0)) == {"cam1": False}
+
+    live["camera"].start()
+    _wait(lambda: dict(probe_many(targets, timeout=3.0))["cam1"] is True, 30,
+          "неблокирующий проход не увидел появившийся поток")
+    assert rtsp_alive(url, timeout=3.0) is True, "пробы разошлись на живом потоке"
+
+    live["camera"].stop()
+    _wait(lambda: dict(probe_many(targets, timeout=3.0))["cam1"] is False, 30,
+          "неблокирующий проход не увидел пропавший поток")
 
 
 def test_kick_restores_recording_faster_than_the_server_would(live):
