@@ -190,3 +190,52 @@ def test_camera_leaving_record_layer_releases_ownership(db, monkeypatch):
     # Камера ушла из списка слоя записи.
     worker.publish_record_layer_status([])
     assert 1 not in worker._record_layer_owned
+
+
+# --- алерты §9 подключены к проходу, а не только написаны ------------------
+
+def test_lost_stream_raises_the_alert_not_just_a_log_line(db, monkeypatch):
+    """§9 «Алерты: потеря потока» — оповещение обязано уйти из этого прохода.
+
+    Тест на **проводку**, а не на саму отправку (её проверяет
+    `test_record_layer_alerts.py`). Без него набор оставался бы зелёным на
+    коде, где `send_record_layer_alert()` написана безупречно и не вызвана
+    ниоткуда — ровно то состояние, в котором эти два алерта прожили до
+    цикла 50: функция логирования была, оповещения не было.
+    """
+    calls = []
+    monkeypatch.setattr(worker, "send_record_layer_alert",
+                        lambda kind, ids: calls.append((kind, list(ids))) or list(ids))
+    db.add(1, "Проходная", status="online")
+
+    # Первый проход задаёт точку отсчёта: `newly_lost` считает ПЕРЕХОД, а
+    # не текущее состояние, и на пустой истории молчит намеренно.
+    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "available": True, "ready": True,
+                                     "online": True, "inboundBytes": 4096}})
+    worker.publish_record_layer_status([(1, "Проходная")])
+    assert calls == [], "на первом проходе перехода ещё не было"
+
+    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "available": False, "ready": False,
+                                     "online": True, "inboundBytes": 0}})
+    worker.publish_record_layer_status([(1, "Проходная")])
+
+    assert ("stream_lost", [1]) in calls
+
+
+def test_segment_gap_raises_the_alert(db, monkeypatch):
+    """§9 «Алерты: пропуск записи» — вторая половина той же проводки.
+
+    Поток может быть `online`, а файлы не расти (нет места, права, сбой
+    записи в MediaMTX) — этот отказ архив теряет так же тихо.
+    """
+    calls = []
+    monkeypatch.setattr(worker, "send_record_layer_alert",
+                        lambda kind, ids: calls.append((kind, list(ids))) or list(ids))
+    monkeypatch.setattr(worker, "segment_gaps", lambda *a, **k: [1])
+    db.add(1, "Проходная", status="online")
+    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "available": True, "ready": True,
+                                     "online": True, "inboundBytes": 4096}})
+
+    worker.publish_record_layer_status([(1, "Проходная")])
+
+    assert ("segment_missing", [1]) in calls
