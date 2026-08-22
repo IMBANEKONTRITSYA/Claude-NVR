@@ -12,11 +12,14 @@ GetRecordingSummary/FindRecordings/GetRecordingSearchResults/EndSearch
 (search). Это «поисковая» половина Profile G — она отвечает на вопрос «какие
 записи есть и в каких границах», и это ровно то, что FaceWatch знает точно.
 
-**Что зависит от развёртывания:** GetReplayUri отдаёт RTSP-адрес из
-`ONVIF_G_REPLAY_URI_BASE`; без него — ter:NotSupported. MediaMTX не отдаёт
-ONVIF-replay по времени сам, поэтому боевой replay-источник настраивает
-оператор (см. DEPLOY_CHECKLIST). Interop с конкретным VMS проверяется на
-сервере — здесь проверяется контракт SOAP (форма запроса/ответа).
+**Воспроизведение** (replay): GetReplayUri отдаёт адрес встроенного
+RTSP-сервера `services/rtsp_replay.py`, который понимает `Range: clock=` —
+то есть по выданной ссылке действительно играется архив с запрошенной
+секунды. MediaMTX этого не умеет вовсе, поэтому до цикла 44 операция
+отвечала `ter:NotSupported`, а воспроизведения у Profile G не было.
+`ONVIF_G_REPLAY_URI_BASE` остаётся и перекрывает адрес — для развёртываний,
+где перед FaceWatch стоит свой прокси. Interop с конкретным VMS проверяется
+на сервере (known gap) — здесь проверяется контракт SOAP и сам RTSP.
 
 Фича выключена по умолчанию (`ONVIF_G_ENABLED`): при выключенной — 404
 (эндпоинтов как будто нет), при включённой без пароля — отказ (fail-closed).
@@ -33,6 +36,7 @@ from ..config import settings
 from ..db import SessionLocal
 from ..services import onvif_soap as soap
 from ..services import onvif_profile_g as pg
+from ..services import rtsp_replay
 from ..services.pubsub import get_redis
 
 router = APIRouter(prefix="/onvif", tags=["onvif"])
@@ -288,21 +292,53 @@ async def _search_end_search(body) -> str:
 
 # --- Replay service ---------------------------------------------------------
 
-def _replay_get_replay_uri(body) -> str:
+def _replay_get_replay_uri(request: Request, body) -> str:
+    """GetReplayUri: адрес, по которому VMS заберёт запись камеры.
+
+    Адрес ведёт на встроенный RTSP-сервер (`services/rtsp_replay.py`),
+    который понимает `Range: clock=` — то есть по нему действительно
+    воспроизводится архив с запрошенной секунды, а не живой поток. Хост
+    берётся из `Host` запроса: VMS уже дошёл до нас по этому имени, значит
+    оно у него разрешается, — а имя контейнера или `0.0.0.0` из настроек
+    у него бы не разрешилось.
+    """
     token = soap.text_of(body, "RecordingToken")
     cam_id = pg.camera_id_from_token(token or "")
     if cam_id is None:
         raise soap.SoapError("ter:NoRecording", "Неизвестный RecordingToken")
-    base = settings.ONVIF_G_REPLAY_URI_BASE.strip().rstrip("/")
-    if not base:
-        # Честно: без настроенного replay-источника ссылку выдать нечем.
+    if not settings.ONVIF_G_REPLAY_URI_BASE.strip() and not rtsp_replay.replay_enabled():
         raise soap.SoapError(
             "ter:NotSupported",
-            "Replay-источник не сконфигурирован (ONVIF_G_REPLAY_URI_BASE)")
+            "Воспроизведение выключено (ONVIF_G_REPLAY_BUILTIN)")
+    host = request.url.hostname or "127.0.0.1"
+    base = rtsp_replay.replay_uri_base(host)
     uri = f"{base}/{pg.recording_token(cam_id)}"
     return soap.envelope(
         f"<trp:GetReplayUriResponse><trp:Uri>{soap.xml_escape(uri)}</trp:Uri>"
         "</trp:GetReplayUriResponse>")
+
+
+def _replay_get_configuration() -> str:
+    """GetReplayConfiguration: единственный параметр сервиса — через какое
+    время бросается сессия, у которой замолчал клиент."""
+    return soap.envelope(
+        "<trp:GetReplayConfigurationResponse><trp:Configuration>"
+        f"<tt:SessionTimeout>{_iso_duration(rtsp_replay.SESSION_TIMEOUT_SEC)}"
+        "</tt:SessionTimeout>"
+        "</trp:Configuration></trp:GetReplayConfigurationResponse>")
+
+
+def _replay_set_configuration(body) -> str:
+    """SetReplayConfiguration принимается, но таймаут сессии не меняется.
+
+    Значение общее на сервер, а не на VMS: разрешив его менять по запросу,
+    мы позволили бы одному клиенту растянуть таймаут всем остальным — то
+    есть оставить чужие ffmpeg жить после обрыва. Ответ при этом
+    положительный и с фактическим значением (его отдаёт Get выше): ONVIF
+    не требует принимать предложенное, а отказ на штатной операции часть
+    VMS считает неисправностью сервиса.
+    """
+    return soap.envelope("<trp:SetReplayConfigurationResponse/>")
 
 
 # --- Диспетчеры эндпоинтов --------------------------------------------------
@@ -361,7 +397,11 @@ async def _dispatch(request: Request, service: str) -> Response:
                         '</tse:GetServiceCapabilitiesResponse>'))
         elif service == "replay":
             if action == "GetReplayUri":
-                return _reply(_replay_get_replay_uri(body))
+                return _reply(_replay_get_replay_uri(request, body))
+            if action == "GetReplayConfiguration":
+                return _reply(_replay_get_configuration())
+            if action == "SetReplayConfiguration":
+                return _reply(_replay_set_configuration(body))
             if action == "GetServiceCapabilities":
                 return _reply(soap.envelope(
                     '<trp:GetServiceCapabilitiesResponse><trp:Capabilities '
