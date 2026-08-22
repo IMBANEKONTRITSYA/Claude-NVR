@@ -237,10 +237,15 @@ MediaMTX без декодирования (remux) и от профиля не �
 
 ## Резервное копирование
 
-Сервис `backup` (образ `postgres:16-alpine` + cron) снимает дамп PostgreSQL
-раз в сутки (по умолчанию 03:00, `BACKUP_SCHEDULE` в `.env`) в том `backups`,
-хранит `BACKUP_RETENTION_DAYS` (по умолчанию 14) дней и удаляет более старые
-дампы автоматически. Ручной запуск: `scripts\backup_now.bat` (Windows) или
+Дамп PostgreSQL снимается раз в сутки (по умолчанию 03:00) и хранится
+`BACKUP_RETENTION_DAYS` дней; более старые удаляются автоматически.
+Расписание держит `facewatch-backup.timer` в production (.deb + systemd)
+и cron-контейнер `backup` в docker-compose.
+
+Ручной запуск, список копий, скачивание и удаление — в интерфейсе:
+«Настройки» → «Резервное копирование» (только администратор, §18).
+Мимо интерфейса: `systemctl start facewatch-backup.service`,
+`scripts\backup_now.bat` (Windows) или
 `docker compose exec backup /backup/run.sh`. Подробности и процедура
 восстановления — [docs/BACKUP.md](docs/BACKUP.md).
 

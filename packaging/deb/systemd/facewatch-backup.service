@@ -1,0 +1,39 @@
+[Unit]
+Description=FaceWatch: резервная копия базы (SPEC §11)
+Documentation=file:///usr/share/doc/facewatch/BACKUP.md
+# Дамп снимается с локальной СУБД — без неё делать нечего. Requires, а не
+# Wants: молча снятый «бэкап» неработающей базы хуже отсутствия бэкапа.
+After=postgresql.service facewatch-first-run.service
+Requires=postgresql.service
+# PartOf НЕТ намеренно, в отличие от остальных юнитов пакета: `systemctl
+# restart facewatch.target` при обновлении не должен ни прерывать идущий
+# дамп, ни запускать внеочередной.
+
+[Service]
+Type=oneshot
+User=facewatch
+Group=facewatch
+WorkingDirectory=@PREFIX@/app/backend
+EnvironmentFile=/etc/facewatch/facewatch.env
+# Тот же второй файл, что у бэкенда: в нём DATABASE_URL, из которого
+# берутся хост, порт, пользователь и база. Форма URL (asyncpg или
+# psycopg2) роли не играет — драйвер здесь не используется вовсе.
+EnvironmentFile=/etc/facewatch/backend.env
+# Ровно тот код, который стоит за кнопкой «Создать бэкап» в интерфейсе:
+# одна реализация на автоматический и ручной запуск (см. app/backup_cli.py).
+ExecStart=@PREFIX@/venv/backend/bin/python -m app.backup_cli
+Environment=HOME=/var/lib/facewatch
+Environment=PYTHONUNBUFFERED=1
+# Дамп не должен мешать записи камер: §2 требует, чтобы слой записи не
+# страдал от соседей, а pg_dump на базе объекта — это минуты диска и CPU.
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=100%
+MemoryMax=512M
+ProtectSystem=strict
+ReadWritePaths=/var/lib/facewatch
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal

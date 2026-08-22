@@ -162,6 +162,52 @@ else
     bad "в таблице users нет admin"
 fi
 
+step "5a. Резервное копирование работает на установленной системе (SPEC §11)"
+# §11 требует «автоматическое раз в сутки + ручной запуск». До цикла 47 в
+# production не было ни того, ни другого: дамп снимал только
+# cron-контейнер docker-compose, то есть НЕ production-режим по §26.
+# Проверяется тут не наличие файлов в пакете (это делают статические тесты
+# backend/tests/test_backup_service.py), а что на живой машине таймер
+# включён, а дамп действительно снимается с настоящей базы.
+if systemctl is-enabled --quiet facewatch-backup.timer; then
+    ok "таймер ежесуточного бэкапа включён"
+else
+    bad "facewatch-backup.timer не включён — автоматического бэкапа нет"
+fi
+if systemctl list-timers --all facewatch-backup.timer | grep -q facewatch-backup; then
+    ok "таймер бэкапа виден в списке systemd"
+else
+    bad "systemd не знает про facewatch-backup.timer"
+fi
+# Ручной запуск — тем же юнитом, что сработает по расписанию: если дамп
+# снимается только кнопкой, а таймер падает, узнают об этом через сутки.
+if systemctl start facewatch-backup.service; then
+    ok "facewatch-backup.service отработал"
+else
+    bad "facewatch-backup.service упал: $(journalctl -u facewatch-backup -n 20 --no-pager)"
+fi
+DUMP="$(find /var/lib/facewatch/backups -name 'facewatch_*.sql.gz' -type f | head -1)"
+if [ -n "$DUMP" ]; then
+    ok "дамп появился: $(basename "$DUMP") ($(du -h "$DUMP" | cut -f1))"
+else
+    bad "в /var/lib/facewatch/backups нет ни одного дампа"
+fi
+# Дамп обязан содержать, что восстанавливать: пустой или обрезанный файл
+# выглядит как рабочий бэкап ровно до дня восстановления.
+if [ -n "$DUMP" ] && zcat "$DUMP" | grep -q 'CREATE TABLE public.cameras'; then
+    ok "в дампе есть схема приложения"
+else
+    bad "дамп не содержит таблиц приложения"
+fi
+# Тот же дамп должен быть виден в интерфейсе (§11 «ручной запуск» и §18
+# строка «Управление бэкапами»): каталог таймера и каталог бэкенда — один.
+BK_JSON="$(curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1/api/system/backups || echo '{}')"
+if printf '%s' "$BK_JSON" | grep -q "$(basename "${DUMP:-nope}")"; then
+    ok "снятый таймером дамп виден в /api/system/backups"
+else
+    bad "бэкенд не видит дамп таймера: $BK_JSON"
+fi
+
 step "6. Идемпотентность: повторная установка того же пакета (SPEC §26)"
 SECRET_BEFORE="$(sudo md5sum /etc/facewatch/facewatch.env | cut -d' ' -f1)"
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --reinstall "$DEB"

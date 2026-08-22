@@ -19,6 +19,7 @@ from .routers import search as r_search
 from .routers import settings as r_settings
 from .routers import audit as r_audit
 from .routers import system as r_system
+from .routers import backups as r_backups
 from .routers import onvif as r_onvif
 from .services import thumbs as thumbs_svc
 from .audit import AuditMiddleware
@@ -358,6 +359,11 @@ app.include_router(r_search.router)
 app.include_router(r_settings.router)
 app.include_router(r_audit.router)
 app.include_router(r_system.router)
+# SPEC §11 «Резервное копирование: автоматическое раз в сутки + ручной
+# запуск», §18 строка «Управление бэкапами». Отдельный роутер, а не часть
+# system: все четыре роута admin-only, тогда как большинство системных
+# доступно ещё и оператору.
+app.include_router(r_backups.router)
 app.include_router(r_ws.router)
 # SPEC §12: ONVIF Profile G (хранение). Роутер сам возвращает 404, пока
 # ONVIF_G_ENABLED выключен, — маршруты монтируются всегда, но «как будто их

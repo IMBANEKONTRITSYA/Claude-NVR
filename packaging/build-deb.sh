@@ -260,6 +260,9 @@ cp "$REPO_ROOT/packaging/deb/conf/facewatch.env.template" "$STAGE/usr/share/face
 install -m 0755 "$REPO_ROOT/packaging/deb/scripts/facewatch-first-run" "$STAGE/usr/sbin/facewatch-first-run"
 install -m 0644 "$REPO_ROOT/packaging/deb/systemd/"*.service "$STAGE/lib/systemd/system/"
 install -m 0644 "$REPO_ROOT/packaging/deb/systemd/facewatch.target" "$STAGE/lib/systemd/system/"
+# Таймер ежесуточного бэкапа (SPEC §11). Отдельной строкой, а не под *.service:
+# без него «автоматическое раз в сутки» в production не выполнялось вовсе.
+install -m 0644 "$REPO_ROOT/packaging/deb/systemd/"*.timer "$STAGE/lib/systemd/system/"
 
 # Юниты и nginx-конфигурация знают префикс — он подставляется, а не
 # зашивается: --prefix обязан работать целиком, иначе он ложь.
