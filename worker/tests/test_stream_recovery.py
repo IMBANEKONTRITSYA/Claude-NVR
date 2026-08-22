@@ -530,3 +530,183 @@ def test_supervisor_grows_its_pool_under_a_mass_outage():
         assert sup._pool_size == 40
     finally:
         sup.stop()
+
+
+# --- неблокирующий проход опроса (цикл 48) ----------------------------------
+#
+# Пул нитей упирался в потолок PROBE_WORKERS_MAX = 256, и объект крупнее
+# опрашивался в несколько волн: вернувшаяся камера ждала не свой опрос, а
+# очередь. §1 допускает «от 12 до 250+», и на 600 камерах замер
+# (`perf/bench_recovery_batch.py --cameras 600 --mode threads`) давал
+# 6.4 с при бюджете §19 в пять — норматив нарушался.
+#
+# `probe_many` опрашивает любое число камер одним потоком через селектор;
+# ограничивает его не число нитей, а число дескрипторов.
+
+
+def _probe_all(targets, **kw):
+    from stream_recovery import probe_many
+    return dict(probe_many(targets, **kw))
+
+
+class _HoldingCamera:
+    """Камера, которая приняла соединение и молчит, НЕ закрывая его.
+
+    Отличается от `_RTSPStub(None)`: тот после запроса выходит из `with
+    conn` и рвёт соединение, то есть отдаёт ответ «не жива» мгновенно.
+    Дорого стоит именно молчание с открытым сокетом — оно держит опрос до
+    полного таймаута, и ради него и написан весь этот модуль.
+    """
+
+    def __init__(self):
+        self._sock = socket.socket()
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(128)
+        self.port = self._sock.getsockname()[1]
+        self._held = []
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            self._held.append(conn)
+
+    def close(self):
+        self._sock.close()
+        for conn in self._held:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+@pytest.fixture
+def holding_camera():
+    made = []
+
+    def _make():
+        cam = _HoldingCamera()
+        made.append(cam)
+        return cam
+
+    yield _make
+    for cam in made:
+        cam.close()
+
+
+@pytest.mark.parametrize("status,alive", [
+    (b"RTSP/1.0 200 OK\r\n\r\n", True),
+    (b"RTSP/1.0 401 Unauthorized\r\n\r\n", True),
+    (b"RTSP/1.0 404 Not Found\r\n\r\n", False),
+    (b"HTTP/1.1 200 OK\r\n\r\n", False),
+])
+def test_probe_many_reads_status_line_like_the_single_probe(rtsp_stub, status, alive):
+    """Вердикт обязан совпадать с `rtsp_alive` до кода: это один и тот же
+    вопрос к камере, просто заданный всем сразу."""
+    stub = rtsp_stub(status)
+    url = f"rtsp://127.0.0.1:{stub.port}/main"
+    assert _probe_all([("cam1", url)], timeout=2.0) == {"cam1": alive}
+    assert rtsp_alive(url, timeout=2.0) is alive
+
+
+def test_probe_many_never_sends_credentials(rtsp_stub):
+    stub = rtsp_stub(b"RTSP/1.0 401 Unauthorized\r\n\r\n")
+    url = f"rtsp://admin:sup3rsecret@127.0.0.1:{stub.port}/main"
+    assert _probe_all([("cam1", url)], timeout=2.0) == {"cam1": True}
+    sent = b"".join(stub.requests)
+    assert b"sup3rsecret" not in sent and b"admin" not in sent
+    assert b"Authorization" not in sent
+
+
+def test_probe_many_answers_arrive_before_the_silent_ones_time_out(
+        rtsp_stub, holding_camera):
+    """Главное свойство прохода: ответившая камера отдаётся сразу, а не
+    после таймаута молчащих. Именно это ограничивает §19."""
+    live = rtsp_stub(b"RTSP/1.0 200 OK\r\n\r\n")
+    silent = [holding_camera() for _ in range(20)]
+    from stream_recovery import probe_many
+
+    targets = [(f"silent{i}", f"rtsp://127.0.0.1:{s.port}/main")
+               for i, s in enumerate(silent)]
+    targets.append(("live", f"rtsp://127.0.0.1:{live.port}/main"))
+
+    started = time.monotonic()
+    first_name, first_alive = next(iter(probe_many(targets, timeout=2.0)))
+    elapsed = time.monotonic() - started
+    assert (first_name, first_alive) == ("live", True), (
+        "первым отдан не ответивший, а кто-то из молчащих")
+    assert elapsed < 1.0, (
+        f"ответ живой камеры пришёл через {elapsed:.2f} с — она ждала молчащих")
+
+
+def test_probe_many_finishes_within_one_timeout_for_a_whole_outage(holding_camera):
+    """Пачка молчащих камер укладывается в ОДИН таймаут, а не в
+    `камер / нитей × таймаут`. Это и есть снятый потолок в 256."""
+    silent = [holding_camera() for _ in range(60)]
+    targets = [(f"cam{i}", f"rtsp://127.0.0.1:{s.port}/main")
+               for i, s in enumerate(silent)]
+    started = time.monotonic()
+    result = _probe_all(targets, timeout=1.0)
+    elapsed = time.monotonic() - started
+    assert result == {name: False for name, _ in targets}
+    # С потолком в одну нить те же 60 камер заняли бы 60 с; здесь весь
+    # проход — один таймаут с запасом на разбор.
+    assert elapsed < 3.0, f"проход занял {elapsed:.1f} с при таймауте 1 с"
+
+
+def test_probe_many_respects_the_socket_budget(holding_camera):
+    """Дескрипторы — общий ресурс процесса: в нём же живут захваты камер
+    аналитики и соединения с БД. Проход обязан работать и с маленьким
+    бюджетом, просто в несколько волн."""
+    silent = [holding_camera() for _ in range(12)]
+    targets = [(f"cam{i}", f"rtsp://127.0.0.1:{s.port}/main")
+               for i, s in enumerate(silent)]
+    assert _probe_all(targets, timeout=0.5, max_sockets=3) == {
+        name: False for name, _ in targets}
+
+
+def test_probe_many_handles_unreachable_and_bad_urls():
+    """Ни отказ в соединении, ни мусор в URL не должны ронять проход и
+    уносить с собой опрос остальных камер."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead_port = s.getsockname()[1]
+    targets = [
+        ("dead", f"rtsp://127.0.0.1:{dead_port}/main"),
+        ("nohost", "rtsp:///main"),
+        ("garbage", "not-a-url"),
+    ]
+    assert _probe_all(targets, timeout=1.0) == {
+        "dead": False, "nohost": False, "garbage": False}
+
+
+def test_socket_budget_leaves_room_for_the_rest_of_the_process():
+    from stream_recovery import PROBE_SOCKETS_MAX, socket_budget
+    budget = socket_budget()
+    assert 16 <= budget <= PROBE_SOCKETS_MAX
+    # Потолок обязан покрывать верх диапазона §1 («от 12 до 250+») с
+    # запасом — иначе снятый потолок в 256 нитей вернулся бы как потолок
+    # в 256 сокетов.
+    assert PROBE_SOCKETS_MAX > 256
+
+
+def test_supervisor_uses_the_nonblocking_pass_by_default():
+    """Боевой режим — селектор, и нитей опроса не заводится вовсе.
+
+    Пул остаётся запасным путём и включается только явной подменой
+    `probe` (так делают тесты выше и замеры).
+    """
+    desired = {f"cam{i}": _conf(f"rtsp://10.0.0.{i}:554/s") for i in range(1, 5)}
+    runtime = {name: _live(False) for name in desired}
+    sup = RecoverySupervisor(lambda: FakeClient(runtime), lambda: desired)
+    try:
+        assert sup._probe_batch is not None
+        sup.start()
+        assert sup._executor is None, "заведён пул нитей, хотя проход неблокирующий"
+    finally:
+        sup.stop()

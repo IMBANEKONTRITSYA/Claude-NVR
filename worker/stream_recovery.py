@@ -59,7 +59,10 @@ cv2/insightface, поэтому вся логика отсюда проверя�
 """
 from __future__ import annotations
 
+import errno
 import logging
+import resource
+import selectors
 import socket
 import threading
 import time
@@ -136,6 +139,229 @@ def probe_pool_size(down: int) -> int:
     (замер — в шапке `PROBE_WORKERS`).
     """
     return max(PROBE_WORKERS, min(PROBE_WORKERS_MAX, int(down)))
+
+
+# Сколько сокетов опроса держать открытыми одновременно в неблокирующем
+# проходе (`probe_many`). Это не «сколько камер опрашивать» — их может быть
+# сколько угодно; это предел одновременно открытых дескрипторов, чтобы
+# опрос не съел лимит процесса, в котором живут ещё захваты камер
+# аналитики и соединения с БД.
+#
+# Фактическая величина берётся от RLIMIT_NOFILE процесса (см.
+# `socket_budget`), а это — потолок сверху: 1024 сокета покрывают вчетверо
+# больший объект, чем верх диапазона §1 («250+»), и дальше упирается уже
+# не проход, а сеть.
+PROBE_SOCKETS_MAX = 1024
+
+# Сколько дескрипторов оставить всему остальному процессу.
+PROBE_FD_RESERVE = 256
+
+# Кэш разрешения имён: getaddrinfo блокирует, и в неблокирующем проходе
+# один медленный DNS задержал бы весь пакет. Во время обрыва опрашиваются
+# одни и те же хосты каждые пару секунд, поэтому первый проход платит, а
+# следующие — нет. Литеральные адреса (а ONVIF-обнаружение выдаёт именно
+# их) не резолвятся вовсе.
+_DNS_TTL_SEC = 60.0
+_dns_cache: dict[str, tuple[float, str | None]] = {}
+_dns_lock = threading.Lock()
+
+
+def socket_budget() -> int:
+    """Сколько сокетов опроса можно держать открытыми одновременно."""
+    try:
+        soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):  # pragma: no cover - платформенное
+        soft = 1024
+    if soft in (resource.RLIM_INFINITY, -1):
+        return PROBE_SOCKETS_MAX
+    return max(16, min(PROBE_SOCKETS_MAX, int(soft) - PROBE_FD_RESERVE))
+
+
+def _resolve(host: str, *, now: float | None = None) -> str | None:
+    """IP хоста камеры или None. Литералы возвращаются как есть."""
+    try:
+        socket.inet_pton(socket.AF_INET, host)
+        return host
+    except (OSError, ValueError):
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, host)
+        return host
+    except (OSError, ValueError):
+        pass
+    stamp = time.monotonic() if now is None else now
+    with _dns_lock:
+        cached = _dns_cache.get(host)
+        if cached is not None and stamp - cached[0] < _DNS_TTL_SEC:
+            return cached[1]
+    try:
+        addr = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)[0][4][0]
+    except (OSError, IndexError):
+        addr = None
+    with _dns_lock:
+        _dns_cache[host] = (stamp, addr)
+    return addr
+
+
+def _describe_request(target: str) -> bytes:
+    return (f"DESCRIBE {target} RTSP/1.0\r\n"
+            "CSeq: 1\r\n"
+            "Accept: application/sdp\r\n"
+            "User-Agent: FaceWatch\r\n\r\n").encode("ascii", "ignore")
+
+
+def _status_is_alive(buf: bytes) -> bool:
+    line = buf.split(b"\r\n", 1)[0].decode("ascii", "replace")
+    parts = line.split()
+    if len(parts) < 2 or not parts[0].upper().startswith("RTSP/"):
+        return False
+    try:
+        return int(parts[1]) in ALIVE_STATUSES
+    except ValueError:
+        return False
+
+
+class _Probe:
+    """Одно соединение опроса в неблокирующем проходе."""
+
+    __slots__ = ("name", "sock", "out", "buf", "deadline", "reading")
+
+    def __init__(self, name: str, sock: socket.socket, request: bytes,
+                 deadline: float):
+        self.name = name
+        self.sock = sock
+        self.out = request
+        self.buf = b""
+        self.deadline = deadline
+        self.reading = False
+
+
+def probe_many(targets, timeout: float = PROBE_TIMEOUT_SEC,
+               max_sockets: int | None = None, clock=time.monotonic):
+    """Опрашивает пачку камер **в одном потоке**, отдавая ответы по мере прихода.
+
+    Генератор: `(имя пути, жива ли камера)`. Порядок — по факту ответа, а
+    не по списку, поэтому вернувшаяся камера не ждёт молчащих (то же
+    свойство, ради которого проход с пулом разбирал фьючерсы через
+    `as_completed`).
+
+    **Зачем это вместо пула нитей.** Пул опроса упирался в потолок
+    `PROBE_WORKERS_MAX` = 256 нитей, и объект крупнее этого числа
+    опрашивался в несколько волн: вернувшаяся камера ждала не свой опрос,
+    а очередь. §1 допускает «от 12 до 250+» камер, и на 600 замер давал
+    **6.4 с при бюджете §19 в пять** (`perf/bench_recovery_batch.py
+    --cameras 600`). Здесь одновременных опросов ограничивает не число
+    нитей, а число дескрипторов (`socket_budget()`, ~1024 по умолчанию), а
+    стоят они байты, а не стеки по мегабайту.
+
+    Опрос делает ровно то же, что `rtsp_alive`: DESCRIBE без учётных
+    данных, чтение до первой строки состояния. Исключений не бросает —
+    недоступная камера это штатное состояние, ради которого модуль и
+    написан.
+    """
+    queue = list(targets)
+    limit = max_sockets if max_sockets is not None else socket_budget()
+    limit = max(1, int(limit))
+    selector = selectors.DefaultSelector()
+    active: dict[int, _Probe] = {}
+
+    def close(probe: _Probe):
+        try:
+            selector.unregister(probe.sock)
+        except (KeyError, ValueError):
+            pass
+        active.pop(probe.sock.fileno(), None)
+        try:
+            probe.sock.close()
+        except OSError:
+            pass
+
+    def start(name: str, url: str):
+        """Заводит соединение. Возвращает готовый ответ, если его уже видно."""
+        host, port, target = _rtsp_target(url)
+        if not host:
+            return False
+        addr = _resolve(host)
+        if addr is None:
+            return False
+        sock = socket.socket(socket.AF_INET6 if ":" in addr else socket.AF_INET,
+                             socket.SOCK_STREAM)
+        try:
+            sock.setblocking(False)
+            err = sock.connect_ex((addr, port))
+            # EINPROGRESS/EWOULDBLOCK — соединение пошло; всё остальное
+            # (ECONNREFUSED сразу, EHOSTUNREACH) — камера не отвечает.
+            if err not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK):
+                sock.close()
+                return False
+            probe = _Probe(name, sock, _describe_request(target),
+                           clock() + timeout)
+            active[sock.fileno()] = probe
+            selector.register(sock, selectors.EVENT_WRITE, probe)
+            return None
+        except OSError:
+            sock.close()
+            return False
+
+    try:
+        while queue or active:
+            while queue and len(active) < limit:
+                name, url = queue.pop(0)
+                verdict = start(name, url)
+                if verdict is not None:
+                    yield name, verdict
+
+            if not active:
+                continue
+
+            now = clock()
+            nearest = min(p.deadline for p in active.values())
+            # Пауза не бесконечная и не нулевая: проснуться надо к
+            # ближайшему истечению, иначе молчащая камера держала бы
+            # дескриптор до конца прохода, не пуская следующую из очереди.
+            events = selector.select(max(0.0, min(nearest - now, timeout)))
+            for key, mask in events:
+                probe: _Probe = key.data
+                try:
+                    if not probe.reading:
+                        code = probe.sock.getsockopt(socket.SOL_SOCKET,
+                                                     socket.SO_ERROR)
+                        if code != 0:
+                            close(probe)
+                            yield probe.name, False
+                            continue
+                        sent = probe.sock.send(probe.out)
+                        probe.out = probe.out[sent:]
+                        if not probe.out:
+                            probe.reading = True
+                            selector.modify(probe.sock, selectors.EVENT_READ,
+                                            probe)
+                        continue
+                    chunk = probe.sock.recv(128)
+                    if not chunk:
+                        close(probe)
+                        yield probe.name, False
+                        continue
+                    probe.buf += chunk
+                    # Нужна только строка состояния: SDP камеры бывает
+                    # килобайтами, и ждать его конца значило бы держать
+                    # дескриптор дольше, чем нужно для ответа.
+                    if b"\r\n" in probe.buf or len(probe.buf) >= 256:
+                        alive = _status_is_alive(probe.buf)
+                        close(probe)
+                        yield probe.name, alive
+                except OSError:
+                    close(probe)
+                    yield probe.name, False
+
+            now = clock()
+            for probe in [p for p in active.values() if p.deadline <= now]:
+                close(probe)
+                yield probe.name, False
+    finally:
+        for probe in list(active.values()):
+            close(probe)
+        selector.close()
 
 
 def _rtsp_target(url: str) -> tuple[str, int, str]:
@@ -362,6 +588,7 @@ def kick_path(client, name: str, conf: dict) -> None:
 
 def recover_once(client, desired: dict[str, dict], runtime: dict[str, dict] | None,
                  planner: RecoveryPlanner, *, probe=rtsp_alive,
+                 probe_batch=None,
                  executor: ThreadPoolExecutor | None = None,
                  clock=time.monotonic) -> dict:
     """Один проход супервизора. Возвращает статистику прохода.
@@ -411,7 +638,13 @@ def recover_once(client, desired: dict[str, dict], runtime: dict[str, dict] | No
             logger.error("не удалось пересоздать путь записи", exc_info=True,
                          extra={"path": name})
 
-    if executor is not None and len(targets) > 1:
+    if probe_batch is not None and len(targets) > 1:
+        # Неблокирующий проход: один поток на любое число камер, ответы
+        # разбираются по мере прихода (генератор). Это и есть боевой путь
+        # с цикла 48 — см. шапку `probe_many`.
+        for name, alive in probe_batch(targets):
+            handle(name, alive)
+    elif executor is not None and len(targets) > 1:
         # Результаты разбираются **по мере готовности**, а не общим списком
         # (`executor.map` отдаёт их в порядке аргументов и, главное, только
         # после самого медленного). Разница видна не на одной камере, а на
@@ -452,13 +685,18 @@ class RecoverySupervisor:
     """
 
     def __init__(self, client_factory, desired_provider, *, interval: float = TICK_SEC,
-                 planner: RecoveryPlanner | None = None, probe=rtsp_alive,
+                 planner: RecoveryPlanner | None = None, probe=None,
                  workers: int = PROBE_WORKERS):
         self._client_factory = client_factory
         self._desired_provider = desired_provider
         self.interval = interval
         self.planner = planner or RecoveryPlanner()
-        self._probe = probe
+        # `probe` не задан — боевой режим: неблокирующий проход одним
+        # потоком (`probe_many`), пул нитей не заводится вовсе. Задан —
+        # старый путь через пул: так подменяют опрос тесты и замеры, и так
+        # же остаётся запасной вариант, если селектор придётся выключить.
+        self._probe_batch = probe_many if probe is None else None
+        self._probe = probe if probe is not None else rtsp_alive
         self._workers = max(1, int(workers))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -474,6 +712,10 @@ class RecoverySupervisor:
         десятки килобайт. Нити простаивают в `recv`, поэтому лишние стоят
         памяти, а не процессора.
         """
+        if self._probe_batch is not None:
+            # Неблокирующий проход нитей не заводит вовсе: одновременность
+            # там даёт селектор, а не пул. Расти нечему.
+            return
         want = probe_pool_size(down)
         if want <= self._pool_size and self._executor is not None:
             return
@@ -511,7 +753,8 @@ class RecoverySupervisor:
         # длится дольше бюджета §19.
         self._grow_pool(len(down_paths(desired, runtime)))
         stats = recover_once(client, desired, runtime, self.planner,
-                             probe=self._probe, executor=self._executor)
+                             probe=self._probe, probe_batch=self._probe_batch,
+                             executor=self._executor)
         self.last_stats = stats
         return stats
 
@@ -525,9 +768,10 @@ class RecoverySupervisor:
             self._stop.wait(self.interval)
 
     def start(self) -> "RecoverySupervisor":
-        self._executor = ThreadPoolExecutor(max_workers=self._workers,
-                                            thread_name_prefix="rtsp-probe")
-        self._pool_size = self._workers
+        if self._probe_batch is None:
+            self._executor = ThreadPoolExecutor(max_workers=self._workers,
+                                                thread_name_prefix="rtsp-probe")
+            self._pool_size = self._workers
         self._thread = threading.Thread(target=self._run, name="record-recovery",
                                         daemon=True)
         self._thread.start()
