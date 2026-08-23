@@ -87,7 +87,7 @@ def _publish(monkeypatch) -> dict:
             return {}
 
     monkeypatch.setattr(worker, "MediaMTXClient", _Client)
-    monkeypatch.setattr(worker, "_last_segment_ts", lambda ids: {})
+    monkeypatch.setattr(worker, "_last_segments", lambda ids: {})
     monkeypatch.setattr(worker, "update_status", lambda *a, **k: None)
     monkeypatch.setattr(worker.r, "set", lambda *a, **k: True)
     return worker.publish_record_layer_status([])

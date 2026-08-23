@@ -99,7 +99,7 @@ def _mediamtx(monkeypatch, paths):
             return paths
 
     monkeypatch.setattr(worker, "MediaMTXClient", _Client)
-    monkeypatch.setattr(worker, "_last_segment_ts", lambda ids: {})
+    monkeypatch.setattr(worker, "_last_segments", lambda ids: {})
 
 
 def test_record_only_camera_goes_online_from_record_layer(db, monkeypatch):
@@ -239,3 +239,81 @@ def test_segment_gap_raises_the_alert(db, monkeypatch):
     worker.publish_record_layer_status([(1, "Проходная")])
 
     assert ("segment_missing", [1]) in calls
+
+
+# --- проводка FPS и битрейта §9 -------------------------------------------
+#
+# Тесты ниже проверяют не арифметику (она в `tests/test_stream_rate.py`,
+# который выполняется и в лёгкой джобе), а ПРОВОДКУ: попадают ли обе
+# величины в полезную нагрузку, которую читает интерфейс. Без них набор
+# оставался бы зелёным на коде, где `stream_rate.py` написан безупречно и
+# не вызван ниоткуда, — ровно то состояние, в котором §9 прожил 51 цикл с
+# алертами и в котором до этого цикла жили FPS с битрейтом.
+
+
+def test_published_stream_carries_fps_and_bitrate_fields(db, monkeypatch):
+    """§9 называет три величины; в полезной нагрузке обязаны быть все три."""
+    db.add(1, "Проходная", status="online")
+    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "available": True,
+                                     "ready": True, "online": True,
+                                     "bytesReceived": 4096}})
+
+    payload = worker.publish_record_layer_status([(1, "Проходная")])
+
+    stream = payload["streams"][0]
+    assert "fps" in stream, "FPS §9 не доезжает до интерфейса"
+    assert "bitrate_kbps" in stream, "битрейт §9 не доезжает до интерфейса"
+    # На первом проходе сравнивать счётчик не с чем — прочерк, не ноль.
+    assert stream["bitrate_kbps"] is None
+    assert payload["summary"]["inbound_kbps"] is None
+    assert payload["summary"]["bitrate_measured_cameras"] == 0
+
+
+def test_bitrate_appears_on_the_second_pass_and_sums_into_the_summary(db, monkeypatch):
+    """Вторая проба счётчика даёт число — и в строке камеры, и в сводке.
+
+    Сводка проверяется вместе со строкой: суммарный входящий поток §16
+    считается по тем же величинам, и разойтись они не должны.
+    """
+    db.add(1, "Проходная", status="online")
+    monkeypatch.setattr(worker, "_record_byte_samples", {})
+
+    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "available": True,
+                                     "ready": True, "online": True,
+                                     "bytesReceived": 0}})
+    monkeypatch.setattr(worker.time, "time", lambda: 1000.0)
+    worker.publish_record_layer_status([(1, "Проходная")])
+
+    # 1 250 000 байт за 10 секунд = 1000 кбит/с.
+    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "available": True,
+                                     "ready": True, "online": True,
+                                     "bytesReceived": 1_250_000}})
+    monkeypatch.setattr(worker.time, "time", lambda: 1010.0)
+    payload = worker.publish_record_layer_status([(1, "Проходная")])
+
+    assert payload["streams"][0]["bitrate_kbps"] == 1000.0
+    assert payload["summary"]["inbound_kbps"] == 1000.0
+    assert payload["summary"]["bitrate_measured_cameras"] == 1
+
+
+def test_a_broken_probe_does_not_stop_the_record_layer_pass(db, monkeypatch):
+    """SPEC §2: от украшения строки мониторинга запись зависеть не должна.
+
+    Проход менеджера в этом же цикле ставит статусы камер, и падение
+    расчёта скорости обязано оставить их на месте.
+    """
+    db.add(1, "Проходная", status="offline")
+    _mediamtx(monkeypatch, {"cam1": {"name": "cam1", "available": True,
+                                     "ready": True, "online": True,
+                                     "bytesReceived": 4096}})
+
+    def boom(*a, **k):
+        raise RuntimeError("расчёт скорости сломан")
+
+    monkeypatch.setattr(worker, "update_bitrates", boom)
+
+    payload = worker.publish_record_layer_status([(1, "Проходная")])
+
+    assert db.status(1) == "online", "статус камеры не выставлен из-за FPS"
+    assert payload["streams"][0]["bitrate_kbps"] is None
+    assert payload["streams"][0]["fps"] is None
