@@ -530,3 +530,62 @@ def test_unparseable_duration_falls_back_to_string_comparison(garbage):
     _add, to_update, _del = diff_paths(current, {"cam1": conf})
 
     assert list(to_update) == ["cam1"]
+
+
+# Отсечка «докуда архив уже заполнен» (цикл 53). Смысл параметра в цене:
+# каталог архива на объекте — это retention × камеры × сегменты в сутки,
+# при значениях по умолчанию больше миллиона файлов в одном каталоге, а
+# обход идёт каждые ~10 с. Замеры — perf/bench_segment_scan.py.
+
+
+def test_segments_already_in_the_archive_are_not_looked_at(tmp_path):
+    """Не позже границы — пропускаются, и пропускаются ДО `os.stat`."""
+    d = str(tmp_path)
+    for ts in (1000, 1300, 1600):
+        _write(os.path.join(d, f"cam1_{ts}.mp4"), 2048, age_sec=120)
+
+    found = collect_complete_segments(d, now=time.time(), after={1: 1300})
+
+    assert [s["started_ts"] for s in found] == [1600]
+
+
+def test_the_boundary_itself_is_already_indexed(tmp_path):
+    """Сегмент с тем же временем начала — это тот же сегмент. Строгое
+    «позже», иначе последний занесённый разбирался бы каждый проход."""
+    d = str(tmp_path)
+    _write(os.path.join(d, "cam1_1000.mp4"), 2048, age_sec=120)
+
+    assert collect_complete_segments(d, now=time.time(), after={1: 1000}) == []
+
+
+def test_a_camera_without_a_boundary_is_scanned_whole(tmp_path):
+    """Камера, у которой в архиве ещё ничего нет, отсечкой не задета —
+    иначе первая же запись новой камеры не попала бы в архив никогда."""
+    d = str(tmp_path)
+    _write(os.path.join(d, "cam1_1000.mp4"), 2048, age_sec=120)
+    _write(os.path.join(d, "cam2_1000.mp4"), 2048, age_sec=120)
+    _write(os.path.join(d, "cam2_1300.mp4"), 2048, age_sec=120)
+
+    found = collect_complete_segments(d, now=time.time(), after={1: 1000})
+
+    assert [(s["camera_id"], s["started_ts"]) for s in found] == [(2, 1000), (2, 1300)]
+
+
+def test_the_boundary_of_one_camera_does_not_cut_another(tmp_path):
+    d = str(tmp_path)
+    for cam in (1, 2):
+        for ts in (1000, 1300):
+            _write(os.path.join(d, f"cam{cam}_{ts}.mp4"), 2048, age_sec=120)
+
+    found = collect_complete_segments(d, now=time.time(), after={1: 1300, 2: 1000})
+
+    assert [(s["camera_id"], s["started_ts"]) for s in found] == [(2, 1300)]
+
+
+def test_without_a_boundary_everything_is_collected_as_before(tmp_path):
+    """Обратная совместимость: без `after` поведение прежнее."""
+    d = str(tmp_path)
+    for ts in (1000, 1300):
+        _write(os.path.join(d, f"cam1_{ts}.mp4"), 2048, age_sec=120)
+
+    assert len(collect_complete_segments(d, now=time.time())) == 2

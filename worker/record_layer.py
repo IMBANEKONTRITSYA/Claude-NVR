@@ -423,7 +423,8 @@ SEGMENT_SETTLE_SEC = 30.0
 
 
 def collect_complete_segments(segments_dir: str, now: float,
-                              settle_sec: float = SEGMENT_SETTLE_SEC) -> list[dict]:
+                              settle_sec: float = SEGMENT_SETTLE_SEC,
+                              after: dict[int, float] | None = None) -> list[dict]:
     """Дописанные сегменты слоя записи, готовые к занесению в архив.
 
     Признак «дописан» двойной, и оба нужны:
@@ -434,6 +435,17 @@ def collect_complete_segments(segments_dir: str, now: float,
       последним из-за пропажи камеры, никогда не попал бы в архив: следующего
       файла не будет, пока камера не вернётся, а это может быть часами.
 
+    `after` — {камера: unix-время последнего уже занесённого сегмента};
+    файлы не позже него пропускаются **до** `os.stat`. Смысл параметра
+    целиком в цене: функция стоит в цикле менеджера и выполняется каждые
+    ~10 с, а каталог архива на объекте — это retention × камеры × сегменты
+    в сутки, то есть при сроке по умолчанию (30 суток, 120 камер,
+    сегменты по 5 минут) **больше миллиона файлов в одном каталоге**.
+    Без отсечки каждый проход снимал `stat` со всех до единого — работа,
+    результат которой затем целиком отбрасывался сверкой по `file_path`.
+    Отсечка ровно по «строго позже»: сегмент с тем же временем начала —
+    это тот же сегмент, он уже в архиве.
+
     Возвращает описания, а не строки БД: модуль не знает ни про SQLAlchemy,
     ни про модели (см. шапку файла), запись делает `segment_index.py`.
     """
@@ -442,12 +454,16 @@ def collect_complete_segments(segments_dir: str, now: float,
     except OSError:
         return []
 
+    after = after or {}
     by_cam: dict[int, list[tuple[int, str]]] = {}
     for name in names:
         parsed = parse_segment_name(name)
         if parsed is None:
             continue
         cam_id, ts = parsed
+        known_through = after.get(cam_id)
+        if known_through is not None and ts <= known_through:
+            continue
         by_cam.setdefault(cam_id, []).append((ts, name))
 
     out: list[dict] = []

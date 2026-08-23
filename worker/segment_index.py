@@ -10,7 +10,7 @@
 """
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from record_layer import SEGMENT_SETTLE_SEC, collect_complete_segments
 
@@ -59,7 +59,30 @@ def index_new_segments(session_factory, segment_model, segments_dir: str, *,
     оставлена намеренно: она даёт один неудачный проход, следующий уже
     видит камеру удалённой и пропускает её сегменты сам.
     """
-    found = collect_complete_segments(segments_dir, now, settle_sec)
+    # Граница «докуда архив уже заполнен», по камерам. Без неё каждый
+    # проход снимал `stat` со всех файлов каталога и спрашивал у БД все их
+    # пути разом — на объекте это миллион файлов и миллион параметров в
+    # `IN`, каждые ~10 с, ради нуля новых строк (замеры — в
+    # `perf/bench_segment_scan.py`).
+    #
+    # Обратное преобразование времени берётся у самой `from_timestamp`
+    # (`from_timestamp(0.0)` — начало эпохи в том виде времени, в котором
+    # вызывающий кладёт метки в БД), а не через `utcfromtimestamp`:
+    # предположение о UTC здесь было бы лишним, а `started_at` в базе
+    # получен ровно этой функцией из времени в имени файла, поэтому
+    # обратный переход точен.
+    with session_factory() as s:
+        epoch = from_timestamp(0.0)
+        after = {
+            cam_id: (last - epoch).total_seconds()
+            for cam_id, last in s.execute(
+                select(segment_model.camera_id, func.max(segment_model.started_at))
+                .group_by(segment_model.camera_id)
+            ).all()
+            if last is not None
+        }
+
+    found = collect_complete_segments(segments_dir, now, settle_sec, after=after)
     if not found:
         return 0
 
