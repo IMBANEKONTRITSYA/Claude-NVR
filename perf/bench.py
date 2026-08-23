@@ -133,6 +133,86 @@ def bench_decode_opencv(path: str) -> dict:
             "fps": round(frames / elapsed, 1) if elapsed else 0}
 
 
+# Разрешения, между которыми выбирает слой аналитики (SPEC §2, §15:
+# «основной поток либо субпоток с разрешением не ниже 640×480»).
+# Первые два порог НЕ проходят и в цикле 53 стали поводом увести аналитику
+# на основной поток; остальные проходят. Замер отвечает на единственный
+# вопрос, который этот перевод ставит: во сколько раз он дороже по декоду.
+SOURCE_TIERS = [
+    ("cif_352x288", 352, 288, False),      # §1: типовой субпоток, порог не проходит
+    ("sub_640x360", 640, 360, False),      # то, что worker.py считал кадром аналитики
+    ("d1_704x576", 704, 576, True),        # §1: верх диапазона CIF-D1, порог проходит
+    ("hd_1280x720", 1280, 720, True),      # §1: основной поток
+    ("fhd_1920x1080", 1920, 1080, True),   # §1: верх диапазона «720p-2K»
+]
+
+
+def bench_decode_tiers(tmpdir: str) -> dict:
+    """Цена декодирования по разрешениям, между которыми выбирает §2/§15.
+
+    Нужен, чтобы стоимость соблюдения порога §15 была числом, а не
+    ощущением. Субпоток ниже 640×480 SPEC источником кадров аналитики не
+    называет, поэтому камера с CIF-субпотоком переводится на основной
+    поток — и переводится она на декод, который здесь и измеряется.
+
+    Каждый тир кодируется отдельным клипом с тем же битрейтом на пиксель,
+    что и основной поток §1 (2048 кбит/с на 1280×720): одинаковый битрейт
+    на всех разрешениях сделал бы CIF неотличимо дешёвым по вводу-выводу и
+    завысил бы разрыв, а пропорциональный держит сравнение честным —
+    отличается только объём пикселей, который декодер обязан разобрать.
+    """
+    import cv2
+
+    bits_per_pixel = (CLIP_KBPS * 1000) / (CLIP_W * CLIP_H * CLIP_FPS)
+    out: dict = {}
+    for name, w, h, meets in SOURCE_TIERS:
+        kbps = max(64, round(bits_per_pixel * w * h * CLIP_FPS / 1000))
+        clip = os.path.join(tmpdir, f"tier-{name}.mp4")
+        try:
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", f"testsrc2=size={w}x{h}:rate={CLIP_FPS}",
+                "-t", str(CLIP_SECONDS),
+                "-c:v", "libx265", "-b:v", f"{kbps}k",
+                "-x265-params", "log-level=none",
+                "-pix_fmt", "yuv420p", clip,
+            ], check=True, capture_output=True)
+        except subprocess.CalledProcessError as exc:
+            out[name] = {"error": (exc.stderr or b"").decode()[-200:]}
+            continue
+
+        cap = cv2.VideoCapture(clip)
+        if not cap.isOpened():
+            out[name] = {"error": "VideoCapture не открыл клип"}
+            continue
+        frames = 0
+        t0 = time.perf_counter()
+        while True:
+            ok, _ = cap.read()
+            if not ok:
+                break
+            frames += 1
+        elapsed = time.perf_counter() - t0
+        cap.release()
+        with contextlib.suppress(OSError):
+            os.unlink(clip)
+        out[name] = {
+            "width": w, "height": h, "kbps": kbps,
+            "meets_floor": meets,
+            "frames": frames, "seconds": round(elapsed, 3),
+            "fps": round(frames / elapsed, 1) if elapsed else 0,
+            "ms_per_frame": round(elapsed * 1000 / frames, 3) if frames else None,
+        }
+
+    # Во сколько раз дороже обходится перевод камеры с CIF-субпотока на
+    # основной поток 720p — то самое решение, которое принимает
+    # worker/analytics_source.py.
+    cif, hd = out.get("cif_352x288", {}), out.get("hd_1280x720", {})
+    if cif.get("ms_per_frame") and hd.get("ms_per_frame"):
+        out["fallback_cost_ratio"] = round(hd["ms_per_frame"] / cif["ms_per_frame"], 2)
+    return out
+
+
 def bench_decode_ffmpeg_pipe(path: str) -> dict:
     """FFmpeg → сырой BGR в пайп: альтернатива, которую SPEC §28 называет
     равноправной («OpenCV / FFmpeg (CPU-декод), GStreamer опционально»).
@@ -1112,6 +1192,8 @@ def run(groups: set[str], chain_repeats: int = 1) -> dict:
                 "ffmpeg_pipe": bench_decode_ffmpeg_pipe(clip),
                 "ffmpeg_pipe_scaled_640": bench_decode_ffmpeg_scaled(clip),
             }
+            # Цена порога §2/§15 по разрешениям: см. bench_decode_tiers.
+            result["decode_tiers"] = bench_decode_tiers(tmpdir)
         if "prefilter" in groups and needs_clip:
             result["prefilter"] = bench_motion_prefilter(clip)
         if "inference" in groups:
@@ -1226,6 +1308,21 @@ def main() -> int:
             else:
                 print(f"  {name:28} {d['fps']:8.1f} FPS  ({d['frames']} кадров "
                       f"за {d['seconds']} с)")
+    if "decode_tiers" in res:
+        print("\nЦена источника аналитики по разрешениям "
+              "(SPEC §2/§15: порог 640×480):")
+        for name, d in res["decode_tiers"].items():
+            if name == "fallback_cost_ratio":
+                continue
+            if "error" in d:
+                print(f"  {name:20} ОШИБКА: {d['error']}")
+            else:
+                mark = "проходит" if d["meets_floor"] else "НИЖЕ ПОРОГА"
+                print(f"  {name:20} {d['fps']:8.1f} FPS  "
+                      f"{d['ms_per_frame']:7.3f} мс/кадр   {mark}")
+        ratio = res["decode_tiers"].get("fallback_cost_ratio")
+        if ratio:
+            print(f"  перевод CIF → 720p дороже по декоду в {ratio}×")
     if "prefilter" in res:
         print("\nПрефильтр движения (кадр 640×384):")
         for name, d in res["prefilter"].items():

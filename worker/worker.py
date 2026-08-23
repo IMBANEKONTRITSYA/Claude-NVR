@@ -42,6 +42,8 @@ from sqlalchemy import (Column, Integer, BigInteger, String, DateTime, Boolean,
                         ForeignKey, JSON, Text)
 from pgvector.sqlalchemy import Vector
 
+from analytics_source import (SUB_BELOW_FLOOR_NO_MAIN,
+                              choose_analytics_source, describe)
 from backoff import reconnect_delay
 import cpu_affinity
 from detection_schedule import schedule_active
@@ -714,6 +716,117 @@ def open_capture(url: str) -> cv2.VideoCapture:
     return cap
 
 
+def capture_resolution(cap) -> tuple[int | None, int | None]:
+    """Фактическое разрешение открытого захвата, либо (None, None).
+
+    Сначала свойства захвата: они не стоят ни одного декодированного кадра.
+    Свойство регулярно отдаёт 0 — сборка OpenCV без него, поток, у которого
+    заголовки ещё не разобраны, — и тогда берётся первый кадр. Кадр честнее
+    свойства (это ровно те пиксели, которые получит детектор), но стоит
+    декодирования, поэтому он второй, а не первый.
+
+    Прочитанный здесь кадр теряется для вызывающего. Это осознанно: замер
+    делается один раз при открытии потока, а цикл кадров ниже читает
+    свежие — на потоке в 10-15 fps потеря одного кадра при старте не
+    значит ничего, и возвращать его наружу ради этого не стоит усложнения.
+
+    Исключения гасятся: замер — вспомогательная операция, и падать на ней
+    нельзя. Не измерилось — вызывающий получит (None, None) и оставит
+    поток как есть (см. analytics_source.choose_analytics_source).
+    """
+    width = height = None
+    try:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    except Exception:
+        width = height = 0
+    if width and height:
+        return width, height
+    try:
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            h, w = frame.shape[:2]
+            return int(w), int(h)
+    except Exception:
+        pass
+    return None, None
+
+
+def publish_analytics_source(cam_id: int, decision: dict) -> None:
+    """Выбранный поток аналитики → Redis, для §9-мониторинга.
+
+    §9 требует показывать статус потоков; до этого момента дежурный видел
+    по камере аналитики только FPS детекции и не мог отличить «детекция
+    идёт по субпотоку, как задумано» от «субпоток оказался ниже порога §15
+    и аналитика молча переехала на основной поток» — а это разная нагрузка
+    на сервер и разное качество распознавания.
+    """
+    try:
+        r.hset("worker:analytics_source", str(cam_id), json.dumps({
+            "stream": decision.get("stream"),
+            "reason": decision.get("reason"),
+            "width": decision.get("width"),
+            "height": decision.get("height"),
+            "note": describe(decision),
+        }, ensure_ascii=False))
+    except Exception:
+        pass  # мониторинг не должен ронять аналитику
+
+
+def drop_analytics_source(cam_id: int) -> None:
+    """Снять запись о потоке аналитики (нить встала или не поднялась).
+
+    Запись описывает живую аналитику. Пережив нить, она превращается в
+    утверждение о том, чего нет: панель §9 показывала бы «Субпоток
+    704×576» на камере, которая сейчас не обрабатывается вовсе, — тот же
+    класс, что «честный ноль вместо последнего FPS» в цикле паузы ниже.
+    """
+    try:
+        r.hdel("worker:analytics_source", str(cam_id))
+    except Exception:
+        pass
+
+
+def open_analytics_capture(cam_id: int, rtsp_url: str, sub_rtsp_url: str | None):
+    """Открывает поток аналитики, соблюдая порог §2/§15 по разрешению.
+
+    Возвращает (cap, decision). `cap` может быть закрытым — вызывающий
+    проверяет isOpened() и уходит на обычный backoff, как и раньше.
+
+    Порядок именно такой: сначала открыть предпочтительный поток
+    (субпоток, если задан), измерить его, и только по измеренному числу
+    решать. Спросить разрешение, не открыв поток, нельзя — профиль ONVIF
+    для этого не годится (прошивки врут, а §2 говорит о разрешении
+    приходящего кадра), поэтому лишнее открытие субпотока здесь
+    неизбежно. Стоит оно одного соединения на старте нити.
+    """
+    preferred = sub_rtsp_url or rtsp_url
+    cap = open_capture(preferred)
+    if not cap.isOpened():
+        # Не открылось — решать не по чему. Отдаём как есть: вызывающий
+        # уйдёт на backoff и попробует снова, и замер случится тогда.
+        return cap, choose_analytics_source(rtsp_url, sub_rtsp_url)
+
+    width, height = capture_resolution(cap) if sub_rtsp_url else (None, None)
+    decision = choose_analytics_source(rtsp_url, sub_rtsp_url, width, height)
+
+    if decision["url"] != preferred:
+        # Порог не выдержан — переоткрываемся на основном потоке.
+        # warning, а не info: это ухудшение против задуманной схемы (декод
+        # основного потока стоит кратно дороже субпотока), и дежурный
+        # должен узнать о нём из журнала, а не догадаться по загрузке CPU.
+        logger.warning("субпоток ниже порога §15, аналитика переведена на основной поток",
+                       extra={"camera_id": cam_id, "sub_width": width, "sub_height": height,
+                              "min_width": 640, "min_height": 480})
+        cap.release()
+        cap = open_capture(decision["url"])
+    elif decision["reason"] == SUB_BELOW_FLOOR_NO_MAIN:
+        logger.warning("субпоток ниже порога §15, но переключиться некуда",
+                       extra={"camera_id": cam_id, "sub_width": width, "sub_height": height})
+
+    return cap, decision
+
+
 def build_roi_mask(roi: dict | None, shape) -> np.ndarray | None:
     """Полигоны хранятся в нормализованных координатах [0..1]."""
     if not roi or not roi.get("polygons"):
@@ -1019,23 +1132,41 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         pinned = cpu_affinity.pin_current_thread(cpus)
         logger.info("канал привязан к ядрам", extra={
             "camera_id": cam_id, "cpus": sorted(cpus), "pinned": pinned})
-    analyze_url = sub_rtsp_url or rtsp_url
     # Снимки лиц режутся из полноразмерного кадра, который камера отдаёт по
     # HTTP (ONVIF GetSnapshotUri), а не из кадра аналитики: на субпотоке
     # 640×360 лицо занимает несколько десятков пикселей. Адрес резолвится
     # один раз при старте; None означает откат на кроп из кадра аналитики.
     snapshot_url = resolve_snapshot_url(onvif_config)
+    # Поток аналитики выбирается по фактически измеренному разрешению, а не
+    # по наличию субпотока: §2 и §15 называют допустимым источником кадров
+    # основной поток либо субпоток «с разрешением не ниже 640×480», и
+    # субпоток ниже порога в этот список не входит. Решение принимается
+    # один раз при старте нити и живёт в analyze_url — все переоткрытия
+    # ниже (реконнект, возврат из окна расписания) идут по нему же, поэтому
+    # камера, уведённая с проваленного субпотока, там и остаётся.
+    cap, source = open_analytics_capture(cam_id, rtsp_url, sub_rtsp_url)
+    analyze_url = source["url"]
     logger.info("старт камеры", extra={
         "camera_id": cam_id,
-        "analytics_stream": "sub" if sub_rtsp_url else "main",
+        "analytics_stream": source["stream"],
+        "analytics_source_reason": source["reason"],
+        "analytics_width": source["width"],
+        "analytics_height": source["height"],
         "hires_snapshots": bool(snapshot_url),
     })
-    cap = open_capture(analyze_url)
     if not cap.isOpened():
         logger.error("не удалось открыть RTSP", extra={"camera_id": cam_id})
         update_status(cam_id, "offline")
+        # Этот выход идёт МИМО общего finally ниже (он ещё не начался), а
+        # manager() поднимает нить заново каждые ~10 с. Без снятия записи
+        # камера с неоткрывающимся потоком навсегда осталась бы в §9 с тем
+        # потоком, который у неё был в прошлый удачный запуск.
+        drop_analytics_source(cam_id)
         return
     update_status(cam_id, "online")
+    # Публикуется только для работающей нити: решение, принятое без
+    # единого прочитанного кадра, описывает не аналитику, а намерение.
+    publish_analytics_source(cam_id, source)
 
     # Запускается только после успешного открытия потока аналитики, а не
     # безусловно при входе в функцию: onvif_poll_worker — daemon-нить без
@@ -1308,6 +1439,10 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         # захват уже отпущен.
         if cap is not None:
             cap.release()
+        # Запись о выбранном потоке снимается вместе с нитью — см.
+        # drop_analytics_source(). Панель §9 должна показать прочерк, а не
+        # последнее известное значение.
+        drop_analytics_source(cam_id)
 
 
 
