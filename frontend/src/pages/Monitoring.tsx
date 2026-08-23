@@ -540,7 +540,14 @@ export function Monitoring() {
           hint={`${m.ram_used_mb} / ${m.ram_total_mb} МБ`} />
         <Metric label="Диск архива" value={`${m.disk_percent}%`} percent={m.disk_percent}
           hint={`свободно ${m.disk_free_gb} ГБ из ${m.disk_total_gb} ГБ`} />
-        {m.temperature_c != null && <Metric label="Температура" value={`${m.temperature_c}°C`} />}
+        {/* Источник показания подписан под числом: датчиков на сервере
+            несколько (сокеты, корпус, диски массива), и «Температура» без
+            уточнения читается как температура процессора — а до цикла 52
+            ею запросто оказывалась температура корпуса или диска. */}
+        {m.temperature_c != null && (
+          <Metric label="Температура" value={`${m.temperature_c}°C`}
+            hint={m.temperature_source || undefined} />
+        )}
       </div>
 
       <RecordLayerPanel />
