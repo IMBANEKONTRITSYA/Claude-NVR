@@ -244,6 +244,27 @@ jobs:
     # continue-on-error: бенчмарк не должен ронять мердж функциональной
     # правки, если ffmpeg на раннере повёл себя иначе.
     continue-on-error: true
+    defaults:
+      run:
+        # `pipefail` на всю джобу, и это не косметика.
+        #
+        # Почти каждый шаг здесь оканчивается `| tee perf-*.txt`. Шелл
+        # GitHub Actions по умолчанию — `bash -e {0}`, **без** `pipefail`:
+        # код возврата конвейера берётся от последней команды, то есть от
+        # `tee`, который успешен всегда. Упавший бенчмарк отчитывался
+        # зелёным шагом и пустым артефактом.
+        #
+        # Это не гипотеза. Цикл 55 обнаружил так **два** молчащих замера
+        # сразу: `bench_rto.py --hang-only` (§13, §19 RTO — драйвер падал
+        # на `import uvicorn`, стоящем в цепочке `app.liveness`) и
+        # собственный новый `bench_model_load_stall.py` (падал на
+        # `import redis`). Первый молчал не один цикл, а отчёты всё это
+        # время ссылались на его число как на измеренное.
+        #
+        # `-u` намеренно НЕ включается: шаги ссылаются на переменные,
+        # которых на форк-прогонах может не быть, и падение по ним было бы
+        # новым классом ложной красноты вместо ложной зелени.
+        shell: bash -eo pipefail {0}
     services:
       # Только ради `bench_segment_scan.py` (цикл 53): проход индексации
       # архива меряется вместе с его запросами к БД, а на SQLite «до
@@ -279,7 +300,24 @@ jobs:
         # целиком, на настоящей модели. До цикла 36 группа в CI не гонялась
         # вовсе, и оба норматива отслеживались только замерами вручную из
         # песочницы — то есть между циклами не сравнивались никак.
-        run: pip install opencv-python-headless numpy onnxruntime onnx insightface scikit-image
+        #
+        # `uvicorn` и цепочка воркера (`redis`, `sqlalchemy`,
+        # `psycopg2-binary`, `pgvector`, `cryptography`, `fastapi`,
+        # `defusedxml`) — не «на всякий случай», а по факту падений,
+        # которые до цикла 55 были не видны из-за отсутствия `pipefail`
+        # (см. `defaults` джобы):
+        #
+        # * `bench_rto.py --hang-only` поднимает драйвер, который тянет
+        #   `app.liveness` → `app.logging_utils` → `uvicorn.logging`.
+        #   Без `uvicorn` драйвер умирал молча (его stderr уходит в
+        #   DEVNULL), а замер печатал «драйвер замера не дошёл до
+        #   блокировки» и выходил с ненулевым кодом, который съедал `tee`.
+        # * `bench_model_load_stall.py` импортирует настоящий `worker` —
+        #   иначе он мерил бы не менеджер воркера, а свою заглушку.
+        run: |
+          pip install opencv-python-headless numpy onnxruntime onnx insightface scikit-image
+          pip install uvicorn redis sqlalchemy psycopg2-binary pgvector cryptography \
+            fastapi defusedxml
       - name: Run benchmarks
         run: python perf/bench.py --json | tee perf-results.json
       - name: Measure hang detection (SPEC §13, §19 RTO)
