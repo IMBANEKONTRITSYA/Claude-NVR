@@ -62,6 +62,19 @@ def archive(tmp_path, monkeypatch):
         t.drop(engine, checkfirst=True)
         t.create(engine, checkfirst=True)
 
+    # `persons` заводится минимальным DDL, а не из модели: у неё колонки
+    # `Vector(512)` и `ARRAY(Text)`, которых на SQLite нет вовсе. Уборке
+    # нужен один столбец `avatar_path` — тот же приём, что применён к
+    # `face_events` в `test_retention_rotation.py`.
+    with engine.begin() as conn:
+        conn.execute(_sql("DROP TABLE IF EXISTS persons"))
+        conn.execute(_sql(
+            "CREATE TABLE persons (id INTEGER PRIMARY KEY, name VARCHAR, "
+            "status VARCHAR, avatar_path VARCHAR)"
+            if not is_pg else
+            "CREATE TABLE persons (id SERIAL PRIMARY KEY, name VARCHAR, "
+            "status VARCHAR, avatar_path VARCHAR)"))
+
     Session = sessionmaker(bind=engine)
     segdir = tmp_path / "segments"
     segdir.mkdir()
@@ -101,6 +114,26 @@ def archive(tmp_path, monkeypatch):
             f = p / f"{seg_id}.jpg"
             f.write_bytes(b"\0" * 128)
             return f
+
+        def person(self, name, avatar_rel=None):
+            """Карточка персоны с файлом аватара (SPEC §15)."""
+            if avatar_rel:
+                f = tmp_path / avatar_rel
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_bytes(b"\0" * 64)
+            with Session() as s:
+                pid = s.execute(_sql(
+                    "INSERT INTO persons (name, status, avatar_path) "
+                    "VALUES (:n, 'known', :a) RETURNING id"),
+                    {"n": name, "a": avatar_rel}).scalar()
+                s.commit()
+                return pid
+
+        def drop_person(self, pid):
+            """`DELETE /api/persons/{pid}`: снимает карточку, файл остаётся."""
+            with Session() as s:
+                s.execute(_sql("DELETE FROM persons WHERE id = :i"), {"i": pid})
+                s.commit()
 
         def drop_camera(self, cam_id):
             """Удаление камеры через веб-интерфейс (SPEC §3).
@@ -158,7 +191,7 @@ def test_live_cameras_keep_their_archive(archive):
 
     stats = worker.prune_orphan_media()
 
-    assert stats == {"segments": 0, "thumbs": 0, "failed": 0}
+    assert stats == {"segments": 0, "thumbs": 0, "avatars": 0, "failed": 0}
     assert len(os.listdir(archive.dir)) == 2
     assert len(archive.segment_rows()) == 2
 
@@ -204,4 +237,48 @@ def test_a_thumb_of_a_rotated_out_segment_is_removed_too(archive):
 
 def test_nothing_to_do_costs_no_deletions(archive):
     """Пустой архив — не повод удалять что-либо и не повод падать."""
-    assert worker.prune_orphan_media() == {"segments": 0, "thumbs": 0, "failed": 0}
+    assert worker.prune_orphan_media() == {"segments": 0, "thumbs": 0, "avatars": 0, "failed": 0}
+
+
+def test_the_avatar_of_a_deleted_person_is_removed(archive):
+    """`DELETE /api/persons/{pid}` снимает карточку, а файл в `avatars/` не
+    убирал никто: уборка по возрасту этот каталог не трогает намеренно —
+    аватар живёт столько же, сколько карточка (см. `avatar_store.py` и
+    сторож `test_fileage.py::test_prune_media_keeps_avatars`)."""
+    doomed = archive.person("Ушедший", "avatars/auto_dead.jpg")
+    archive.person("Оставшийся", "avatars/manual_beef.jpg")
+    archive.drop_person(doomed)
+
+    stats = worker.prune_orphan_media()
+
+    assert stats["avatars"] == 1
+    assert not (archive.root / "avatars" / "auto_dead.jpg").exists()
+    assert (archive.root / "avatars" / "manual_beef.jpg").exists()
+
+
+def test_a_replaced_avatar_does_not_linger(archive):
+    """То же правило само собой закрывает второй случай: карточке
+    назначили другой аватар, прежний файл остался. Спрашивается ссылка, а
+    не персона, поэтому отдельного кода на это не нужно."""
+    pid = archive.person("Обновлённый", "avatars/auto_old.jpg")
+    (archive.root / "avatars" / "auto_new.jpg").write_bytes(b"\0" * 64)
+    with archive.Session() as s:
+        s.execute(_sql("UPDATE persons SET avatar_path = :a WHERE id = :i"),
+                  {"a": "avatars/auto_new.jpg", "i": pid})
+        s.commit()
+
+    worker.prune_orphan_media()
+
+    assert not (archive.root / "avatars" / "auto_old.jpg").exists()
+    assert (archive.root / "avatars" / "auto_new.jpg").exists()
+
+
+def test_avatars_in_use_are_never_touched(archive):
+    """Цена ошибки обратной уборки: на объекте без единого удаления она
+    обязана не делать ничего."""
+    archive.person("Живой", "avatars/manual_alive.jpg")
+
+    stats = worker.prune_orphan_media()
+
+    assert stats == {"segments": 0, "thumbs": 0, "avatars": 0, "failed": 0}
+    assert (archive.root / "avatars" / "manual_alive.jpg").exists()
