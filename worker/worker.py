@@ -51,6 +51,7 @@ from face_select import pick_matching_face
 from fileage import prune_media
 from liveness import Heartbeat, start_watchdog
 from ort_threads import analytics_thread_budget, limit_threads as limit_ort_threads
+from avatar_store import adopt_snapshot, avatar_files, needs_avatar
 from orphan_media import (remove_files, segment_camera_ids,
                           thumb_segment_ids)
 from motion_windows import (DEFAULT_GUARD_SEC, MotionWindowTracker,
@@ -1643,11 +1644,21 @@ def process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url
             )
             s.add(ev)
             person = s.get(Person, p.pid)
+            # Аватар — копия снимка в `avatars/`, а не ссылка на него:
+            # `snapshots/` чистится по возрасту, и карточка теряла фото
+            # через retention_days навсегда. Подробности и почему копия, а
+            # не перенос — в шапке `avatar_store.py`.
             is_new_avatar = (
-                person is not None and person.avatar_path is None and bool(p.snap_rel)
+                person is not None and bool(p.snap_rel)
+                and needs_avatar(person.avatar_path, MEDIA_PATH)
             )
             if is_new_avatar:
-                person.avatar_path = p.snap_rel
+                adopted = adopt_snapshot(MEDIA_PATH, p.snap_rel)
+                # None — копию сделать не удалось; аватар не назначается
+                # вовсе: битая ссылка хуже пустой карточки.
+                is_new_avatar = adopted is not None
+                if is_new_avatar:
+                    person.avatar_path = adopted
             # flush, а не commit: id события нужен для payload'а, а читать
             # его после commit() значит реактивировать объект и открыть
             # транзакцию заново.
@@ -1852,14 +1863,23 @@ def prune_orphan_media() -> dict[str, int]:
       появляется только у сегмента, который открывали в выдаче архива),
       поэтому спрашивается наличие именно этих идентификаторов.
 
+    Третий вид сиротства — **аватары** (§15): `DELETE /api/persons/{pid}`
+    снимает карточку, а её файл в `avatars/` не убирает никто (уборка по
+    возрасту этот каталог не трогает намеренно — аватар живёт столько же,
+    сколько карточка, см. `avatar_store.py`). Спрашивается наличие ссылки,
+    а не персоны: на файл ссылается `persons.avatar_path`, и это же
+    правило само собой закрывает случай «карточке назначили другой
+    аватар, прежний остался».
+
     Раз в час, вместе с retention: сиротство возникает только в момент
-    удаления камеры, и час задержки ничего не решает, а обход каталога
-    архива не бесплатный.
+    удаления камеры или персоны, и час задержки ничего не решает, а обход
+    каталога архива не бесплатный.
     """
-    stats = {"segments": 0, "thumbs": 0, "failed": 0}
+    stats = {"segments": 0, "thumbs": 0, "avatars": 0, "failed": 0}
     by_cam = segment_camera_ids(segments_dir(MEDIA_PATH))
     thumbs = thumb_segment_ids(MEDIA_PATH)
-    if not by_cam and not thumbs:
+    avatars = avatar_files(MEDIA_PATH)
+    if not by_cam and not thumbs and not avatars:
         return stats
 
     with Session() as s:
@@ -1871,6 +1891,13 @@ def prune_orphan_media() -> dict[str, int]:
                 select(VideoSegment.id).where(VideoSegment.id.in_(thumbs))
             ).scalars().all()
         ) if thumbs else set()
+        # Ссылки, а не персоны: спрашиваются только те относительные пути,
+        # что встречены на диске, — список конечный.
+        used_avatars = set(
+            s.execute(
+                select(Person.avatar_path).where(Person.avatar_path.in_(avatars))
+            ).scalars().all()
+        ) if avatars else set()
 
     doomed_cams = sorted(set(by_cam) - live_cams)
     doomed_files = [p for cam in doomed_cams for p in by_cam[cam]]
@@ -1883,7 +1910,12 @@ def prune_orphan_media() -> dict[str, int]:
     stats["thumbs"] = removed
     stats["failed"] += failed
 
-    if stats["segments"] or stats["thumbs"] or stats["failed"]:
+    doomed_avatars = [p for rel, p in avatars.items() if rel not in used_avatars]
+    removed, failed = remove_files(doomed_avatars)
+    stats["avatars"] = removed
+    stats["failed"] += failed
+
+    if any(stats.values()):
         # warning, а не info: удаление камеры — редкая операция, и объём
         # освобождённого здесь места (сутки записи одной камеры — ~21.6 ГБ
         # по §16) администратор должен видеть в журнале без grep'а.
