@@ -244,6 +244,28 @@ jobs:
     # continue-on-error: бенчмарк не должен ронять мердж функциональной
     # правки, если ffmpeg на раннере повёл себя иначе.
     continue-on-error: true
+    services:
+      # Только ради `bench_segment_scan.py` (цикл 53): проход индексации
+      # архива меряется вместе с его запросами к БД, а на SQLite «до
+      # правки» вообще не выполнимо — там `IN` со всеми путями каталога
+      # упирается в предел числа параметров, которого у Postgres нет.
+      # Образ тот же, что у джобы backend, хотя pgvector этому замеру не
+      # нужен: одна версия сервера на весь CI.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facewatch
+          POSTGRES_PASSWORD: facewatch
+          POSTGRES_DB: facewatch_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U facewatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://facewatch:facewatch@localhost:5432/facewatch_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -405,6 +427,24 @@ jobs:
         # ~7.5 с проб в проходе, идущем раз в 5 секунд. Замер завершается
         # ненулевым кодом, если худший проход дороже 1.5 с.
         run: python perf/bench_stream_rate.py --json | tee perf-stream-rate.json
+
+      - name: Measure the cost of an archive indexing pass (SPEC §5, §19)
+        # Шаг индексации идёт в цикле менеджера каждые ~10 с и обходит
+        # каталог архива целиком. Каталог плоский, его размер —
+        # retention × камеры × сегменты в сутки, то есть при значениях по
+        # умолчанию (30 суток, 120 камер, сегменты по 5 минут) больше
+        # миллиона файлов. Замер цикла 53 на таком каталоге: **16.7 с на
+        # проход**, то есть проход дольше собственного интервала и 167 %
+        # ядра постоянно; с отсечкой «докуда архив уже заполнен» — 1.0 с.
+        #
+        # В CI каталог уменьшен до 17 280 файлов (20 камер × 3 суток):
+        # миллион файлов на раннере это ~2 ГБ и лишние минуты, а сторожить
+        # надо не миллисекунды раннера, а само отношение — сломайся
+        # отсечка, оно схлопывается к 1.1× (проверено откатом). Порог 3×
+        # с запасом ниже 8.3×, которые шаг даёт на этом размере.
+        run: |
+          pip install sqlalchemy psycopg2-binary
+          python perf/bench_segment_scan.py --cameras 20 --days 3 --min-speedup 3
 
       - name: Compare analytics concurrency models (SPEC §17)
         # Слой аналитики устроен на нитях с общей моделью, и это решение

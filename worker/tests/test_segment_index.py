@@ -314,3 +314,33 @@ def test_the_foreign_key_is_really_enforced_here(tmp_path, session_factory):
                            event_type=CONTINUOUS, duration_sec=1, size_bytes=1))
         with pytest.raises(IntegrityError):
             s.commit()
+
+
+def test_the_boundary_never_hides_a_new_segment(tmp_path, session_factory):
+    """Отсечка по «докуда архив заполнен» (цикл 53) — оптимизация, и её
+    единственный способ навредить в том, чтобы пропустить настоящую
+    запись. Проверяется на трёх последовательных проходах: архив обязан
+    догонять диск на каждом.
+    """
+    d = tmp_path / "segments"
+    d.mkdir()
+    _cameras(session_factory, 1, 2)
+    _write(d / "cam1_1000.mp4")
+    _write(d / "cam1_1300.mp4")
+    assert _index(session_factory, d) == 2
+
+    # Новый сегмент той же камеры и первый сегмент второй камеры, у
+    # которой в архиве нет ничего (её отсечка отсутствует вовсе).
+    _write(d / "cam1_1600.mp4")
+    _write(d / "cam2_1000.mp4")
+    _write(d / "cam2_1300.mp4")
+    assert _index(session_factory, d) == 3
+
+    _write(d / "cam1_1900.mp4")
+    assert _index(session_factory, d) == 1
+
+    rows = _rows(session_factory)
+    assert sorted((r.camera_id, os.path.basename(r.file_path)) for r in rows) == [
+        (1, "cam1_1000.mp4"), (1, "cam1_1300.mp4"), (1, "cam1_1600.mp4"),
+        (1, "cam1_1900.mp4"), (2, "cam2_1000.mp4"), (2, "cam2_1300.mp4"),
+    ]
