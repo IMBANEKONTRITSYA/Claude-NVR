@@ -101,22 +101,25 @@ def test_real_budget_table_covers_manager_stages(liveness):
     самый общий порог, от которого таблица и уводит.
     """
     stages = {"camera_scan", "record_layer_sync", "index_segments",
-              "record_status", "cleanup", "motion_prune", "disk_quota",
+              "record_status", "motion_prune", "disk_quota",
               "disk_alerts", "idle", "shutdown"}
     assert stages <= set(liveness.STAGE_BUDGETS_SEC)
 
 
-def test_model_load_is_not_a_manager_stage(liveness):
-    """`model_load` из таблицы убран — менеджер этим этапом не отмечается.
+@pytest.mark.parametrize("stage", ["model_load", "cleanup"])
+def test_work_that_left_the_manager_has_no_budget_here(liveness, stage):
+    """У этапов, ушедших в свои нити, бюджета в таблице быть не должно.
 
     Обратная проверка к предыдущей: там «у каждого этапа есть бюджет»,
-    здесь — «бюджета нет у того, чего менеджер не делает». Пока запись
-    бюджета жила в таблице, она означала санкцию на 900-секундную
-    остановку слоя записи ради загрузки модели (SPEC §2). Загрузка ушла в
-    свою нить, и возвращение записи сюда означало бы возвращение той
-    остановки — молча, одной строкой.
+    здесь — «бюджета нет у того, чего менеджер не делает».
+
+    Обе записи, пока они жили в таблице, означали одно и то же — санкцию на
+    900-секундную остановку слоя записи (SPEC §2): `model_load` ради
+    загрузки модели аналитики (ушёл в цикле 55), `cleanup` ради уборки
+    архива по retention (ушёл в цикле 57). Возвращение любой из них сюда
+    вернуло бы ту остановку молча, одной строкой.
     """
-    assert "model_load" not in liveness.STAGE_BUDGETS_SEC
+    assert stage not in liveness.STAGE_BUDGETS_SEC
 
 
 # --- Watchdog --------------------------------------------------------------
