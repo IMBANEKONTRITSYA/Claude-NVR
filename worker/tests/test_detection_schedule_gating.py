@@ -35,6 +35,17 @@ NIGHT_ONLY = {"enabled": True, "windows": [{"days": [0, 1, 2, 3, 4, 5, 6],
 ALWAYS = None
 
 
+# Субпоток камеры этого набора — D1 PAL. §1 называет «CIF-D1» типовым
+# субпотоком, а §2/§15 требуют от источника кадров аналитики разрешения не
+# ниже 640×480: 704×576 — верхний край этого диапазона, порог проходит.
+# Числа здесь не декорация: `camera_worker()` меряет открытый захват и
+# уводит аналитику на основной поток, если субпоток порогу не отвечает
+# (worker/analytics_source.py). Набор проверяет расписание §6, поэтому
+# камера ему нужна заведомо исправная — иначе половина проверок ловила бы
+# не паузу по расписанию, а переключение потока.
+SUB_WIDTH, SUB_HEIGHT = 704, 576
+
+
 class _Capture:
     def __init__(self):
         self.released = False
@@ -44,11 +55,20 @@ class _Capture:
         return True
 
     def get(self, prop_id):
+        # Разрешение отдаётся по своим идентификаторам, а не одним числом
+        # на любое свойство: захват, сообщающий «25» в ответ на запрос
+        # ширины кадра, не бывает, и подменять им настоящий значит
+        # проверять поведение на входе, которого не существует.
+        import cv2
+        if prop_id == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(SUB_WIDTH)
+        if prop_id == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(SUB_HEIGHT)
         return 25.0
 
     def read(self):
         self.reads += 1
-        return True, np.zeros((360, 640, 3), dtype=np.uint8)
+        return True, np.zeros((SUB_HEIGHT, SUB_WIDTH, 3), dtype=np.uint8)
 
     def release(self):
         self.released = True

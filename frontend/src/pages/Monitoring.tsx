@@ -3,6 +3,7 @@ import { api, getToken, getRole } from "../api";
 import {
   formatBitrate, formatFps, formatTotalBitrate, isSilentStream,
 } from "../streamRate";
+import { AnalyticsSource, streamCell } from "../analyticsStream";
 
 function Bar({ percent, warn, crit }: { percent: number; warn?: number; crit?: number }) {
   // Умолчания через ?? , а не в сигнатуре: вызывающие передают warn/crit
@@ -513,6 +514,27 @@ function StoragePanel({ isAdmin }: { isAdmin: boolean }) {
   );
 }
 
+/** Ячейка «Поток аналитики»: подпись, цвет и пояснение от воркера. */
+function AnalyticsStreamCell({ src }: { src: AnalyticsSource }) {
+  const cell = streamCell(src);
+  const color = cell.tone === "warn" ? "var(--orange)"
+    : cell.tone === "muted" ? "var(--muted)" : undefined;
+  return (
+    <span title={cell.note}>
+      <span style={{ color, fontWeight: cell.tone === "warn" ? 600 : undefined }}>
+        {cell.label}
+      </span>
+      {/* Пояснение стоит под подписью, а не только в title: причина, по
+          которой аналитика уехала с субпотока, — это то, ради чего строка
+          вообще показывается, и прятать её в подсказку значит не показать
+          вовсе (§9 требует статус потоков, а не намёк на него). */}
+      {cell.tone === "warn" && cell.note && (
+        <div className="muted" style={{ fontSize: 11 }}>{cell.note}</div>
+      )}
+    </span>
+  );
+}
+
 export function Monitoring() {
   const [m, setM] = useState<any>(null);
   const [err, setErr] = useState("");
@@ -528,7 +550,15 @@ export function Monitoring() {
   if (err) return <div><h2>Мониторинг</h2><div className="empty">{err}</div></div>;
   if (!m) return <div><h2>Мониторинг</h2><div className="empty">Загрузка...</div></div>;
 
-  const fps = Object.entries(m.camera_fps || {});
+  // Строки таблицы аналитики — объединение двух источников, а не только
+  // camera_fps: камера, у которой поток аналитики выбран, но детекция ещё
+  // не намерила первое окно FPS, обязана быть видна. Обратный случай тоже
+  // возможен (воркер прежней версии не публикует источник), и тогда в
+  // столбце потока просто прочерк.
+  const analyticsSource: Record<string, any> = m.camera_analytics_source || {};
+  const camIds = Array.from(
+    new Set([...Object.keys(m.camera_fps || {}), ...Object.keys(analyticsSource)])
+  ).sort((a, b) => Number(a) - Number(b));
 
   return (
     <div>
@@ -567,18 +597,25 @@ export function Monitoring() {
       </div>
 
       <div className="card" style={{ marginBottom: 16 }}>
-        <h3 style={{ marginTop: 0 }}>FPS детекции по камерам</h3>
-        {fps.length === 0 && <div className="empty">Нет данных — воркер ещё не публиковал метрики</div>}
-        {fps.length > 0 && (
+        <h3 style={{ marginTop: 0 }}>Аналитика по камерам</h3>
+        {camIds.length === 0 && <div className="empty">Нет данных — воркер ещё не публиковал метрики</div>}
+        {camIds.length > 0 && (
           <table>
-            <thead><tr><th>Камера</th><th>FPS детекции</th></tr></thead>
+            <thead><tr><th>Камера</th><th>FPS детекции</th><th>Поток аналитики</th></tr></thead>
             <tbody>
-              {fps.map(([id, v]: any) => (
-                <tr key={id}>
-                  <td>#{id}</td>
-                  <td style={{ color: v < 1 ? "var(--orange)" : "var(--green)", fontWeight: 600 }}>{v}</td>
-                </tr>
-              ))}
+              {camIds.map((id: string) => {
+                const v = (m.camera_fps || {})[id];
+                const src = analyticsSource[id];
+                return (
+                  <tr key={id}>
+                    <td>#{id}</td>
+                    <td style={{ color: v < 1 ? "var(--orange)" : "var(--green)", fontWeight: 600 }}>
+                      {v == null ? "—" : v}
+                    </td>
+                    <td>{src ? <AnalyticsStreamCell src={src} /> : "—"}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

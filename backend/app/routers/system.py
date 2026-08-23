@@ -69,6 +69,7 @@ async def _collect() -> dict:
     redis_ok = True
     queue_len = 0
     fps: dict[str, float] = {}
+    analytics_source: dict[str, dict] = {}
     try:
         r = get_redis()
         await r.ping()
@@ -76,6 +77,24 @@ async def _collect() -> dict:
         # Воркер публикует свой FPS по каждой камере в хеш worker:fps
         raw = await r.hgetall("worker:fps")
         fps = {k: float(v) for k, v in (raw or {}).items()}
+        # SPEC §2/§15: источником кадров аналитики допустим основной поток
+        # либо субпоток «с разрешением не ниже 640×480». Какой из них
+        # реально достался камере — решает воркер по измеренному кадру
+        # (worker/analytics_source.py), и без этой строки §9 показывал бы
+        # FPS детекции, не говоря, по какому потоку он получен.
+        raw_src = await r.hgetall("worker:analytics_source")
+        for k, v in (raw_src or {}).items():
+            try:
+                row = json.loads(v)
+            except (ValueError, TypeError):
+                # Мусор в хеше не должен ронять весь /metrics: камера
+                # просто останется без строки, остальные метрики уедут.
+                continue
+            # Валидный JSON — ещё не объект: строка «"5"» разбирается в
+            # число, и фронтенд полез бы за полями в него. Отбрасывается
+            # тем же путём, что и мусор.
+            if isinstance(row, dict):
+                analytics_source[k] = row
     except Exception:
         redis_ok = False
 
@@ -102,6 +121,7 @@ async def _collect() -> dict:
         "upscale_queue": queue_len,
         "redis_ok": redis_ok,
         "camera_fps": fps,
+        "camera_analytics_source": analytics_source,
     }
 
 
