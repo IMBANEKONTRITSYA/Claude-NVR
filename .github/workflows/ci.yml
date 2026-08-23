@@ -317,23 +317,32 @@ jobs:
         # вовсе, и оба норматива отслеживались только замерами вручную из
         # песочницы — то есть между циклами не сравнивались никак.
         #
-        # `uvicorn` и цепочка воркера (`redis`, `sqlalchemy`,
-        # `psycopg2-binary`, `pgvector`, `cryptography`, `fastapi`,
-        # `defusedxml`) — не «на всякий случай», а по факту падений,
-        # которые до цикла 55 были не видны из-за отсутствия `pipefail`
-        # (см. `defaults` джобы):
+        # **Ставится `worker/requirements.txt` целиком, а не список пакетов
+        # руками.** Список руками пробовался в цикле 55 и разошёлся с
+        # реальной цепочкой импорта **дважды подряд**: сперва не хватило
+        # `redis`, потом — `scikit-learn`. Оба раза это всплывало только в
+        # CI и только после того, как `pipefail` перестал прятать падение.
+        # Файл требований — единственный источник, который не разъезжается
+        # с кодом, потому что по нему же собирается production-образ.
+        # Побочная польза: бенчмарки идут на **тех же пинах**, что поедут
+        # на объект, а не на «свежайшем с PyPI».
         #
-        # * `bench_rto.py --hang-only` поднимает драйвер, который тянет
-        #   `app.liveness` → `app.logging_utils` → `uvicorn.logging`.
-        #   Без `uvicorn` драйвер умирал молча (его stderr уходит в
-        #   DEVNULL), а замер печатал «драйвер замера не дошёл до
-        #   блокировки» и выходил с ненулевым кодом, который съедал `tee`.
+        # Кому это нужно из замеров:
+        #
         # * `bench_model_load_stall.py` импортирует настоящий `worker` —
-        #   иначе он мерил бы не менеджер воркера, а свою заглушку.
+        #   иначе он мерил бы не менеджер воркера, а свою заглушку;
+        # * `bench_rto.py --hang-only` поднимает драйвер, который тянет
+        #   `app.liveness` → `app.logging_utils` → `uvicorn.logging`
+        #   (`uvicorn` есть в требованиях воркера). Без него драйвер умирал
+        #   молча — его stderr уходит в DEVNULL, — а замер печатал «драйвер
+        #   замера не дошёл до блокировки» и выходил с ненулевым кодом,
+        #   который съедал `tee`. §13/§19 RTO не считался в CI не один цикл.
+        #
+        # `onnx` и `scikit-image` в требованиях воркера отсутствуют: они
+        # нужны только группам `bench.py` и ставятся отдельно.
         run: |
-          pip install opencv-python-headless numpy onnxruntime onnx insightface scikit-image
-          pip install uvicorn redis sqlalchemy psycopg2-binary pgvector cryptography \
-            fastapi defusedxml
+          pip install -r worker/requirements.txt
+          pip install onnx scikit-image
       - name: Run benchmarks
         run: python perf/bench.py --json | tee perf-results.json
       - name: Measure hang detection (SPEC §13, §19 RTO)
