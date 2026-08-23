@@ -230,7 +230,7 @@ async def record_layer_status(_=Depends(require_role("admin", "operator")),
             "gb_last_day": round(bytes_day / BYTES_PER_GB, 2),
             "streams": [], "summary": None, "segment_gaps": [],
             "analytics": None, "control_api_error": None,
-            "record_root_warning": None,
+            "record_root_warning": None, "cleanup": None,
         }
 
     # Состояние восстановления (SPEC §19) приезжает от воркера отдельной
@@ -266,6 +266,11 @@ async def record_layer_status(_=Depends(require_role("admin", "operator")),
         # диск, который никто не чистит; сам по себе он на причину не
         # указывает, поэтому причина едет отдельным полем.
         "record_root_warning": payload.get("record_root_warning"),
+        # Часовая уборка архива (§5) с цикла 57 идёт в своей нити воркера и
+        # сторожем живости не проверяется. Её отказ снаружи выглядит ровно
+        # как исправная работа — диск просто заполняется, — поэтому
+        # состояние прохода показывается рядом со слоем записи.
+        "cleanup": payload.get("cleanup"),
     }
 
 

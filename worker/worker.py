@@ -45,6 +45,7 @@ from pgvector.sqlalchemy import Vector
 from analytics_source import (SUB_BELOW_FLOOR_NO_MAIN,
                               choose_analytics_source, describe)
 from backoff import reconnect_delay
+from cleanup_status import CleanupStatus
 import cpu_affinity
 from detection_schedule import schedule_active
 from face_select import pick_matching_face
@@ -2013,6 +2014,12 @@ def prune_orphan_media() -> dict[str, int]:
 # пор, и на неё же смотрит тест.
 _cleanup_thread: threading.Thread | None = None
 
+# Наблюдаемое состояние проходов уборки (SPEC §5, §9, см. cleanup_status.py).
+# Заведено вместе с выносом уборки в свою нить: из-под сторожа живости она
+# вышла, и без этого состояния затянувшийся или упавший проход не виден
+# снаружи ничем, кроме строки в журнале воркера.
+CLEANUP_STATUS = CleanupStatus()
+
 
 def _cleanup_bg():
     """Проход уборки архива целиком: retention + осиротевшие файлы.
@@ -2027,15 +2034,28 @@ def _cleanup_bg():
     связано с retention ни причиной, ни данными, и отказ одной уборки не
     должен отменять вторую — иначе диск продолжал бы расти по причине, о
     которой в журнале уже написано.
+
+    Имена упавших этапов копятся и уезжают в состояние прохода (§9): после
+    того как уборка вышла из-под сторожа живости, её отказ не виден
+    снаружи ничем, кроме строки в журнале воркера, — а диск, который
+    перестал чиститься, выглядит просто заполняющимся (cleanup_status.py).
     """
+    CLEANUP_STATUS.pass_started()
+    failed = []
     try:
         cleanup_old()
     except Exception:
+        failed.append("cleanup_old")
         logger.error("ошибка очистки (cleanup)", exc_info=True)
     try:
         prune_orphan_media()
     except Exception:
+        failed.append("prune_orphan_media")
         logger.error("ошибка уборки осиротевших медиа-файлов", exc_info=True)
+    # В `finally` не нужно: оба этапа уже под своими `try`, и единственный
+    # способ сюда не дойти — смерть самой нити, при которой снимок обязан
+    # остаться в состоянии `running`, а не отчитаться о завершении.
+    CLEANUP_STATUS.pass_finished(failed)
 
 
 def start_cleanup_pass() -> bool:
@@ -2080,8 +2100,9 @@ def start_cleanup_pass() -> bool:
         # встал, либо архив не успевает чиститься. Молчать здесь нельзя,
         # но и запускать второй проход поверх первого незачем: они
         # выбирали бы одни и те же строки и удваивали работу.
+        skipped = CLEANUP_STATUS.pass_skipped()
         logger.warning("проход уборки архива идёт дольше часа, "
-                       "новый не запускаю")
+                       "новый не запускаю", extra={"skipped_total": skipped})
         return False
     _cleanup_thread = threading.Thread(target=_cleanup_bg,
                                        name="archive-cleanup", daemon=True)
@@ -2492,7 +2513,15 @@ def publish_record_layer_status(cam_names) -> dict:
                              "model": CONFIG["face_model"],
                              "error": MODEL_ERROR,
                              "load": (_model_loader.snapshot()
-                                      if _model_loader is not None else None)}}
+                                      if _model_loader is not None else None)},
+               # Состояние часовой уборки архива (§5, §9). Едет здесь же по
+               # той же причине, что и состояние загрузки модели: у ключа
+               # уже есть читатель и TTL, а отдельный ключ ради пяти полей
+               # означал бы второй запрос из бэкенда на каждый показ
+               # страницы. С цикла 57 уборка идёт в своей нити и сторожем
+               # живости не проверяется — без этого поля её отказ виден
+               # снаружи ровно как исправная работа: диск заполняется.
+               "cleanup": CLEANUP_STATUS.snapshot()}
     try:
         r.set("record:layer", json.dumps(payload), ex=120)
     except Exception:
