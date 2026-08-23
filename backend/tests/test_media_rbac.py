@@ -68,15 +68,36 @@ def test_archive_roles_can_read_segments(client, media_files, make_user, role):
     assert r.content == b"stub"
 
 
-@pytest.mark.parametrize("role", ["admin", "operator", "viewer"])
+@pytest.mark.parametrize("role", ["admin", "operator"])
 @pytest.mark.parametrize("kind", ["snapshots", "avatars"])
-def test_all_roles_can_read_faces(client, media_files, make_user, role, kind):
-    """Кадры лиц и аватары доступны всем ролям осознанно: на них построены
-    Стена и дашборд, разрешённые наблюдателю той же матрицей прав."""
+def test_analytics_roles_can_read_faces(client, media_files, make_user, role, kind):
+    """Кадры лиц и аватары — ролям, которым §18 разрешает «Карточки персон»."""
     _, token = make_user(f"rbac_{kind}_{role}", role)
     r = client.get(f"/api/media/{kind}/{media_files[kind]}?token={token}")
     assert r.status_code == 200, r.text
     assert r.content == b"stub"
+
+
+@pytest.mark.parametrize("kind", ["snapshots", "avatars"])
+def test_viewer_cannot_read_faces(client, media_files, make_user, kind):
+    """Находка цикла 51 — поправка к прежней редакции этого файла.
+
+    До неё здесь стоял `test_all_roles_can_read_faces` с обоснованием
+    «на них построены Стена и дашборд, разрешённые наблюдателю той же
+    матрицей прав». Матрица §18 Стену наблюдателю не разрешает: строки
+    «Стена» в ней нет вовсе, а §9 перечисляет содержимое дашборда поимённо
+    («количество событий, активность по часам, топ камер») и персон среди
+    него не значится. Ни одна строка §18, относящаяся к модулю §15, для
+    наблюдателя не открыта — а хранимый кадр лица есть содержимое карточки
+    персоны, которую ему закрывает `/api/persons`.
+
+    Живой просмотр §4 при этом не страдает: рамки с подписями приходят
+    наблюдателю по `/ws/faces` поверх видео и хранимых снимков не трогают
+    (см. test_integration_spec18_face_identity.py).
+    """
+    _, token = make_user(f"rbac_{kind}_viewer", "viewer")
+    r = client.get(f"/api/media/{kind}/{media_files[kind]}?token={token}")
+    assert r.status_code == 403, r.text
 
 
 def test_unknown_kind_still_404(client, media_files, admin_token):

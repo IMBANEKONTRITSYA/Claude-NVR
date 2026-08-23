@@ -1,9 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line, CartesianGrid } from "recharts";
-import { api } from "../api";
+import { api, getRole } from "../api";
+import { canSeePersonIdentity } from "../access";
 import { useWebSocket } from "../useWebSocket";
 
 export function Dashboard() {
+  // §18: «Карточки персон» — Да/Да/Нет. Рейтинг персон запрашивается только
+  // теми, кому он разрешён: иначе наблюдатель на каждой загрузке дашборда
+  // отправлял бы заведомый 403, а тот пишется в журнал аудита как отказ
+  // в доступе — то есть штатная работа выглядела бы попыткой обойти права.
+  const canSeePersons = canSeePersonIdentity(getRole());
   const [kpi, setKpi] = useState<any>({});
   const [byDay, setByDay] = useState<any[]>([]);
   const [byHour, setByHour] = useState<any[]>([]);
@@ -16,7 +22,7 @@ export function Dashboard() {
     api.byDay().then(setByDay).catch(() => {});
     api.byHour().then(setByHour).catch(() => {});
     api.heatmap().then((r: any) => setGrid(r.grid || [])).catch(() => {});
-    api.topPersons().then(setTop).catch(() => {});
+    if (canSeePersons) api.topPersons().then(setTop).catch(() => {});
   };
 
   useEffect(() => { loadAll(); }, []);
@@ -114,7 +120,13 @@ export function Dashboard() {
         </table>
       </div>
 
-      <div className="card">
+      {/* Единственный блок дашборда с именами людей — и потому единственный,
+          закрытый наблюдателю (§18, строка «Карточки персон»). Блок именно
+          не рисуется, а не показывает «Нет данных»: пустая таблица там, где
+          у оператора список, читается как «за 30 дней никого не видели», то
+          есть врёт о состоянии объекта. Остальной дашборд агрегатный и
+          наблюдателю открыт строкой «Дашборд и мониторинг: Да/Да/Да». */}
+      {canSeePersons && <div className="card">
         <h3>Топ-10 персон за 30 дней</h3>
         <table>
           <thead><tr><th>#</th><th>Имя</th><th>Статус</th><th>Обнаружений</th></tr></thead>
@@ -127,7 +139,7 @@ export function Dashboard() {
             {top.length === 0 && <tr><td colSpan={4} className="empty">Нет данных</td></tr>}
           </tbody>
         </table>
-      </div>
+      </div>}
     </div>
   );
 }

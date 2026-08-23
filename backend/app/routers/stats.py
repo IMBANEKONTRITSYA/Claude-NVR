@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from ..db import get_db
 from ..models import FaceEvent, Person
-from ..auth import get_current_user
+from ..auth import get_current_user, require_role
 from ..params import days_param, limit_param
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
@@ -70,7 +70,19 @@ async def heatmap(days: int = days_param(30), _=Depends(get_current_user), db: A
 
 
 @router.get("/top-persons")
-async def top_persons(days: int = days_param(30), limit: int = limit_param(10), _=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def top_persons(days: int = days_param(30), limit: int = limit_param(10),
+                      _=Depends(require_role("admin", "operator")),
+                      db: AsyncSession = Depends(get_db)):
+    """Рейтинг персон по частоте появлений.
+
+    Единственная ручка дашборда, отдающая имена людей, — и потому
+    единственная, закрытая наблюдателю. §9 перечисляет содержимое дашборда
+    поимённо: «количество событий, активность по часам, **топ камер**»;
+    персон среди него нет, поэтому строка «Дашборд и мониторинг: Да/Да/Да»
+    §18 этот рейтинг не покрывает — его покрывает «Карточки персон:
+    Да/Да/Нет». Остальные ручки (kpi, by-day, by-hour, heatmap) агрегатные
+    и наблюдателю по-прежнему открыты.
+    """
     since = datetime.utcnow() - timedelta(days=days)
     r = await db.execute(
         select(Person.id, Person.name, Person.status, func.count(FaceEvent.id).label("c"))

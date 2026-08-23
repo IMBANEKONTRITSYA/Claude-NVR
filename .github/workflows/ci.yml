@@ -383,6 +383,17 @@ jobs:
         # просадке той же величины. Медиана из трёх плюс печать разброса.
         run: python perf/bench.py --only chain --repeat 3 --json | tee perf-chain.json
 
+      - name: Measure face-feed ACL filter cost (SPEC §18 на горячем пути §4)
+        # Фильтр ленты лиц по роли (цикл 51) стоит на пути, по которому
+        # сообщение `box` уходит на КАЖДЫЙ кадр каждой камеры analytics —
+        # иначе живая сетка §4 рисовала бы рамку с задержкой. Ролям с
+        # карточками персон он отдаёт исходную строку без разбора,
+        # наблюдателю — разбирает JSON и собирает подмножество полей.
+        # Шаг сторожит, чтобы эта пересборка не выросла в статью расхода:
+        # замер печатает долю ядра при 600 сообщ/с, то есть на потолке
+        # §19 (120 камер × 5 FPS).
+        run: python perf/bench_face_feed_acl.py --json | tee perf-face-acl.json
+
       - name: Compare analytics concurrency models (SPEC §17)
         # Слой аналитики устроен на нитях с общей моделью, и это решение
         # держится на замере, а не на рассуждении: цикл 40 прогнал ту же
@@ -487,6 +498,7 @@ jobs:
           path: |
             perf-results.json
             perf-chain.json
+            perf-face-acl.json
             perf-scaling.json
             perf-load.json
             perf-ram-scaling.json
