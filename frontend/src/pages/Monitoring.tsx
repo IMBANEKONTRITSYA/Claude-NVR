@@ -5,6 +5,7 @@ import {
 } from "../streamRate";
 import { AnalyticsSource, streamCell } from "../analyticsStream";
 import { modelBanner } from "../modelLoad";
+import { cleanupBanner } from "../archiveCleanup";
 
 function Bar({ percent, warn, crit }: { percent: number; warn?: number; crit?: number }) {
   // Умолчания через ?? , а не в сигнатуре: вызывающие передают warn/crit
@@ -127,6 +128,34 @@ function RecordLayerPanel() {
             {b.hint && (
               <div style={{ fontWeight: 400, fontSize: 12, marginTop: 4 }}>
                 {b.hint}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* Часовая уборка архива (§5). С цикла 57 она идёт в своей нити
+          воркера и сторожем живости не проверяется — плата за то, что
+          долгий проход больше не останавливает статусы потоков и
+          циклическую перезапись (SPEC §2). Поэтому её состояние
+          показывается здесь, и только когда от дежурного что-то зависит:
+          проход упал, проходы не укладываются в час, проход затянулся.
+          Выбор вынесен в archiveCleanup.ts и проверяется юнит-тестами. */}
+      {(() => {
+        const b = cleanupBanner(d.cleanup);
+        if (!b) return null;
+        return (
+          <div style={{
+            padding: "8px 12px", borderRadius: 4, marginBottom: 12,
+            background: b.tone === "warn" ? "var(--orange)" : "var(--panel)",
+            color: b.tone === "warn" ? "#000" : "inherit",
+            border: b.tone === "warn" ? "none" : "1px solid var(--border)",
+            fontWeight: 600,
+          }}>
+            {b.title}
+            {b.detail && (
+              <div style={{ fontWeight: 400, fontSize: 12, marginTop: 4 }}>
+                {b.detail}
               </div>
             )}
           </div>
