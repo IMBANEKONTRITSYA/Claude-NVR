@@ -13,6 +13,7 @@ from ..config import settings
 from ..db import SessionLocal, get_db
 from ..models import Camera, FaceEvent, Setting, VideoSegment
 from ..auth import require_role, require_role_query
+from ..services.sensors import cpu_temperature
 from ..profiles import profile_settings
 from ..services import autoconfig
 from ..services.pubsub import get_redis
@@ -39,14 +40,19 @@ async def _collect() -> dict:
     except OSError:
         disk_total = disk_used = disk_free = 0
 
-    # Температура доступна не на всех платформах (в Docker под Windows — нет)
-    temp = None
+    # Температура доступна не на всех платформах (в Docker под Windows — нет).
+    #
+    # Выбор датчика — не «первый попавшийся»: на целевом сервере §20
+    # (2× Xeon, RAID-массив) в словаре лежат и корпусный `acpitz`, и
+    # `drivetemp` каждого диска, а порядок обхода задаётся загрузкой
+    # модулей ядра. Правило вынесено в services/sensors.py, потому что
+    # проверять его надо без нужного железа — здесь его нет ни в
+    # песочнице, ни на раннере CI.
+    temp = temp_source = None
     try:
-        sensors = psutil.sensors_temperatures() or {}
-        for entries in sensors.values():
-            if entries:
-                temp = entries[0].current
-                break
+        reading = cpu_temperature(psutil.sensors_temperatures() or {})
+        if reading is not None:
+            temp, temp_source = reading.celsius, reading.source
     except (AttributeError, OSError):
         pass
 
@@ -79,6 +85,11 @@ async def _collect() -> dict:
         "ram_used_mb": round(mem.used / 1048576),
         "ram_total_mb": round(mem.total / 1048576),
         "temperature_c": temp,
+        # Источник показания едет рядом с числом: 38 °C с сокета и
+        # 38 °C с корпусного датчика — разные сведения об объекте,
+        # а подпись «Температура» без уточнения выдаёт второе за
+        # первое (см. services/sensors.py).
+        "temperature_source": temp_source,
         "disk_total_gb": round(disk_total / 1073741824, 1),
         "disk_used_gb": round(disk_used / 1073741824, 1),
         "disk_free_gb": round(disk_free / 1073741824, 1),
