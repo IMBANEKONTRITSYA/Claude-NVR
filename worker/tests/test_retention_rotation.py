@@ -376,3 +376,97 @@ def test_disk_alert_survives_redis_failure(archive, monkeypatch):
     monkeypatch.setattr(worker.r, "set", _boom)
     monkeypatch.setattr(worker.shutil, "disk_usage", lambda _p: _Usage(100, 2))
     assert worker.check_disk_alerts() == "critical"
+
+
+# --- параллельные проходы уборки (SPEC §5, §2) ----------------------------
+#
+# Три прохода уборки выбирают кандидатов независимо и по пересекающимся
+# признакам: старейший сегмент переполненного диска обычно и просрочен тоже.
+# Пока все три шли в одной нити менеджера, пересечься они не могли. С
+# выносом retention в свою нить (§2: долгий этап не задерживает соседние)
+# совпадение выборок стало штатным, и путь удаления обязан его пережить.
+
+def test_a_second_pass_over_the_same_segment_does_not_break(archive, monkeypatch):
+    """Два прохода выбрали один сегмент — второй не падает и не врёт в счёте.
+
+    Проверка откатом: верните `s.delete(seg)` вместо `DELETE ... WHERE id IN`
+    в `_drop_segments` — тест падает на `dropped_b == 0`, потому что счёт
+    берётся из длины списка.
+
+    **Заодно этот откат опровергает разбор цикла 55**, который и отложил
+    правку: там ожидался `StaleDataError` и обрыв прохода. На откате его нет
+    ни на SQLite, ни на настоящем Postgres 16 — SQLAlchemy печатает
+    `SAWarning` и продолжает (`orm/persistence.py`: ошибку она бросает
+    только при настроенном `version_id_col`). То есть опасность, ради
+    которой цикл 55 не стал выносить уборку в свою нить, была не той, что
+    предполагалась: ломался счёт, а не проход.
+    """
+    archive.camera(1)
+    archive.segment(1, days_ago=9)
+
+    with archive.Session() as first, archive.Session() as second:
+        # Обе выборки сделаны до того, как первая что-либо удалила, — так и
+        # получается на объекте: кандидаты набраны, дальше идёт долгий unlink.
+        victims_a = first.query(worker.VideoSegment).all()
+        victims_b = second.query(worker.VideoSegment).all()
+        assert len(victims_a) == len(victims_b) == 1
+
+        assert worker._drop_segments(first, victims_a) == 1
+        first.commit()
+
+        # Ключевое: второй проход доходит до конца.
+        dropped_b = worker._drop_segments(second, victims_b)
+        second.commit()
+
+    assert dropped_b == 0, (
+        "опоздавший проход записал в актив чужое удаление — на этих числах "
+        "стоят логи ротации и отчёт §9 о снятом объёме"
+    )
+    assert archive.rows() == set()
+
+
+def test_the_rest_of_the_batch_survives_a_stolen_segment(archive, monkeypatch):
+    """Пачка из трёх, один уже снесён соседом — двое остальных удалены.
+
+    Отдельно от предыдущей: там проверялось, что проход не падает, здесь —
+    что он **доделывает работу**. Разница практическая: на объекте пачка
+    циклической перезаписи — до 5000 строк, и обрыв на первой пересёкшейся
+    означал бы, что диск не освобождается вовсе.
+    """
+    archive.camera(1)
+    for days in (9, 8, 7):
+        archive.segment(1, days_ago=days)
+
+    with archive.Session() as first, archive.Session() as second:
+        victims = second.query(worker.VideoSegment).order_by(
+            worker.VideoSegment.started_at).all()
+        assert len(victims) == 3
+
+        stolen = first.query(worker.VideoSegment).order_by(
+            worker.VideoSegment.started_at).first()
+        assert worker._drop_segments(first, [stolen]) == 1
+        first.commit()
+
+        dropped = worker._drop_segments(second, victims)
+        second.commit()
+
+    assert dropped == 2, "счёт должен считать строки, а не намерения"
+    assert archive.rows() == set(), "остаток пачки не удалён"
+
+
+def test_dropped_segments_are_detached_not_expired(archive):
+    """После удаления объекты отцеплены от сессии, а не просрочены.
+
+    Без `expunge` commit пометил бы их expired, и первое же обращение к полю
+    (в логе, в счётчике объёма) ушло бы за строкой, которой уже нет, —
+    `ObjectDeletedError` уже после того, как работа сделана.
+    """
+    archive.camera(1)
+    archive.segment(1, days_ago=9)
+
+    with archive.Session() as s:
+        victims = s.query(worker.VideoSegment).all()
+        worker._drop_segments(s, victims)
+        s.commit()
+        # Обращение к полю после коммита не должно ходить в БД.
+        assert victims[0].file_path.endswith(".mp4")
