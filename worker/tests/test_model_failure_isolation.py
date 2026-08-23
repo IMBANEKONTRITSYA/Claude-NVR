@@ -92,7 +92,7 @@ def test_record_layer_publishes_status_without_model(monkeypatch):
                     "online": True, "inboundBytes": 4096}}
 
     monkeypatch.setattr(worker, "MediaMTXClient", _Client)
-    monkeypatch.setattr(worker, "_last_segment_ts", lambda ids: {})
+    monkeypatch.setattr(worker, "_last_segments", lambda ids: {})
     monkeypatch.setattr(worker, "update_status", lambda *a, **k: None)
     published = {}
     monkeypatch.setattr(worker.r, "set", lambda k, v, **kw: published.update({k: v}))
@@ -116,7 +116,7 @@ def test_analytics_state_is_published_for_the_interface(monkeypatch):
             return {}
 
     monkeypatch.setattr(worker, "MediaMTXClient", _Client)
-    monkeypatch.setattr(worker, "_last_segment_ts", lambda ids: {})
+    monkeypatch.setattr(worker, "_last_segments", lambda ids: {})
     monkeypatch.setattr(worker.r, "set", lambda *a, **k: True)
 
     payload = worker.publish_record_layer_status([])
@@ -185,7 +185,7 @@ def _broken_api(monkeypatch, exc=OSError("Connection refused")):
             raise exc
 
     monkeypatch.setattr(worker, "MediaMTXClient", _Client)
-    monkeypatch.setattr(worker, "_last_segment_ts", lambda ids: {})
+    monkeypatch.setattr(worker, "_last_segments", lambda ids: {})
     monkeypatch.setattr(worker.r, "set", lambda *a, **k: True)
     monkeypatch.setattr(worker, "_record_api_error", None)
     monkeypatch.setattr(worker, "_record_prev_status", None)

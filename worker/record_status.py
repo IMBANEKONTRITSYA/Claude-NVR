@@ -147,6 +147,13 @@ def summarize(states: dict[int, dict]) -> dict:
     total = len(states)
     online = sum(1 for s in states.values() if s["status"] == ONLINE)
     unknown = sum(1 for s in states.values() if s["status"] == UNKNOWN)
+    # Суммарный битрейт объекта (SPEC §9 «битрейт», SPEC §16 «Сеть: сумма
+    # битрейтов всех камер + 10% запас»). Считается по камерам, у которых
+    # он есть: `None` означает «ещё не измерен», и подставлять вместо него
+    # ноль значило бы показывать заниженную нагрузку на сеть сразу после
+    # старта воркера — то самое число, по которому планируют канал.
+    measured = [s.get("bitrate_kbps") for s in states.values()
+                if s.get("bitrate_kbps") is not None]
     return {
         "streams_total": total,
         "streams_online": online,
@@ -154,6 +161,8 @@ def summarize(states: dict[int, dict]) -> dict:
         "streams_unknown": unknown,
         "inbound_bytes": sum(s["inbound_bytes"] for s in states.values()),
         "frames_in_error": sum(s["frames_in_error"] for s in states.values()),
+        "inbound_kbps": round(sum(measured), 1) if measured else None,
+        "bitrate_measured_cameras": len(measured),
     }
 
 

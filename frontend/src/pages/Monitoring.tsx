@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
 import { api, getToken, getRole } from "../api";
+import {
+  formatBitrate, formatFps, formatTotalBitrate, isSilentStream,
+} from "../streamRate";
 
 function Bar({ percent, warn, crit }: { percent: number; warn?: number; crit?: number }) {
   // Умолчания через ?? , а не в сигнатуре: вызывающие передают warn/crit
@@ -137,6 +140,16 @@ function RecordLayerPanel() {
               hint={gaps.length ? `камеры: ${gaps.join(", ")}` : "нет"} />
             <Metric label="Кадров с ошибками" value={s.frames_in_error}
               hint="суммарно по всем потокам" />
+            {/* Суммарный входящий поток (SPEC §9 «битрейт», §16 «Сеть:
+                сумма битрейтов всех камер + 10% запас»). Подпись говорит,
+                по скольким камерам он сложен: сразу после старта воркера
+                измерены ещё не все, и сумма без этой оговорки выглядела бы
+                заниженной нагрузкой на канал — тем самым числом, по
+                которому канал и планируют. */}
+            <Metric label="Входящий поток" value={formatTotalBitrate(s.inbound_kbps)}
+              hint={s.inbound_kbps === null || s.inbound_kbps === undefined
+                ? "ещё не измерен"
+                : `измерено камер: ${s.bitrate_measured_cameras} из ${s.streams_total}`} />
           </div>
 
           {gaps.length > 0 && (
@@ -168,7 +181,13 @@ function RecordLayerPanel() {
             <div style={{ maxHeight: 320, overflowY: "auto" }}>
               <table>
                 <thead>
-                  <tr><th>Камера</th><th>Статус</th><th>Принято</th><th>Ошибки кадров</th><th>В сети с</th></tr>
+                  {/* FPS и битрейт §9 стоят сразу за статусом: раздел
+                      называет все три величины одной строкой, и читаются
+                      они тоже вместе — «онлайн, 25 к/с, 4.2 Мбит/с».
+                      «Принято» остаётся, но уже как справка об объёме, а
+                      не как подмена скорости. */}
+                  <tr><th>Камера</th><th>Статус</th><th>FPS</th><th>Битрейт</th>
+                    <th>Принято</th><th>Ошибки кадров</th><th>В сети с</th></tr>
                 </thead>
                 <tbody>
                   {shown.map(x => (
@@ -193,7 +212,20 @@ function RecordLayerPanel() {
                           </div>
                         )}
                       </td>
-                      <td>{(x.inbound_bytes / 1048576).toFixed(1)} МБ</td>
+                      <td>{formatFps(x.fps)}</td>
+                      {/* Поток числится живым, а байты не идут — состояние,
+                          которого накопительный счётчик не показывал вовсе.
+                          Красится только оно: прочерк «ещё не измерено»
+                          аварией не является. */}
+                      <td style={{
+                        color: isSilentStream(x.status, x.bitrate_kbps)
+                          ? "var(--red)" : undefined,
+                        fontWeight: isSilentStream(x.status, x.bitrate_kbps) ? 600 : undefined,
+                      }}>
+                        {formatBitrate(x.bitrate_kbps)}
+                        {isSilentStream(x.status, x.bitrate_kbps) && " · данных нет"}
+                      </td>
+                      <td className="muted">{(x.inbound_bytes / 1048576).toFixed(1)} МБ</td>
                       <td style={{ color: x.frames_in_error ? "var(--orange)" : undefined }}>
                         {x.frames_in_error}
                       </td>

@@ -56,8 +56,10 @@ from record_layer import (MediaMTXClient, path_conf, path_name,
                           record_media_root, record_path_template,
                           record_root_divergence, redact_url, segments_dir,
                           sync_paths)
-from record_status import (UNKNOWN, alert_batch, newly_lost, newly_restored,
-                           segment_gaps, stream_states, summarize)
+from record_status import (SEGMENT_GAP_FACTOR, UNKNOWN, alert_batch,
+                           newly_lost, newly_restored, segment_gaps,
+                           stream_states, summarize)
+from stream_rate import SegmentFpsCache, update_bitrates
 from stream_recovery import RecoverySupervisor
 from segment_index import index_new_segments
 from snapshot_http import fetch_snapshot_bytes
@@ -174,6 +176,16 @@ IDLE_AFTER_SEC = 20
 # считается ПЕРЕХОД online → offline (SPEC §14 требует алерт на потерю
 # потока, а не на факт «сейчас offline» — см. record_status.newly_lost).
 _record_prev_status: dict[int, str] | None = None
+
+# Пробы счётчика `bytesReceived` с прошлого прохода: «камера → (время,
+# байты)». По ним считается битрейт §9 — Control API отдаёт только
+# накопительный счётчик, скорости в нём нет (см. stream_rate.py).
+_record_byte_samples: dict[int, tuple[float, int]] = {}
+
+# FPS §9 по последнему дописанному сегменту каждой камеры. Кэш держится
+# процессом, а не пересоздаётся на проходе: он и существует ради того,
+# чтобы один и тот же файл не пробовался ffprobe каждые пять секунд.
+_record_fps_cache = SegmentFpsCache()
 
 # Последняя причина недоступности Control API MediaMTX (None — доступен).
 # Хранится, чтобы, во-первых, не повторять одно и то же предупреждение
@@ -1936,6 +1948,8 @@ def publish_record_layer_status(cam_names) -> dict:
     """
     global _record_prev_status
 
+    global _record_byte_samples
+
     global _record_api_error
 
     try:
@@ -1985,8 +1999,9 @@ def publish_record_layer_status(cam_names) -> dict:
         # время хоста, и на непустой `TZ` проверка «сегмент не пишется
         # дольше N минут» уехала бы ровно на смещение пояса — в одну
         # сторону молчала бы всегда, в другую алертила бы всегда.
-        gaps = segment_gaps(_last_segment_ts(states.keys()), states,
-                            _utc_seconds(datetime.utcnow()),
+        newest_segments = _last_segments(states.keys())
+        gaps = segment_gaps({cid: ts for cid, (ts, _) in newest_segments.items()},
+                            states, _utc_seconds(datetime.utcnow()),
                             CONFIG["record_segment_min"])
         for cam_id in gaps:
             logger.error("пропуск записи сегмента",
@@ -1996,8 +2011,31 @@ def publish_record_layer_status(cam_names) -> dict:
     except Exception:
         logger.error("не удалось проверить пропуски сегментов", exc_info=True)
         gaps = []
+        newest_segments = {}
 
     _record_prev_status = {cid: st["status"] for cid, st in states.items()}
+
+    # FPS и битрейт каждого потока (SPEC §9). Обе величины Control API не
+    # отдаёт вовсе, поэтому считаются здесь: битрейт — из разности
+    # счётчика байтов между проходами, FPS — пробой последнего дописанного
+    # сегмента. Подробности и обоснование источников — в stream_rate.py.
+    #
+    # Под общим try: ни одна из двух величин не стоит того, чтобы уронить
+    # проход менеджера, который в этом же цикле синхронизирует пути записи
+    # и ставит статусы камер (SPEC §2 — слои независимы, и уж тем более от
+    # украшения строки мониторинга запись зависеть не должна).
+    try:
+        rates, _record_byte_samples = update_bitrates(
+            _record_byte_samples, states, time.time())
+        fps_by_camera = _record_fps_cache.refresh(
+            newest_segments, _utc_seconds(datetime.utcnow()),
+            CONFIG["record_segment_min"] * 60 * SEGMENT_GAP_FACTOR)
+    except Exception:
+        logger.error("не удалось посчитать скорость потоков записи", exc_info=True)
+        rates, fps_by_camera = {}, {}
+    for cam_id, st in states.items():
+        st["bitrate_kbps"] = rates.get(cam_id)
+        st["fps"] = fps_by_camera.get(cam_id)
 
     # Статус камеры в БД — из слоя записи (SPEC §2, §4).
     #
@@ -2062,23 +2100,45 @@ def _utc_seconds(dt: datetime) -> float:
     return dt.replace(tzinfo=timezone.utc).timestamp()
 
 
-def _last_segment_ts(camera_ids) -> dict[int, float]:
-    """Время последнего дописанного сегмента по каждой камере (naive-UTC).
+def _last_segments(camera_ids) -> dict[int, tuple[float, str]]:
+    """Последний дописанный сегмент по камере: «время конца, путь файла».
 
     Читается из архива, а не с диска: строка появляется там только после
     того, как файл дописан и проиндексирован, — это и есть признак «запись
-    идёт», который проверяет SPEC §14.
+    идёт», который проверяет SPEC §14. Он же гарантирует, что путь ведёт на
+    **закрытый** файл: пробовать ffprobe растущий сегмент (SPEC §9, FPS)
+    значило бы мерить длительность, которая ещё меняется.
+
+    Путь и время берутся одной строкой, а не двумя запросами: `max(ended_at)`
+    в группировке не сказал бы, какому файлу принадлежит максимум.
     """
     ids = list(camera_ids)
     if not ids:
         return {}
+    newest = (
+        select(VideoSegment.camera_id,
+               func.max(VideoSegment.ended_at).label("ended_at"))
+        .where(VideoSegment.camera_id.in_(ids))
+        .group_by(VideoSegment.camera_id)
+        .subquery()
+    )
     with Session() as s:
         rows = s.execute(
-            select(VideoSegment.camera_id, func.max(VideoSegment.ended_at))
-            .where(VideoSegment.camera_id.in_(ids))
-            .group_by(VideoSegment.camera_id)
+            select(VideoSegment.camera_id, VideoSegment.ended_at,
+                   VideoSegment.file_path)
+            .join(newest,
+                  (VideoSegment.camera_id == newest.c.camera_id)
+                  & (VideoSegment.ended_at == newest.c.ended_at))
         ).all()
-    return {cam_id: _utc_seconds(ended) for cam_id, ended in rows if ended}
+    out: dict[int, tuple[float, str]] = {}
+    for cam_id, ended, path in rows:
+        if ended is None:
+            continue
+        # Переворот файла на границе секунды может дать две строки с
+        # одинаковым `ended_at`; какая из них попадёт в карту — неважно,
+        # обе описывают один и тот же поток в одно и то же время.
+        out[cam_id] = (_utc_seconds(ended), path)
+    return out
 
 
 def index_record_segments() -> None:

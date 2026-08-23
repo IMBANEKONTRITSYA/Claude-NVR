@@ -149,6 +149,12 @@ if [ -n "${FACEWATCH_FFMPEG_TARBALL:-}" ]; then
     tar xf "$BUILD_DIR/ffmpeg.tar" -C "$BUILD_DIR/ffmpeg" --strip-components=1
     find "$BUILD_DIR/ffmpeg" -type f \( -name ffmpeg -o -name ffprobe \) -exec install -m 0755 {} "$PREFIX/bin/" \;
     [ -x "$PREFIX/bin/ffmpeg" ] || { echo "в архиве не нашлось ffmpeg" >&2; exit 1; }
+    # ffprobe проверяется отдельно, а не заодно: им снимается FPS потоков
+    # записи (SPEC §9, worker/stream_rate.py), и его отсутствие не роняет
+    # ничего — просто столбец «FPS» на «Мониторинге» навсегда остаётся
+    # прочерком на всех камерах. Такой отказ не находят, поэтому сборка
+    # обязана падать здесь, а не молчать.
+    [ -x "$PREFIX/bin/ffprobe" ] || { echo "в архиве не нашлось ffprobe" >&2; exit 1; }
 fi
 
 # ------------------------------------------------------------------- venv
