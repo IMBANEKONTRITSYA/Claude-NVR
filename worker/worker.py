@@ -49,6 +49,8 @@ from face_select import pick_matching_face
 from fileage import prune_media
 from liveness import Heartbeat, start_watchdog
 from ort_threads import analytics_thread_budget, limit_threads as limit_ort_threads
+from orphan_media import (remove_files, segment_camera_ids,
+                          thumb_segment_ids)
 from motion_windows import (DEFAULT_GUARD_SEC, MotionWindowTracker,
                             SETTLE_SEC as MOTION_SETTLE_SEC,
                             segments_without_motion)
@@ -434,7 +436,7 @@ class MotionWindow(Base):
 
     __tablename__ = "motion_windows"
     id = Column(Integer, primary_key=True)
-    camera_id = Column(Integer, ForeignKey("cameras.id"))
+    camera_id = Column(Integer, ForeignKey("cameras.id", ondelete="CASCADE"))
     started_at = Column(DateTime)
     ended_at = Column(DateTime)
     motion = Column(Boolean, default=False)
@@ -463,8 +465,8 @@ class Person(Base):
 class FaceEvent(Base):
     __tablename__ = "face_events"
     id = Column(Integer, primary_key=True)
-    camera_id = Column(Integer, ForeignKey("cameras.id"))
-    person_id = Column(Integer, ForeignKey("persons.id"), nullable=True)
+    camera_id = Column(Integer, ForeignKey("cameras.id", ondelete="CASCADE"))
+    person_id = Column(Integer, ForeignKey("persons.id", ondelete="SET NULL"), nullable=True)
     ts = Column(DateTime)
     snapshot_path = Column(String)
     orig_snapshot_path = Column(String)
@@ -475,9 +477,20 @@ class FaceEvent(Base):
 
 
 class VideoSegment(Base):
+    """Копия модели бэкенда; схему создаёт он (`models.VideoSegment`).
+
+    `ondelete` — правило DDL, и в бою его ставит бэкенд, поэтому на работу
+    воркера эти слова не влияют вовсе. Стоят они здесь ради тестов: набор,
+    создающий таблицы из **этих** моделей, иначе получает схему без
+    каскада, то есть проверяет систему, которой не существует. Ровно на
+    этом цикл 53 потерял бы находку второй раз — первый был в
+    `tests/test_segment_index.py`, где своя модель обходилась без внешнего
+    ключа совсем (см. её шапку).
+    """
+
     __tablename__ = "video_segments"
     id = Column(Integer, primary_key=True)
-    camera_id = Column(Integer, ForeignKey("cameras.id"))
+    camera_id = Column(Integer, ForeignKey("cameras.id", ondelete="CASCADE"))
     started_at = Column(DateTime)
     ended_at = Column(DateTime)
     file_path = Column(String)
@@ -1683,6 +1696,67 @@ def cleanup_old():
         logger.info("уборка медиа-файлов", extra={"removed": removed})
 
 
+def prune_orphan_media() -> dict[str, int]:
+    """Файлы, потерявшие свою строку в БД (SPEC §3 «удаление камер», §5).
+
+    Четвёртый механизм удаления рядом с retention, циклической перезаписью
+    и уборкой сегментов без движения — и единственный, который идёт от
+    файла к строке, а не наоборот. Он закрывает ровно один случай: строку
+    удалил не воркер, а `ON DELETE CASCADE` при удалении камеры через
+    веб-интерфейс. Обоснование направления и правил безопасности — в
+    шапке `orphan_media.py`.
+
+    Убирается двоякое сиротство, потому что у камеры сносятся строки
+    сразу двух видов:
+
+    * **сегменты** удалённых камер — их идентификатор читается из имени
+      файла (`cam3_1754460000.mp4`);
+    * **миниатюры** (§7), которые именуются идентификатором сегмента и
+      живут отдельным файлом: `_drop_segments` удаляет их по строке, а
+      строк после CASCADE нет. Их набор на диске мал (миниатюра
+      появляется только у сегмента, который открывали в выдаче архива),
+      поэтому спрашивается наличие именно этих идентификаторов.
+
+    Раз в час, вместе с retention: сиротство возникает только в момент
+    удаления камеры, и час задержки ничего не решает, а обход каталога
+    архива не бесплатный.
+    """
+    stats = {"segments": 0, "thumbs": 0, "failed": 0}
+    by_cam = segment_camera_ids(segments_dir(MEDIA_PATH))
+    thumbs = thumb_segment_ids(MEDIA_PATH)
+    if not by_cam and not thumbs:
+        return stats
+
+    with Session() as s:
+        live_cams = set(
+            s.execute(select(Camera.id).where(Camera.id.in_(by_cam))).scalars().all()
+        ) if by_cam else set()
+        live_segs = set(
+            s.execute(
+                select(VideoSegment.id).where(VideoSegment.id.in_(thumbs))
+            ).scalars().all()
+        ) if thumbs else set()
+
+    doomed_cams = sorted(set(by_cam) - live_cams)
+    doomed_files = [p for cam in doomed_cams for p in by_cam[cam]]
+    removed, failed = remove_files(doomed_files)
+    stats["segments"] = removed
+    stats["failed"] += failed
+
+    doomed_thumbs = [p for sid, p in thumbs.items() if sid not in live_segs]
+    removed, failed = remove_files(doomed_thumbs)
+    stats["thumbs"] = removed
+    stats["failed"] += failed
+
+    if stats["segments"] or stats["thumbs"] or stats["failed"]:
+        # warning, а не info: удаление камеры — редкая операция, и объём
+        # освобождённого здесь места (сутки записи одной камеры — ~21.6 ГБ
+        # по §16) администратор должен видеть в журнале без grep'а.
+        logger.warning("уборка осиротевших медиа-файлов",
+                       extra={"camera_ids": doomed_cams, **stats})
+    return stats
+
+
 def prune_motionless_segments() -> int:
     """«Запись только при движении»: сносит сегменты без движения (SPEC §6).
 
@@ -2151,7 +2225,8 @@ def index_record_segments() -> None:
     try:
         index_new_segments(
             Session, VideoSegment, segments_dir(MEDIA_PATH),
-            now=time.time(), from_timestamp=datetime.utcfromtimestamp,
+            now=time.time(), camera_model=Camera,
+            from_timestamp=datetime.utcfromtimestamp,
         )
     except Exception:
         logger.error("не удалось занести сегменты записи в архив", exc_info=True)
@@ -2417,6 +2492,15 @@ def manager():
                     cleanup_old()
                 except Exception:
                     logger.error("ошибка очистки (cleanup)", exc_info=True)
+                # Отдельным try: сиротство после удаления камеры не связано
+                # с retention ни причиной, ни данными, и отказ одной уборки
+                # не должен отменять вторую — иначе диск продолжал бы расти
+                # по причине, о которой в журнале уже написано.
+                try:
+                    prune_orphan_media()
+                except Exception:
+                    logger.error("ошибка уборки осиротевших медиа-файлов",
+                                 exc_info=True)
 
             # SPEC §6: уборка сегментов без движения идёт чаще retention —
             # раз в 5 минут. Смысл режима в том, чтобы не занимать диск

@@ -30,7 +30,8 @@ MIN_SEGMENT_BYTES = 1024
 
 
 def index_new_segments(session_factory, segment_model, segments_dir: str, *,
-                       now: float, from_timestamp, settle_sec: float = SEGMENT_SETTLE_SEC,
+                       now: float, camera_model,
+                       from_timestamp, settle_sec: float = SEGMENT_SETTLE_SEC,
                        min_bytes: int = MIN_SEGMENT_BYTES) -> int:
     """Заносит в архив все дописанные сегменты, которых там ещё нет.
 
@@ -41,6 +42,22 @@ def index_new_segments(session_factory, segment_model, segments_dir: str, *,
     сверка идёт по `file_path`, а он уникален (в имени unix-время начала
     сегмента). Именно поэтому индексация может спокойно стоять в цикле
     менеджера, который выполняется каждые ~10 с.
+
+    `camera_model` обязателен, и вот почему. Идентификатор камеры берётся
+    **из имени файла**, а `video_segments.camera_id` — внешний ключ на
+    `cameras.id`. Файлы удалённой камеры (§3) остаются на диске, её строки
+    архива сносит `ON DELETE CASCADE`, и следующий же проход пытается
+    завести их заново — с идентификатором, которого в `cameras` больше
+    нет. Postgres отвечает отказом внешнего ключа, а вставка идёт **одной
+    транзакцией на весь проход**, поэтому вместе с осиротевшими не
+    заносятся и сегменты всех остальных камер: одно удаление камеры
+    останавливало индексацию архива целиком и навсегда (файлы-сироты со
+    временем не исчезают). Сегменты камер, которых нет, здесь пропускаются;
+    их файлы убирает `worker.prune_orphan_media()`.
+
+    Гонка «камеру удалили между этим запросом и коммитом» возможна и
+    оставлена намеренно: она даёт один неудачный проход, следующий уже
+    видит камеру удалённой и пропускает её сегменты сам.
     """
     found = collect_complete_segments(segments_dir, now, settle_sec)
     if not found:
@@ -52,6 +69,25 @@ def index_new_segments(session_factory, segment_model, segments_dir: str, *,
 
     added = 0
     with session_factory() as s:
+        # Спрашиваются только камеры, встреченные на диске: список конечный
+        # (не больше числа камер объекта), а ответ «этих нет» не зависит от
+        # того, сколько камер заведено всего.
+        seen_cams = {x["camera_id"] for x in fresh}
+        live_cams = set(
+            s.execute(
+                select(camera_model.id).where(camera_model.id.in_(seen_cams))
+            ).scalars().all()
+        )
+        gone = seen_cams - live_cams
+        if gone:
+            fresh = [x for x in fresh if x["camera_id"] in live_cams]
+            logger.info(
+                "сегменты удалённых камер пропущены при индексации",
+                extra={"camera_ids": sorted(gone)},
+            )
+            if not fresh:
+                return 0
+
         known = set(
             s.execute(
                 select(segment_model.file_path).where(
