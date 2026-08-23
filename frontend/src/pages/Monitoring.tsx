@@ -577,20 +577,40 @@ export function Monitoring() {
       <h2>Мониторинг системы</h2>
 
       <div className="row" style={{ marginBottom: 16 }}>
-        <Metric label="Загрузка CPU" value={`${m.cpu_percent}%`} percent={m.cpu_percent} />
-        <Metric label="Оперативная память" value={`${m.ram_percent}%`} percent={m.ram_percent}
-          hint={`${m.ram_used_mb} / ${m.ram_total_mb} МБ`} />
+        {/* §18 «Системный мониторинг: Оператор — Ограниченно». Телеметрия
+            железа сервера приходит только админу, и признак приходит от
+            бэкенда (`system_metrics_limited`), а не выводится из роли на
+            клиенте: право решает сервер, клиент лишь объясняет пустоту.
+            Без объяснения оператор видел бы страницу без трёх плиток и
+            читал бы это как поломку мониторинга. */}
+        {!m.system_metrics_limited && <>
+          <Metric label="Загрузка CPU" value={`${m.cpu_percent}%`} percent={m.cpu_percent} />
+          <Metric label="Оперативная память" value={`${m.ram_percent}%`} percent={m.ram_percent}
+            hint={`${m.ram_used_mb} / ${m.ram_total_mb} МБ`} />
+        </>}
         <Metric label="Диск архива" value={`${m.disk_percent}%`} percent={m.disk_percent}
           hint={`свободно ${m.disk_free_gb} ГБ из ${m.disk_total_gb} ГБ`} />
         {/* Источник показания подписан под числом: датчиков на сервере
             несколько (сокеты, корпус, диски массива), и «Температура» без
             уточнения читается как температура процессора — а до цикла 52
             ею запросто оказывалась температура корпуса или диска. */}
-        {m.temperature_c != null && (
+        {!m.system_metrics_limited && m.temperature_c != null && (
           <Metric label="Температура" value={`${m.temperature_c}°C`}
             hint={m.temperature_source || undefined} />
         )}
       </div>
+
+      {m.system_metrics_limited && (
+        <div style={{
+          padding: "8px 12px", borderRadius: 4, marginBottom: 16,
+          background: "var(--panel)", border: "1px solid var(--border)",
+          fontSize: 13,
+        }}>
+          Загрузка CPU, память и температура сервера доступны только
+          администратору (матрица прав, §18). Состояние камер, потоков и
+          архива — ниже.
+        </div>
+      )}
 
       <RecordLayerPanel />
       <StoragePanel isAdmin={isAdmin} />

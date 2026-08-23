@@ -14,6 +14,7 @@ from ..db import SessionLocal, get_db
 from ..models import Camera, FaceEvent, Setting, VideoSegment
 from ..auth import require_role, require_role_query
 from ..services.sensors import cpu_temperature
+from ..services.system_metrics_acl import filter_system_metrics
 from ..profiles import profile_settings
 from ..services import autoconfig
 from ..services.pubsub import get_redis
@@ -126,9 +127,16 @@ async def _collect() -> dict:
 
 
 @router.get("/metrics")
-async def system_metrics(_=Depends(require_role("admin", "operator"))):
-    """Метрики для админ-дашборда. Оператору доступно ограниченно (см. матрицу прав)."""
-    return await _collect()
+async def system_metrics(user=Depends(require_role("admin", "operator"))):
+    """Метрики для админ-дашборда.
+
+    Оператору — ограниченно, как требует §18: телеметрия железа сервера
+    (CPU, RAM, температура) не отдаётся, место на диске отдаётся. Граница
+    и её обоснование — в services/system_metrics_acl.py; до цикла 55 эта
+    строка докстринга была единственным местом, где ограничение
+    существовало, — оператор получал ответ целиком.
+    """
+    return filter_system_metrics(await _collect(), user.role)
 
 
 @router.get("/prometheus")
