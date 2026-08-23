@@ -102,8 +102,21 @@ def test_real_budget_table_covers_manager_stages(liveness):
     """
     stages = {"camera_scan", "record_layer_sync", "index_segments",
               "record_status", "cleanup", "motion_prune", "disk_quota",
-              "disk_alerts", "model_load", "idle", "shutdown"}
+              "disk_alerts", "idle", "shutdown"}
     assert stages <= set(liveness.STAGE_BUDGETS_SEC)
+
+
+def test_model_load_is_not_a_manager_stage(liveness):
+    """`model_load` из таблицы убран — менеджер этим этапом не отмечается.
+
+    Обратная проверка к предыдущей: там «у каждого этапа есть бюджет»,
+    здесь — «бюджета нет у того, чего менеджер не делает». Пока запись
+    бюджета жила в таблице, она означала санкцию на 900-секундную
+    остановку слоя записи ради загрузки модели (SPEC §2). Загрузка ушла в
+    свою нить, и возвращение записи сюда означало бы возвращение той
+    остановки — молча, одной строкой.
+    """
+    assert "model_load" not in liveness.STAGE_BUDGETS_SEC
 
 
 # --- Watchdog --------------------------------------------------------------

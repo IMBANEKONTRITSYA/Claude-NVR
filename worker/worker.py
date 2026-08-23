@@ -50,6 +50,7 @@ from detection_schedule import schedule_active
 from face_select import pick_matching_face
 from fileage import prune_media
 from liveness import Heartbeat, start_watchdog
+from model_loader import ModelLoader
 from ort_threads import analytics_thread_budget, limit_threads as limit_ort_threads
 from avatar_store import adopt_snapshot, avatar_files, needs_avatar
 from orphan_media import (remove_files, segment_camera_ids,
@@ -215,6 +216,11 @@ _record_desired: dict[str, dict] = {}
 # отсюда его состояние забирает publish_record_layer_status() для
 # интерфейса.
 _record_recovery: RecoverySupervisor | None = None
+
+# Нить загрузки модели аналитики (SPEC §2, см. model_loader.py). Создаётся
+# в manager(); её состояние забирает publish_record_layer_status(), чтобы
+# §9 отличал «модель грузится» от «модель не загрузилась».
+_model_loader: ModelLoader | None = None
 
 
 def _pg_connect_args(url: str) -> dict:
@@ -564,18 +570,27 @@ def analytics_threads() -> int:
     )
 
 
-def load_face_app(model_name: str | None = None):
-    """Загружает модель детекции/распознавания с учётом профиля (ТЗ 18.5)."""
+def load_face_app(model_name: str | None = None, det_size: int | None = None,
+                  ort_threads: int | None = None):
+    """Загружает модель детекции/распознавания с учётом профиля (ТЗ 18.5).
+
+    Параметры передаются явно, а не читаются из `CONFIG` на месте: с цикла
+    55 загрузка идёт в отдельной нити (model_loader.py), а `CONFIG`
+    обновляет нить менеджера. Читая конфиг здесь, загрузка могла бы
+    применить параметры новее тех, о которых её просили, и отчитаться о
+    них как о старых — расхождение молча дожило бы до следующей смены
+    профиля. Умолчания сохранены: без аргументов поведение прежнее.
+    """
     global ACCELERATOR, FACE_APP
     # Потолок CPU ставится ДО создания сессий: опции читаются в момент
     # создания, у существующей сессии пул уже свой.
-    threads = analytics_threads()
+    threads = analytics_threads() if ort_threads is None else int(ort_threads)
     limited = limit_ort_threads(threads)
     from insightface.app import FaceAnalysis
     name = model_name or CONFIG["face_model"]
     providers = detect_providers()
     ACCELERATOR = providers[0].replace("ExecutionProvider", "")
-    size = int(CONFIG["detect_width"])
+    size = int(CONFIG["detect_width"] if det_size is None else det_size)
     logger.info("модель загружена", extra={"model": name, "accelerator": ACCELERATOR,
                                            "det_size": size, "ort_threads": threads,
                                            "ort_threads_applied": limited})
@@ -585,17 +600,20 @@ def load_face_app(model_name: str | None = None):
     return app
 
 
-def _try_load_model() -> bool:
+def _try_load_model(params: tuple | None = None) -> bool:
     """Загружает модель, не роняя процесс при отказе (SPEC §2).
 
     Возвращает успех и оставляет причину отказа в `MODEL_ERROR`, чтобы
     интерфейс мог показать её администратору: молчаливое «аналитика не
     работает» отличить от «камеры нет в кадре» невозможно.
+
+    `params` — кортеж `want_model_params()`. Без него берутся текущие
+    значения `CONFIG` (прежнее поведение).
     """
     global MODEL_ERROR
     logger.info("загрузка модели InsightFace...")
     try:
-        load_face_app()
+        load_face_app(*(params or ()))
     except Exception as exc:
         MODEL_ERROR = f"{type(exc).__name__}: {exc}"[:300]
         logger.error(
@@ -609,6 +627,22 @@ def _try_load_model() -> bool:
     MODEL_ERROR = None
     logger.info("модель готова")
     return True
+
+
+def want_model_params() -> tuple[str, int, int]:
+    """Параметры модели, которых требует текущий профиль (§15, §16).
+
+    Бюджет потоков ORT входит в них наравне с именем модели и разрешением
+    детектора: он применяется к сессиям ONNX Runtime в момент их создания,
+    и смена настройки без перезагрузки модели не изменила бы ничего.
+    """
+    return (str(CONFIG["face_model"]), int(CONFIG["detect_width"]),
+            analytics_threads())
+
+
+def _load_model_params(params: tuple) -> bool:
+    """Адаптер для нити загрузки (model_loader.py)."""
+    return _try_load_model(params)
 
 
 # Причина, по которой модель не загрузилась (None — загружена). Публикуется
@@ -2318,9 +2352,16 @@ def publish_record_layer_status(cam_names) -> dict:
                # на стене выглядят одинаково, а чинятся по-разному.
                "recovery": (_record_recovery.snapshot()
                             if _record_recovery is not None else {}),
+               # Состояние загрузки модели (§9). Без него «модель ещё
+               # качается» и «модель не загрузилась» выглядели на странице
+               # одинаково — `model_ready: false` без пояснений, — а с
+               # цикла 55 первое состояние стало обычным и длительным:
+               # запись идёт, аналитика поднимается в своей нити.
                "analytics": {"model_ready": FACE_APP is not None,
                              "model": CONFIG["face_model"],
-                             "error": MODEL_ERROR}}
+                             "error": MODEL_ERROR,
+                             "load": (_model_loader.snapshot()
+                                      if _model_loader is not None else None)}}
     try:
         r.set("record:layer", json.dumps(payload), ex=120)
     except Exception:
@@ -2455,7 +2496,7 @@ def manager():
     # именно `/health` этого API опрашивает healthcheck контейнера, и до
     # цикла 38 он отвечал «жив» независимо от того, крутится ли этот цикл
     # (uvicorn работает в своей нити). Зависший менеджер выглядел здоровым.
-    global HEARTBEAT, _record_root_warning, _record_recovery
+    global HEARTBEAT, _record_root_warning, _record_recovery, _model_loader
     HEARTBEAT = Heartbeat()
     HEARTBEAT.beat("startup")
 
@@ -2496,11 +2537,21 @@ def manager():
     # штатно: InsightFace скачивает модель из интернета при первом запуске,
     # а production-сервер видеонаблюдения обычно изолирован. Контейнер
     # уходил в бесконечный CrashLoop, и запись не велась вообще.
-    loaded_model = None
-    HEARTBEAT.beat("model_load")
-    _try_load_model()
-    if FACE_APP is not None:
-        loaded_model = (CONFIG["face_model"], CONFIG["detect_width"], analytics_threads())
+    # Загрузка — в собственной нити, и менеджер её НЕ ждёт (SPEC §2, §15,
+    # см. model_loader.py). Раньше здесь стоял синхронный `_try_load_model()`,
+    # и до его возврата не выполнялась ни одна строка слоя записи: пути
+    # камер в MediaMTX не создавались, то есть на свежей установке архив не
+    # писался всё время скачивания пака модели. Бюджет `model_load` в
+    # liveness.py — 900 секунд: столько эта остановка могла длиться, не
+    # считаясь даже зависанием.
+    _model_loader = ModelLoader(
+        _load_model_params,
+        error_getter=lambda: MODEL_ERROR,
+        retry_sec=MODEL_RETRY_SEC,
+        stop_event=shutdown_event,
+    )
+    _model_loader.request(want_model_params())
+    _model_loader.start()
 
     # Супервизор восстановления потоков (SPEC §19: «восстановление потока
     # ≤ 5 секунд после обрыва»). Поднимается ДО первого прохода менеджера,
@@ -2526,7 +2577,6 @@ def manager():
     last_cleanup = 0.0
     last_recluster = 0.0
     last_motion_prune = 0.0
-    last_model_retry = time.time()
 
     logger.info("конфиг воркера", extra={"config": CONFIG})
 
@@ -2534,27 +2584,15 @@ def manager():
         try:
             HEARTBEAT.beat("camera_scan")
             refresh_config()
-            # Бюджет потоков ORT — часть параметров модели: он применяется
-            # к сессиям при создании, и смена настройки без перезагрузки
-            # модели ничего бы не изменила (SPEC §16).
-            want_model = (CONFIG["face_model"], CONFIG["detect_width"],
-                          analytics_threads())
-            # Смена модели/разрешения в профиле применяется без перезапуска
-            if FACE_APP is not None and want_model != loaded_model:
-                logger.info("параметры модели изменились, перезагружаю")
-                HEARTBEAT.beat("model_load")
-                if _try_load_model():
-                    loaded_model = want_model
-            elif FACE_APP is None and time.time() - last_model_retry > MODEL_RETRY_SEC:
-                HEARTBEAT.beat("model_load")
-                # Повторная попытка после отказа: модель могла появиться без
-                # перезапуска контейнера (администратор положил файлы в том,
-                # починился доступ в интернет). Раз в 5 минут, а не каждый
-                # проход: скачивание модели идёт минуты и блокирует цикл.
-                last_model_retry = time.time()
-                if _try_load_model():
-                    loaded_model = want_model
-                    logger.info("слой аналитики включён: модель загружена")
+            # Объявляем нужные параметры и идём дальше НЕ ДОЖИДАЯСЬ загрузки.
+            # Смена модели/разрешения в профиле и повтор после отказа —
+            # забота нити загрузки; и то и другое применяется без
+            # перезапуска, как и раньше, но больше не останавливает слой
+            # записи ниже по циклу (SPEC §2, §15).
+            _model_loader.request(want_model_params())
+            # Долгую загрузку в журнал пишет менеджер, а не сама нить: она в
+            # этот момент сидит в `requests.get()` без таймаута.
+            _model_loader.log_if_slow()
             record_cams: list[tuple[int, str]] = []
             record_cam_names: list[tuple[int, str]] = []
             # Камеры, которые должны быть под аналитикой на этом проходе, —
