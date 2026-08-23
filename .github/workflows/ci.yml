@@ -317,6 +317,22 @@ jobs:
           MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
             python perf/bench_remux.py --pull --quick 1 4 8 | tee perf-remux.txt
 
+      - name: Measure record-layer stall caused by model load (SPEC §2)
+        # §2 требует, чтобы «падение/деградация одного слоя не затрагивала
+        # другой». Отказ загрузки модели закрыт с цикла 22 и проверяется
+        # тестами; деградация — медленная загрузка — не проверялась ничем
+        # до цикла 55, а стоила слою записи ровно столько же, сколько
+        # длится загрузка (замер 1:1).
+        #
+        # Число здесь — не порог, а сторож приёма: пока загрузка идёт в
+        # своей нити, `stall_sec` равен длительности загрузки только в
+        # синхронном варианте, а в боевом обязан оставаться около нуля.
+        # Возврат синхронной загрузки виден в этой строке сразу.
+        #
+        # Держим 20 секунд, а не боевые минуты: зависимость измерена
+        # линейной, и удлинение прогона ничего не добавляет.
+        run: python perf/bench_model_load_stall.py --hold 20 | tee perf-model-load-stall.txt
+
       - name: Measure stream recovery after a break (SPEC §19)
         # §19 «Запись: восстановление потока ≤ 5 секунд после обрыва» —
         # норматив, который до цикла 40 не измерялся ни разу. RTO циклов
@@ -555,6 +571,7 @@ jobs:
             perf-load.json
             perf-ram-scaling.json
             perf-rto-hang.txt
+            perf-model-load-stall.txt
             perf-remux.txt
             perf-recovery.txt
             perf-recovery-baseline.txt

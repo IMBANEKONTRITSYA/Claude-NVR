@@ -4,6 +4,7 @@ import {
   formatBitrate, formatFps, formatTotalBitrate, isSilentStream,
 } from "../streamRate";
 import { AnalyticsSource, streamCell } from "../analyticsStream";
+import { modelBanner } from "../modelLoad";
 
 function Bar({ percent, warn, crit }: { percent: number; warn?: number; crit?: number }) {
   // Умолчания через ?? , а не в сигнатуре: вызывающие передают warn/crit
@@ -101,25 +102,36 @@ function RecordLayerPanel() {
 
       {/* Отказ аналитики показывается отдельно от записи: с цикла 26 он
           больше не роняет воркер (SPEC §2), поэтому без явного сообщения
-          «распознавание молчит» неотличимо от «в кадре никого нет». */}
-      {d.analytics && d.analytics.model_ready === false && (
-        <div style={{
-          padding: "8px 12px", borderRadius: 4, marginBottom: 12,
-          background: "var(--orange)", color: "#000", fontWeight: 600,
-        }}>
-          Распознавание лиц выключено: модель «{d.analytics.model}» не загружена.
-          Запись при этом идёт нормально.
-          {d.analytics.error && (
-            <div style={{ fontWeight: 400, fontSize: 12, marginTop: 4 }}>
-              {d.analytics.error}
-            </div>
-          )}
-          <div style={{ fontWeight: 400, fontSize: 12, marginTop: 4 }}>
-            При первом запуске модель скачивается из интернета. На сервере без
-            доступа в сеть положите её в том insightface-models — см. INSTALL.
+          «распознавание молчит» неотличимо от «в кадре никого нет».
+          С цикла 55 у состояния три исхода, а не два: загрузка идёт в
+          своей нити и «ещё грузится» стало обычным и длительным — авария
+          в этом случае звала бы дежурного чинить то, что качается. Выбор
+          вынесен в modelLoad.ts и проверяется юнит-тестами. */}
+      {(() => {
+        const b = modelBanner(d.analytics);
+        if (!b) return null;
+        return (
+          <div style={{
+            padding: "8px 12px", borderRadius: 4, marginBottom: 12,
+            background: b.tone === "warn" ? "var(--orange)" : "var(--panel)",
+            color: b.tone === "warn" ? "#000" : "inherit",
+            border: b.tone === "warn" ? "none" : "1px solid var(--border)",
+            fontWeight: 600,
+          }}>
+            {b.title}
+            {b.detail && (
+              <div style={{ fontWeight: 400, fontSize: 12, marginTop: 4 }}>
+                {b.detail}
+              </div>
+            )}
+            {b.hint && (
+              <div style={{ fontWeight: 400, fontSize: 12, marginTop: 4 }}>
+                {b.hint}
+              </div>
+            )}
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {!d.available ? (
         <div className="empty">
