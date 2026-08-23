@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from ..db import get_db
 from ..models import FaceEvent, Person
-from ..auth import get_current_user
+from ..auth import require_role
 from ..schemas import FaceEventRich
 
 router = APIRouter(prefix="/api/events", tags=["events"])
@@ -16,9 +16,18 @@ async def recent_events(
     camera_id: int | None = None,
     is_known: bool | None = None,
     before_id: int | None = None,   # курсор для бесконечного скролла Стены
-    _=Depends(get_current_user),
+    _=Depends(require_role("admin", "operator")),
     db: AsyncSession = Depends(get_db),
 ):
+    """Лента Стены распознавания (§15).
+
+    Матрица прав §18 закрывает наблюдателю строку «Карточки персон», а эта
+    лента и есть карточки, выданные списком: имя персоны, путь к её
+    хранимому кадру и теги (включая watchlist). Раньше здесь стоял
+    `get_current_user` — любая аутентифицированная роль, — и наблюдатель,
+    получавший 403 на `/api/persons`, читал то же содержимое отсюда.
+    Живому оверлею §4 эта ручка не нужна: рамки приходят по `/ws/faces`.
+    """
     limit = min(max(1, limit), 200)
     q = (
         select(FaceEvent, Person.name, Person.status, Person.tags)

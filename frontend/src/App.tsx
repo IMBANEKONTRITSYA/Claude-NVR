@@ -3,6 +3,7 @@ import { Suspense, lazy, useCallback, useEffect, useState } from "react";
 import { api, getRole, getToken, getUser, isPasswordExpired } from "./api";
 import { Login } from "./pages/Login";
 import { useInactivityLogout } from "./useInactivityLogout";
+import { canAccess, SECTION_ROLES, type Section } from "./access";
 
 const Dashboard = lazy(() => import("./pages/Dashboard").then(m => ({ default: m.Dashboard })));
 const LiveGrid = lazy(() => import("./pages/LiveGrid").then(m => ({ default: m.LiveGrid })));
@@ -48,7 +49,9 @@ function Layout({ children }: { children: any }) {
   const nav = useNavigate();
   const role = getRole();
   const user = getUser();
-  const can = (...roles: string[]) => roles.includes(role);
+  // Матрица прав §18 — из access.ts, а не списками ролей по месту: три
+  // независимые копии (роут, пункт меню, require_role) и разошлись на Стене.
+  const can = (section: Section) => canAccess(section, role);
   const logout = () => { api.logout().then(() => nav("/login")); };
   const inactivityLogout = useCallback(() => {
     api.logout().finally(() => nav("/login?reason=inactive"));
@@ -68,23 +71,29 @@ function Layout({ children }: { children: any }) {
             <NavGroup title="Наблюдение">
               <NavLink to="/dashboard">Дашборд</NavLink>
               <NavLink to="/live">Камеры онлайн</NavLink>
-              <NavLink to="/wall">Стена распознавания</NavLink>
+              {/* Стена — раздел модуля распознавания §15, а не наблюдения:
+                  она показывает имя, хранимый кадр и watchlist-разметку,
+                  то есть карточку персоны. §18 закрывает наблюдателю
+                  строку «Карточки персон», поэтому здесь та же роль, что
+                  у пунктов группы «Распознавание» ниже. Живой просмотр с
+                  рамками §4 наблюдателю остаётся — это «Камеры онлайн». */}
+              {can("wall") && <NavLink to="/wall">Стена распознавания</NavLink>}
             </NavGroup>
             <NavGroup title="Распознавание">
-              {can("admin", "operator") && <NavLink to="/persons">Карточки персон</NavLink>}
-              {can("admin", "operator") && <NavLink to="/search">Поиск по фото</NavLink>}
-              {can("admin", "operator") && <NavLink to="/roi">Зоны детекции</NavLink>}
+              {can("persons") && <NavLink to="/persons">Карточки персон</NavLink>}
+              {can("search") && <NavLink to="/search">Поиск по фото</NavLink>}
+              {can("roi") && <NavLink to="/roi">Зоны детекции</NavLink>}
             </NavGroup>
             <NavGroup title="Архив и отчёты">
-              {can("admin", "operator") && <NavLink to="/archive">Видеоархив</NavLink>}
-              {can("admin", "operator") && <NavLink to="/reports">Отчёты</NavLink>}
+              {can("archive") && <NavLink to="/archive">Видеоархив</NavLink>}
+              {can("reports") && <NavLink to="/reports">Отчёты</NavLink>}
             </NavGroup>
             <NavGroup title="Администрирование">
-              {can("admin") && <NavLink to="/cameras">Камеры</NavLink>}
-              {can("admin", "operator") && <NavLink to="/monitoring">Мониторинг</NavLink>}
-              {can("admin") && <NavLink to="/settings">Настройки</NavLink>}
-              {can("admin") && <NavLink to="/users">Пользователи</NavLink>}
-              {can("admin") && <NavLink to="/audit">Журнал действий</NavLink>}
+              {can("cameras") && <NavLink to="/cameras">Камеры</NavLink>}
+              {can("monitoring") && <NavLink to="/monitoring">Мониторинг</NavLink>}
+              {can("settings") && <NavLink to="/settings">Настройки</NavLink>}
+              {can("users") && <NavLink to="/users">Пользователи</NavLink>}
+              {can("audit") && <NavLink to="/audit">Журнал действий</NavLink>}
             </NavGroup>
           </nav>
         </div>
@@ -101,7 +110,7 @@ function Layout({ children }: { children: any }) {
   );
 }
 
-function Private({ children, roles }: { children: any; roles?: string[] }) {
+function Private({ children, section }: { children: any; section?: Section }) {
   const location = useLocation();
   if (!getToken()) return <Navigate to="/login" replace />;
   // ТЗ 13: срок действия пароля истёк — пускаем только на страницу его смены,
@@ -109,7 +118,10 @@ function Private({ children, roles }: { children: any; roles?: string[] }) {
   if (isPasswordExpired() && location.pathname !== "/profile") {
     return <Navigate to="/profile" replace />;
   }
-  if (roles && !roles.includes(getRole())) return <Navigate to="/dashboard" replace />;
+  // Роли раздела берутся из той же таблицы §18, что и пункты меню
+  // (access.ts). Раньше они дублировались списком по месту, и роут /wall
+  // разошёлся с матрицей: он был открыт любой роли.
+  if (section && !canAccess(section, getRole())) return <Navigate to="/dashboard" replace />;
   return <Layout>{children}</Layout>;
 }
 
@@ -120,17 +132,17 @@ export function App() {
       <Route path="/login" element={<Login />} />
       <Route path="/dashboard" element={<Private><Dashboard /></Private>} />
       <Route path="/live" element={<Private><LiveGrid /></Private>} />
-      <Route path="/wall" element={<Private><Wall /></Private>} />
-      <Route path="/persons" element={<Private roles={["admin", "operator"]}><Persons /></Private>} />
-      <Route path="/archive" element={<Private roles={["admin", "operator"]}><Archive /></Private>} />
-      <Route path="/roi" element={<Private roles={["admin", "operator"]}><ROI /></Private>} />
-      <Route path="/reports" element={<Private roles={["admin", "operator"]}><Reports /></Private>} />
-      <Route path="/search" element={<Private roles={["admin", "operator"]}><Search /></Private>} />
-      <Route path="/cameras" element={<Private roles={["admin"]}><Cameras /></Private>} />
-      <Route path="/users" element={<Private roles={["admin"]}><Users /></Private>} />
-      <Route path="/monitoring" element={<Private roles={["admin", "operator"]}><Monitoring /></Private>} />
-      <Route path="/settings" element={<Private roles={["admin"]}><SettingsPage /></Private>} />
-      <Route path="/audit" element={<Private roles={["admin"]}><Audit /></Private>} />
+      <Route path="/wall" element={<Private section="wall"><Wall /></Private>} />
+      <Route path="/persons" element={<Private section="persons"><Persons /></Private>} />
+      <Route path="/archive" element={<Private section="archive"><Archive /></Private>} />
+      <Route path="/roi" element={<Private section="roi"><ROI /></Private>} />
+      <Route path="/reports" element={<Private section="reports"><Reports /></Private>} />
+      <Route path="/search" element={<Private section="search"><Search /></Private>} />
+      <Route path="/cameras" element={<Private section="cameras"><Cameras /></Private>} />
+      <Route path="/users" element={<Private section="users"><Users /></Private>} />
+      <Route path="/monitoring" element={<Private section="monitoring"><Monitoring /></Private>} />
+      <Route path="/settings" element={<Private section="settings"><SettingsPage /></Private>} />
+      <Route path="/audit" element={<Private section="audit"><Audit /></Private>} />
       <Route path="/profile" element={<Private><Profile /></Private>} />
       <Route path="*" element={<Navigate to={getToken() ? "/dashboard" : "/login"} replace />} />
     </Routes>
