@@ -126,6 +126,154 @@ jobs:
           pip install pytest fastapi httpx defusedxml sqlalchemy aiosmtpd
           pytest tests/ -q
 
+  worker-full:
+    runs-on: ubuntu-latest
+    # Наборы воркера, которым нужен настоящий `worker.py` — то есть
+    # cv2/insightface/onnxruntime, Postgres, Redis и MediaMTX.
+    #
+    # **Зачем отдельная джоба: до неё эти наборы не выполнялись в CI ни
+    # разу.** Лёгкая джоба выше ставит только stdlib-часть, поэтому 26
+    # модулей уходят в `pytest.importorskip("worker")` — и признак этого в
+    # выводе джобы неотличим от «тестов нет»: она честно печатает
+    # «572 passed, 44 skipped» и зеленеет. Полный набор — **742 теста**,
+    # то есть 170 из них не исполнялись нигде, кроме машины автора.
+    #
+    # Что именно оставалось непроверенным, стоит перечислить, потому что
+    # список неслучаен. Под `importorskip` лежат сторожа **ровно того
+    # свойства §2**, которое чинили четыре цикла подряд:
+    #
+    # * `test_model_failure_isolation.py` — «отказ аналитики не роняет
+    #   запись» (цикл 22);
+    # * `test_model_load_does_not_block_record_layer.py` — цикл 55;
+    # * `test_cleanup_does_not_block_record_layer.py` — цикл 57;
+    # * `test_quota_does_not_block_record_layer.py` — цикл 59;
+    # * `test_cleanup_status_wiring.py`, `test_quota_status_wiring.py` —
+    #   проводка состояний в §9;
+    #
+    # плюс `test_retention_rotation.py` (§5), `test_motion_recording.py` и
+    # `test_detection_schedule_gating.py` (§6), `test_record_layer_alerts.py`
+    # (§9), `test_camera_worker_resource_release.py` (утечки захватов),
+    # `test_person_dedup_lock.py` (advisory-lock цикла 16).
+    #
+    # Цена — около четырёх минут, из них ~1 минута на установку
+    # requirements воркера, которую джоба `perf` и так платит.
+    #
+    # Лёгкая джоба при этом НЕ отменяется и не поглощается: она держит
+    # отдельное свойство — что `liveness.py`, `cleanup_status.py`,
+    # `model_loader.py` и прочие модули решений остаются на голом stdlib и
+    # проверяются без тяжёлых зависимостей. Полный прогон это свойство не
+    # различает.
+    services:
+      postgres:
+        # Тот же образ, что у джоб backend и perf: одна версия сервера на
+        # весь CI. pgvector здесь нужен по-настоящему — наборы
+        # `test_process_faces_*` пишут эмбеддинги.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facewatch
+          POSTGRES_PASSWORD: facewatch
+          POSTGRES_DB: facewatch_worker_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U facewatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://facewatch:facewatch@localhost:5432/facewatch_worker_test
+      REDIS_URL: redis://localhost:6379/0
+      # Своя база, отдельная от `facewatch_test` бэкенда, и это не
+      # придирка: схемы воркера и бэкенда пересекаются по именам таблиц и
+      # расходятся по колонкам, а `create_all` существующие таблицы не
+      # достраивает. Общая база даёт лавину `UndefinedColumnError`, которая
+      # выглядит как регресс кода (урок цикла 58).
+      MEDIA_PATH: /tmp/facewatch-media
+      # Сторож живости убил бы процесс прогона на медленном раннере.
+      WORKER_WATCHDOG_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Download pinned MediaMTX
+        # Тот же способ и та же привязка к версии, что в record-layer-live:
+        # версия берётся из docker-compose.yml, а не пишется руками.
+        run: |
+          set -euo pipefail
+          VER=$(grep -oP 'image:\s*bluenviron/mediamtx:\K\S+' docker-compose.yml)
+          mkdir -p "$RUNNER_TEMP/mtx"
+          curl -fsSL -o "$RUNNER_TEMP/mtx.tar.gz" \
+            "https://github.com/bluenviron/mediamtx/releases/download/v${VER}/mediamtx_v${VER}_linux_amd64.tar.gz"
+          tar xzf "$RUNNER_TEMP/mtx.tar.gz" -C "$RUNNER_TEMP/mtx" mediamtx
+          echo "MEDIAMTX_BIN=$RUNNER_TEMP/mtx/mediamtx" >> "$GITHUB_ENV"
+      - name: Install full worker deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r worker/requirements.txt
+          pip install pytest httpx aiosmtpd
+      - name: Create pgvector extension and worker schema
+        working-directory: worker
+        # Наборы `test_process_faces_*` идут production path к настоящему
+        # Postgres, но схему не создают: единственный, кто зовёт
+        # `create_all`, — `test_segment_index.py`, и он работает по своему
+        # файлу SQLite. На свежей базе без этого шага они дают
+        # `relation "cameras" does not exist` — не находка в коде, а
+        # непоставленный стенд (урок цикла 59).
+        #
+        # `CREATE EXTENSION` обязателен отдельной строкой: образ
+        # `pgvector/pgvector:pg16` кладёт расширение в систему, но НЕ
+        # включает его в базе. Джоба `backend` обходится без такого шага
+        # только потому, что за неё это делает `lifespan` приложения при
+        # старте; у воркера точки входа, которая бы это сделала, нет —
+        # в бою расширение включает бэкенд. Без строки `create_all` падает
+        # на `type "vector" does not exist` (колонка `persons.centroid`).
+        run: |
+          python - <<'PY'
+          from sqlalchemy import text
+
+          import worker
+
+          with worker.engine.begin() as conn:
+              conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+          worker.Base.metadata.create_all(worker.engine)
+          print("схема воркера создана")
+          PY
+      - name: Run full worker tests
+        working-directory: worker
+        # `-rs` обязателен: без него пропуски видны только числом в итоге, а
+        # весь смысл джобы в том, чтобы их было видно поимённо.
+        #
+        # Проверка ниже — сторож против возврата того самого класса, ради
+        # которого джоба заведена. Она валит прогон, если хоть один модуль
+        # ушёл в skip по причине «нужен полный requirements.txt»: в этой
+        # джобе он поставлен целиком, поэтому такой пропуск означает не
+        # «нечем проверить», а «джоба перестала делать свою работу».
+        #
+        # Единственный законный пропуск здесь — `test_limit_actually_bounds_cpu`
+        # (`ORT_THREAD_LIMIT_TEST=1`): он поднимает настоящую модель и меряет
+        # занятые ядра минутами. Он не подпадает под проверку, потому что
+        # причина у него другая.
+        run: |
+          set -o pipefail
+          pytest tests/ -q -rs | tee /tmp/worker-full.txt
+          if grep -qiE 'SKIPPED.*(полный|требует) requirements' /tmp/worker-full.txt; then
+            echo "::error::Модули ушли в skip по отсутствию requirements воркера — в этой джобе они поставлены целиком."
+            grep -iE 'SKIPPED.*requirements' /tmp/worker-full.txt
+            exit 1
+          fi
+
   record-layer-live:
     runs-on: ubuntu-latest
     # Слой записи против НАСТОЯЩЕГО MediaMTX, а не против двойника Control

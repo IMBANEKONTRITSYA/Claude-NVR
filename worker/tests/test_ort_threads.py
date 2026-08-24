@@ -128,7 +128,38 @@ def test_limit_actually_bounds_cpu():
     assert busy < 1.6, f"при одном потоке занято {busy:.2f} ядра"
 
 
-def test_patch_is_idempotent_and_reversible():
+@pytest.fixture
+def unpatched_session():
+    """Чистое состояние подмены сессии — до теста и после него.
+
+    **Без этого тест ниже зависел от того, кто прогонялся раньше.**
+    `limit_threads()` меняет глобальный класс в `insightface.model_zoo`, и
+    в бою подмена намеренно остаётся стоять: её ставит `load_face_app()`
+    перед созданием сессий и снимать не должен. Значит любой тест, который
+    поднимает настоящую модель, оставляет её после себя — это не утечка, а
+    поведение продакшна.
+
+    Тест ниже брал `original = mz.PickableInferenceSession` как есть и,
+    получив уже подменённый класс, проверял идемпотентность относительно
+    чужой подмены — то есть не то, что написано в его имени.
+
+    **Проявлялось это как «зелено у меня, красно у соседа».** В полном
+    прогоне набор проходил только при `ORT_THREAD_LIMIT_TEST=1`: тяжёлый
+    `test_limit_actually_bounds_cpu` идёт по файлу выше и в своём `finally`
+    зовёт `restore()` — то есть **случайно работал уборщиком за этот
+    тест**. Стоило снять переменную (а в CI её не было никогда), и
+    зависимость от порядка становилась падением.
+
+    Найдено джобой `worker-full` этого цикла — первым прогоном этих
+    наборов в CI за всё время их существования.
+    """
+    import ort_threads
+    ort_threads.restore()
+    yield
+    ort_threads.restore()
+
+
+def test_patch_is_idempotent_and_reversible(unpatched_session):
     """Повторный вызов не наслаивает подмену, restore() её снимает."""
     mz = pytest.importorskip("insightface.model_zoo.model_zoo")
     import ort_threads

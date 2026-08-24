@@ -70,6 +70,14 @@ def test_camera_worker_does_not_start_onvif_thread_when_capture_never_opens(monk
     monkeypatch.setattr(worker, "update_status", lambda *a, **kw: None)
     monkeypatch.setattr(worker, "onvif_poll_worker", lambda *a, **kw: started.append(a))
 
+    # resolve_snapshot_url() замокан: без этого camera_worker() на каждом из
+    # пяти проходов делает РЕАЛЬНЫЙ ONVIF-вызов get_profiles() к host из
+    # ONVIF_CONFIG (192.168.1.64) с таймаутом 5 с. На машине автора адрес
+    # недоступен мгновенно, на CI-раннере connect к нему висит до таймаута —
+    # пять раз, до 25 с на пустом месте. Тест проверяет запуск нити, а не
+    # разрешение снимка, поэтому сеть здесь лишняя.
+    monkeypatch.setattr(worker, "resolve_snapshot_url", lambda *a, **kw: None)
+
     # Имитируем manager(), пересоздающий camera_worker() на каждом тике,
     # пока RTSP не откроется (в этом тесте — никогда).
     for _ in range(5):
@@ -89,6 +97,28 @@ def test_camera_worker_starts_onvif_thread_after_capture_opens(monkeypatch):
     monkeypatch.setattr(worker, "update_status", lambda *a, **kw: None)
     monkeypatch.setattr(worker, "load_cam_state", lambda cam_id: (None, True, None, None))
 
+    # ГЛАВНОЕ здесь. camera_worker() ДО запуска ONVIF-нити зовёт
+    # resolve_snapshot_url(onvif_config), а та делает синхронный ONVIF-вызов
+    # get_profiles() к host из ONVIF_CONFIG (192.168.1.64) с таймаутом 5 с.
+    # На машине автора и в этом sandbox адрес отбивается мгновенно, поэтому
+    # нить ONVIF стартует за миллисекунды и started.wait() успевает. На
+    # CI-раннере connect к недостижимому 192.168.1.64 висит до самого
+    # таймаута — и старт нити (а с ним started.set()) сдвигается на ~5 с,
+    # ровно к границе прежнего wait(5). Это и есть механизм падения «зелено
+    # локально, красно в CI», которое поймала джоба worker-full: в логе
+    # оставался характерный след — «старт камеры», сразу «остановка
+    # (shutdown)» и невзведённый started. Мок убирает сеть целиком: тест
+    # проверяет запуск нити, а не разрешение снимка.
+    monkeypatch.setattr(worker, "resolve_snapshot_url", lambda *a, **kw: None)
+
+    # Свой, гарантированно снятый shutdown_event на время теста, а не общий
+    # модульный: тест запускает camera_worker() в нити и должен её же
+    # остановить, ни на что не влияя. Общий объект мутируют и соседние наборы
+    # воркера (manager()-тесты, mode_gating, resource_release) — изолированный
+    # Event исключает и чтение чужого состояния, и задевание чужих нитей своим
+    # set() в finally. Тот же приём, что в *_does_not_block_record_layer.
+    monkeypatch.setattr(worker, "shutdown_event", threading.Event())
+
     def fake_onvif_poll_worker(*args, **kwargs):
         started.set()
         while not worker.shutdown_event.is_set():
@@ -106,11 +136,14 @@ def test_camera_worker_starts_onvif_thread_after_capture_opens(monkeypatch):
     )
     t.start()
     try:
-        assert started.wait(timeout=5), "onvif_poll_worker должен стартовать после успешного открытия потока"
+        # Запас по времени против планировщика нагруженного CI-раннера: тест
+        # проверяет сам факт старта нити, а не её скорость, поэтому дешевле
+        # подождать дольше, чем ловить редкое ложное падение.
+        assert started.wait(timeout=15), "onvif_poll_worker должен стартовать после успешного открытия потока"
     finally:
         worker.shutdown_event.set()
-        t.join(timeout=5)
-        worker.shutdown_event.clear()  # не мешать остальным тестам модуля/файла
+        t.join(timeout=10)
+        assert not t.is_alive(), "camera_worker() не остановился по shutdown — нить утекла бы в соседние тесты"
 
 
 def test_camera_worker_skips_onvif_thread_without_onvif_config(monkeypatch):
