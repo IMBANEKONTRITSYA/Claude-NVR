@@ -34,7 +34,28 @@
 **Экспорт метрик для Prometheus/Grafana:** `GET /api/system/prometheus`
 (доступен только администратору, требует Bearer-токен). Формат —
 стандартный текстовый формат экспозиции Prometheus, готов к
-подключению `scrape_config` без дополнительного экспортёра.
+подключению `scrape_config` без дополнительного экспортёра:
+
+```yaml
+scrape_configs:
+  - job_name: facewatch
+    metrics_path: /api/system/prometheus
+    scheme: https          # самоподписанный сертификат — см. tls_config ниже
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/facewatch.token
+    tls_config:
+      insecure_skip_verify: true
+    static_configs:
+      - targets: ["facewatch.local:8443"]
+```
+
+Токен в `credentials_file` — access-токен администратора; он живёт
+`ACCESS_TOKEN_EXPIRE_MINUTES` (по умолчанию 30 минут), поэтому для
+постоянного сбора метрик заведите отдельную учётную запись
+администратора и обновляйте файл по расписанию, либо увеличьте TTL
+осознанно. Эндпоинт принимает и `?token=<access_token>` в query —
+для сборщиков, у которых нет настройки заголовка.
 
 Рекомендуемые пороги для алертинга во внешней системе мониторинга
 (Prometheus Alertmanager, Grafana Alerting) в соответствии с ТЗ 12:

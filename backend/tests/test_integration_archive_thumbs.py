@@ -188,17 +188,20 @@ def test_unknown_segment_gives_404(client, admin_token):
 def test_thumb_requires_token(client, seeded_segments):
     """Без токена и с чужим токеном кадр не отдаётся.
 
-    Два разных кода — не небрежность, а два разных слоя: отсутствие
-    обязательного query-параметра отбраковывает валидатор FastAPI (422,
-    до обработчика), негодный токен — `get_user_from_query_token` (401).
-    Проверяются оба, потому что важна не цифра, а то, что тела ответа с
-    кадром нет ни в одном случае.
+    Оба случая — 401 от `get_user_from_query_token`. Раньше первый давал
+    422: query-параметр `token` был обязательным, и отсутствие учётных
+    данных отбраковывал валидатор FastAPI до обработчика. С цикла 62
+    эндпоинт принимает ещё и `Authorization: Bearer` (§12), поэтому
+    обязательность с query снята, а нехватка учётных данных отвечает
+    кодом состояния авторизации, а не синтаксиса. Важна не цифра, а то,
+    что тела ответа с кадром нет ни в одном случае.
     """
     _, ids = seeded_segments
     url = f"/api/archive/thumb/{ids['ok']}"
 
-    assert client.get(url).status_code == 422
+    assert client.get(url).status_code == 401
     assert client.get(url, params={"token": "not-a-jwt"}).status_code == 401
+    assert client.get(url, headers={"Authorization": "Bearer not-a-jwt"}).status_code == 401
 
 
 def test_viewer_cannot_get_thumb(client, make_user, seeded_segments, request):

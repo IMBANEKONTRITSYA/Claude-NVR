@@ -48,8 +48,15 @@ def _insert_camera_person_event(pg_conn, _seeded=None):
 
 
 def test_reports_missing_token_rejected(client):
+    """Ни заголовка, ни `?token=` — 401.
+
+    До цикла 62 здесь был 422: query-параметр `token` был обязательным по
+    схеме, и запрос отбраковывал валидатор FastAPI. Теперь отчёт §8
+    принимает и штатный `Authorization: Bearer` (§12), поэтому нехватка
+    учётных данных отвечает кодом авторизации.
+    """
     r = client.get("/api/reports/appearances.csv")
-    assert r.status_code == 422
+    assert r.status_code == 401
 
 
 def test_reports_invalid_token_rejected(client):
