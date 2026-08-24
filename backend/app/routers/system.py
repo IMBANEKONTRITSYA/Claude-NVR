@@ -230,7 +230,7 @@ async def record_layer_status(_=Depends(require_role("admin", "operator")),
             "gb_last_day": round(bytes_day / BYTES_PER_GB, 2),
             "streams": [], "summary": None, "segment_gaps": [],
             "analytics": None, "control_api_error": None,
-            "record_root_warning": None, "cleanup": None,
+            "record_root_warning": None, "cleanup": None, "quota": None,
         }
 
     # Состояние восстановления (SPEC §19) приезжает от воркера отдельной
@@ -271,6 +271,12 @@ async def record_layer_status(_=Depends(require_role("admin", "operator")),
         # как исправная работа — диск просто заполняется, — поэтому
         # состояние прохода показывается рядом со слоем записи.
         "cleanup": payload.get("cleanup"),
+        # Циклическая перезапись (§5) с этого цикла тоже идёт в своей нити
+        # воркера и сторожем живости не проверяется. Показывается отдельным
+        # полем, а не внутри `cleanup`: у двух проходов разное правило показа
+        # — пропуски перезаписи штатны (она запрашивается каждые ~10 с), а
+        # пропуски уборки означают, что архив чистится медленнее, чем растёт.
+        "quota": payload.get("quota"),
     }
 
 

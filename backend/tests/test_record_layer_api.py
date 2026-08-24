@@ -196,3 +196,64 @@ def test_stream_without_recovery_state_has_no_such_field(client, admin_headers, 
     d = client.get("/api/system/record-layer", headers=admin_headers).json()
 
     assert "recovery" not in d["streams"][0]
+
+
+def test_quota_state_reaches_monitoring(client, admin_headers, publish_state):
+    """Состояние циклической перезаписи доезжает от воркера до §9.
+
+    С этого цикла проход идёт в своей нити воркера и сторожем живости не
+    проверяется (SPEC §2): его 900-секундный бюджет означал четверть часа
+    без синхронизации путей, без индексации сегментов и без публикации
+    статусов, причём на КАЖДОМ проходе менеджера, а не раз в час, как у
+    уборки. Плата за вынос — проход стал невидимым снаружи, и это поле —
+    то, чем он снова виден.
+
+    Проверка откатом: снимите `"quota": payload.get("quota")` в
+    `routers/system.py` — тест упадёт.
+    """
+    payload = _payload([])
+    payload["quota"] = {"state": "failed", "seconds": 3.0,
+                        "last_pass_sec": 41.2, "error": "enforce_disk_quota",
+                        "skipped": 7}
+    publish_state(payload)
+
+    d = client.get("/api/system/record-layer", headers=admin_headers).json()
+
+    assert d["quota"]["state"] == "failed"
+    assert d["quota"]["error"] == "enforce_disk_quota"
+    assert d["quota"]["skipped"] == 7
+
+
+def test_quota_field_is_present_and_null_when_the_worker_is_silent(
+        client, admin_headers, redis_key):
+    """Молчащий воркер даёт `null`, а не отсутствие ключа.
+
+    Тот же довод, что у `cleanup`: иначе фронтенд отличал бы «перезапись
+    здорова» от «данных нет» по отсутствию поля, то есть по совпадению.
+    """
+    redis_key.delete()
+
+    d = client.get("/api/system/record-layer", headers=admin_headers).json()
+
+    assert "quota" in d and d["quota"] is None
+
+
+def test_quota_and_cleanup_are_separate_fields(client, admin_headers, publish_state):
+    """Два прохода — два поля: у них разные правила показа.
+
+    Пропуск у уборки означает «архив чистится медленнее, чем растёт» —
+    тревога; пропуск у перезаписи штатен, она запрашивается каждые ~10 с.
+    Свести их в одно поле значило бы либо сыпать тревогой на каждом
+    переполненном томе, либо потерять единственный ранний признак у уборки.
+    """
+    payload = _payload([])
+    payload["cleanup"] = {"state": "done", "seconds": 12.0,
+                          "last_pass_sec": 31.4, "error": None, "skipped": 0}
+    payload["quota"] = {"state": "running", "seconds": 14.0,
+                        "last_pass_sec": 13.9, "error": None, "skipped": 42}
+    publish_state(payload)
+
+    d = client.get("/api/system/record-layer", headers=admin_headers).json()
+
+    assert d["cleanup"]["skipped"] == 0
+    assert d["quota"]["skipped"] == 42

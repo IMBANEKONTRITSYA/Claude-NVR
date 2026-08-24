@@ -6,6 +6,7 @@ import {
 import { AnalyticsSource, streamCell } from "../analyticsStream";
 import { modelBanner } from "../modelLoad";
 import { cleanupBanner } from "../archiveCleanup";
+import { quotaBanner } from "../diskQuota";
 
 function Bar({ percent, warn, crit }: { percent: number; warn?: number; crit?: number }) {
   // Умолчания через ?? , а не в сигнатуре: вызывающие передают warn/crit
@@ -143,6 +144,32 @@ function RecordLayerPanel() {
           Выбор вынесен в archiveCleanup.ts и проверяется юнит-тестами. */}
       {(() => {
         const b = cleanupBanner(d.cleanup);
+        if (!b) return null;
+        return (
+          <div style={{
+            padding: "8px 12px", borderRadius: 4, marginBottom: 12,
+            background: b.tone === "warn" ? "var(--orange)" : "var(--panel)",
+            color: b.tone === "warn" ? "#000" : "inherit",
+            border: b.tone === "warn" ? "none" : "1px solid var(--border)",
+            fontWeight: 600,
+          }}>
+            {b.title}
+            {b.detail && (
+              <div style={{ fontWeight: 400, fontSize: 12, marginTop: 4 }}>
+                {b.detail}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* Циклическая перезапись (§5) — тот же случай, что уборка выше: с
+          этого цикла она идёт в своей нити воркера и сторожем живости не
+          проверяется (SPEC §2). Правило показа у неё своё, и оно строже:
+          пропуски штатны (проход запрашивается каждые ~10 с), показывается
+          отказ и затянувшийся проход. Выбор вынесен в diskQuota.ts. */}
+      {(() => {
+        const b = quotaBanner(d.quota);
         if (!b) return null;
         return (
           <div style={{
