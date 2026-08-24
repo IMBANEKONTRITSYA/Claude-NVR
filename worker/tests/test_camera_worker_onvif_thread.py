@@ -97,18 +97,13 @@ def test_camera_worker_starts_onvif_thread_after_capture_opens(monkeypatch):
     monkeypatch.setattr(worker, "update_status", lambda *a, **kw: None)
     monkeypatch.setattr(worker, "load_cam_state", lambda cam_id: (None, True, None, None))
 
-    # ГЛАВНОЕ здесь. camera_worker() ДО запуска ONVIF-нити зовёт
-    # resolve_snapshot_url(onvif_config), а та делает синхронный ONVIF-вызов
-    # get_profiles() к host из ONVIF_CONFIG (192.168.1.64) с таймаутом 5 с.
-    # На машине автора и в этом sandbox адрес отбивается мгновенно, поэтому
-    # нить ONVIF стартует за миллисекунды и started.wait() успевает. На
-    # CI-раннере connect к недостижимому 192.168.1.64 висит до самого
-    # таймаута — и старт нити (а с ним started.set()) сдвигается на ~5 с,
-    # ровно к границе прежнего wait(5). Это и есть механизм падения «зелено
-    # локально, красно в CI», которое поймала джоба worker-full: в логе
-    # оставался характерный след — «старт камеры», сразу «остановка
-    # (shutdown)» и невзведённый started. Мок убирает сеть целиком: тест
-    # проверяет запуск нити, а не разрешение снимка.
+    # resolve_snapshot_url() теперь резолвится в отдельной фоновой нити после
+    # открытия захвата, а не первым синхронным действием camera_worker() (см.
+    # snapshot_url_holder в worker.py). Мок оставлен, чтобы фоновая нить не
+    # ходила в реальную сеть к недостижимому 192.168.1.64: тест проверяет
+    # запуск ONVIF-нити, а не разрешение снимка. Что медленный resolve больше
+    # НЕ сдвигает старт нити — отдельный тест ниже
+    # (test_slow_snapshot_resolve_does_not_block_worker_startup).
     monkeypatch.setattr(worker, "resolve_snapshot_url", lambda *a, **kw: None)
 
     # Свой, гарантированно снятый shutdown_event на время теста, а не общий
@@ -140,6 +135,68 @@ def test_camera_worker_starts_onvif_thread_after_capture_opens(monkeypatch):
         # проверяет сам факт старта нити, а не её скорость, поэтому дешевле
         # подождать дольше, чем ловить редкое ложное падение.
         assert started.wait(timeout=15), "onvif_poll_worker должен стартовать после успешного открытия потока"
+    finally:
+        worker.shutdown_event.set()
+        t.join(timeout=10)
+        assert not t.is_alive(), "camera_worker() не остановился по shutdown — нить утекла бы в соседние тесты"
+
+
+def test_slow_snapshot_resolve_does_not_block_worker_startup(monkeypatch):
+    """Медленный resolve_snapshot_url() не должен задерживать старт нити камеры.
+
+    resolve_snapshot_url() делает синхронный ONVIF-вызов get_profiles() с
+    таймаутом до 5 с. Раньше он звался ПЕРВЫМ действием camera_worker(), до
+    открытия захвата, поэтому на медленной/недоступной камере старт всей нити
+    (и старт onvif_poll_worker вместе с ним) сдвигался на всю длину таймаута —
+    класс «зелено локально (камера рядом), красно/медленно на объекте», см.
+    цикл 60, carryover 14/31. Теперь resolve уехал в фоновую нить после
+    открытия захвата; горячий путь старта его не ждёт.
+
+    Проверяется откатом: resolve_snapshot_url висит 6 с (дольше прежней
+    границы wait(5)); onvif_poll_worker обязан стартовать задолго до этого.
+    Если вернуть вызов на синхронный путь, started.wait(2.0) провалится."""
+    started = threading.Event()
+    monkeypatch.setattr(worker, "open_capture", lambda url: _OpensThenStallsCapture())
+    monkeypatch.setattr(worker, "update_status", lambda *a, **kw: None)
+    monkeypatch.setattr(worker, "load_cam_state", lambda cam_id: (None, True, None, None))
+    monkeypatch.setattr(worker, "shutdown_event", threading.Event())
+
+    resolve_started = threading.Event()
+
+    def slow_resolve(*a, **kw):
+        resolve_started.set()
+        # Дольше прежней границы wait(5): если resolve снова окажется на
+        # синхронном пути, старт нити не уложится в started.wait(2.0) ниже.
+        for _ in range(60):
+            if worker.shutdown_event.is_set():
+                break
+            worker.shutdown_event.wait(0.1)
+        return None
+
+    monkeypatch.setattr(worker, "resolve_snapshot_url", slow_resolve)
+
+    def fake_onvif_poll_worker(*args, **kwargs):
+        started.set()
+        while not worker.shutdown_event.is_set():
+            worker.shutdown_event.wait(0.05)
+
+    monkeypatch.setattr(worker, "onvif_poll_worker", fake_onvif_poll_worker)
+
+    t = threading.Thread(
+        target=worker.camera_worker,
+        args=(1, "rtsp://cam/main", None),
+        kwargs={"sub_rtsp_url": "rtsp://cam/sub", "onvif_config": ONVIF_CONFIG},
+        daemon=True,
+    )
+    t.start()
+    try:
+        assert started.wait(timeout=2.0), (
+            "onvif_poll_worker должен стартовать сразу после открытия захвата, "
+            "не дожидаясь медленного resolve_snapshot_url — иначе сетевой вызов "
+            "снова на горячем пути старта нити"
+        )
+        # И сам resolve действительно был запущен (в фоне), а не пропущен.
+        assert resolve_started.wait(timeout=2.0), "фоновый resolve_snapshot_url должен быть запущен"
     finally:
         worker.shutdown_event.set()
         t.join(timeout=10)
