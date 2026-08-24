@@ -223,7 +223,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r worker/requirements.txt
           pip install pytest httpx aiosmtpd
-      - name: Create worker schema
+      - name: Create pgvector extension and worker schema
         working-directory: worker
         # Наборы `test_process_faces_*` идут production path к настоящему
         # Postgres, но схему не создают: единственный, кто зовёт
@@ -231,7 +231,25 @@ jobs:
         # файлу SQLite. На свежей базе без этого шага они дают
         # `relation "cameras" does not exist` — не находка в коде, а
         # непоставленный стенд (урок цикла 59).
-        run: python -c "import worker; worker.Base.metadata.create_all(worker.engine)"
+        #
+        # `CREATE EXTENSION` обязателен отдельной строкой: образ
+        # `pgvector/pgvector:pg16` кладёт расширение в систему, но НЕ
+        # включает его в базе. Джоба `backend` обходится без такого шага
+        # только потому, что за неё это делает `lifespan` приложения при
+        # старте; у воркера точки входа, которая бы это сделала, нет —
+        # в бою расширение включает бэкенд. Без строки `create_all` падает
+        # на `type "vector" does not exist` (колонка `persons.centroid`).
+        run: |
+          python - <<'PY'
+          from sqlalchemy import text
+
+          import worker
+
+          with worker.engine.begin() as conn:
+              conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+          worker.Base.metadata.create_all(worker.engine)
+          print("схема воркера создана")
+          PY
       - name: Run full worker tests
         working-directory: worker
         # `-rs` обязателен: без него пропуски видны только числом в итоге, а
