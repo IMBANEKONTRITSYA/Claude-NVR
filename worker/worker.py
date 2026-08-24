@@ -1169,9 +1169,23 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
             "camera_id": cam_id, "cpus": sorted(cpus), "pinned": pinned})
     # Снимки лиц режутся из полноразмерного кадра, который камера отдаёт по
     # HTTP (ONVIF GetSnapshotUri), а не из кадра аналитики: на субпотоке
-    # 640×360 лицо занимает несколько десятков пикселей. Адрес резолвится
-    # один раз при старте; None означает откат на кроп из кадра аналитики.
-    snapshot_url = resolve_snapshot_url(onvif_config)
+    # 640×360 лицо занимает несколько десятков пикселей. None означает откат
+    # на кроп из кадра аналитики — полностью рабочий режим (см. process_faces).
+    #
+    # Адрес резолвится НЕ здесь, а в фоновой нити после успешного открытия
+    # захвата (см. ниже блок snapshot_url_holder). Раньше resolve_snapshot_url()
+    # звался синхронно первым же действием нити и делал ONVIF-вызов
+    # get_profiles() с таймаутом до 5 с к host камеры. На объекте камера
+    # отвечает за ~10-50 мс, но на медленной/недоступной камере этот вызов
+    # держал старт camera_worker() до самого таймаута — а manager() к тому же
+    # пересоздаёт нить каждые ~10 с для камеры с валидным ONVIF-host, но
+    # неоткрывающимся RTSP, так что цена платилась на каждом перезапуске и ещё
+    # до проверки, открылся ли поток вообще. Сетевой вызов на горячем пути
+    # старта — ровно тот класс, что джоба worker-full ловила косвенно (цикл
+    # 60, carryover 31): здесь он убран из пути целиком. Держатель на один
+    # элемент — фоновая нить пишет в него один раз, цикл кадров читает; замена
+    # ссылки атомарна под GIL, блокировка не нужна.
+    snapshot_url_holder = [None]
     # Поток аналитики выбирается по фактически измеренному разрешению, а не
     # по наличию субпотока: §2 и §15 называют допустимым источником кадров
     # основной поток либо субпоток «с разрешением не ниже 640×480», и
@@ -1187,7 +1201,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
         "analytics_source_reason": source["reason"],
         "analytics_width": source["width"],
         "analytics_height": source["height"],
-        "hires_snapshots": bool(snapshot_url),
+        "hires_snapshots": "resolving" if (onvif_config and onvif_config.get("host")) else False,
     })
     if not cap.isOpened():
         logger.error("не удалось открыть RTSP", extra={"camera_id": cam_id})
@@ -1202,6 +1216,27 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
     # Публикуется только для работающей нити: решение, принятое без
     # единого прочитанного кадра, описывает не аналитику, а намерение.
     publish_analytics_source(cam_id, source)
+
+    # Разрешение snapshot-URL — в фоновой нити, а не на горячем пути (см.
+    # длинный комментарий у snapshot_url_holder выше). Нить одноразовая: зовёт
+    # resolve_snapshot_url() ровно один раз, кладёт результат в держатель и
+    # завершается (её жизнь ограничена таймаутом ONVIF-вызова, ≤5 с), поэтому
+    # в отличие от onvif_poll_worker она не копится при перезапусках нити
+    # камеры. Стартует только при наличии ONVIF-host и только после успешного
+    # открытия захвата — камера с неоткрывающимся RTSP до сюда не доходит и
+    # сетевой цены за снимок не платит вовсе. Цикл кадров до готовности
+    # держателя работает с None (кроп из кадра аналитики) — штатная деградация.
+    if onvif_config and onvif_config.get("host"):
+        def _resolve_snapshot_bg():
+            url = resolve_snapshot_url(onvif_config)
+            snapshot_url_holder[0] = url
+            logger.info("snapshot URL разрешён", extra={
+                "camera_id": cam_id, "hires_snapshots": bool(url)})
+        threading.Thread(
+            target=_resolve_snapshot_bg,
+            name=f"snapshot-resolve-{cam_id}",
+            daemon=True,
+        ).start()
 
     # Запускается только после успешного открытия потока аналитики, а не
     # безусловно при входе в функцию: onvif_poll_worker — daemon-нить без
@@ -1447,7 +1482,7 @@ def camera_worker(cam_id: int, rtsp_url: str, face_app, sub_rtsp_url: str | None
 
             fh, fw = frame.shape[:2]
             try:
-                process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url)
+                process_faces(cam_id, frame, faces, fw, fh, now, last_event_at, snapshot_url_holder[0])
             except Exception:
                 # Любой сбой на одном кадре не должен убивать нить камеры
                 logger.error("ошибка обработки лиц", exc_info=True, extra={"camera_id": cam_id})
