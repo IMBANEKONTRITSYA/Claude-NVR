@@ -268,13 +268,39 @@ class AuditMiddleware(BaseHTTPMiddleware):
         if request.method == "POST" and request.url.path == "/api/auth/login":
             try:
                 body = await request.body()
-                from urllib.parse import parse_qs
-                form = parse_qs(body.decode("utf-8", errors="ignore"))
-                login_user = (form.get("username") or [""])[0]
+
                 # Возвращаем тело обратно, чтобы downstream его получил
-                async def receive():
-                    return {"type": "http.request", "body": body, "more_body": False}
-                request = Request(request.scope, receive)
+                def _receive_body():
+                    async def receive():
+                        return {"type": "http.request", "body": body, "more_body": False}
+                    return receive
+
+                # Разбор — штатным парсером Starlette, а не parse_qs по
+                # телу. parse_qs понимает ровно один формат,
+                # application/x-www-form-urlencoded, а браузер шлёт форму
+                # входа как FormData, то есть multipart/form-data
+                # (frontend/src/api.ts: login). На multipart parse_qs
+                # возвращал пустой словарь, и **каждый вход через веб-
+                # интерфейс** — то есть каждый настоящий вход на объекте —
+                # ложился в журнал с именем "?". По ТЗ §10/§14 журнал
+                # аудита обязан отвечать на вопрос «кто вошёл»; заглушка
+                # вместо имени снимала с него и разбор неудачных попыток:
+                # при переборе пароля не видно даже, какую учётку
+                # перебирают.
+                #
+                # 62 цикла тестов этого не видели, потому что все до
+                # единого зовут /login через `data=` — тот транспорт,
+                # который работал (см. test_audit_login_transport.py).
+                buffered = Request(request.scope, _receive_body())
+                try:
+                    form = await buffered.form()
+                    login_user = str(form.get("username") or "")
+                finally:
+                    # multipart Starlette складывает во временные файлы —
+                    # без close() они остались бы висеть на каждом входе.
+                    await buffered.close()
+
+                request = Request(request.scope, _receive_body())
             except Exception:
                 logger.warning("не удалось прочитать имя пользователя из тела /login", exc_info=True)
 
