@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
-from fastapi import Depends, HTTPException, Query, status
+from fastapi import Depends, Header, HTTPException, Query, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
 from passlib.context import CryptContext
@@ -164,11 +164,35 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
     return await user_from_token(token, db)
 
 
+def _bearer_from_header(authorization: str | None) -> str | None:
+    """Достаёт токен из `Authorization: Bearer <jwt>`.
+
+    Схема сверяется без учёта регистра (RFC 7235 §2.1: имя схемы
+    case-insensitive; `bearer`, `Bearer` и `BEARER` — одно и то же).
+    Чужая схема (`Basic`, `Digest`) и заголовок без второй части — не
+    ошибка на этом уровне, а «токена в заголовке нет»: вызывающий после
+    этого смотрит в query, и только если пусто и там, отвечает 401.
+    """
+    if not authorization:
+        return None
+    scheme, _, credentials = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    credentials = credentials.strip()
+    return credentials or None
+
+
 async def get_user_from_query_token(
-    token: str = Query(..., description="JWT access-токен"),
+    token: str | None = Query(
+        None,
+        description="JWT access-токен. Альтернатива заголовку "
+                    "`Authorization: Bearer` — для запросов, которые "
+                    "нельзя снабдить заголовком (прямые ссылки браузера).",
+    ),
+    authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """То же, что get_current_user, но токен берётся из query string.
+    """То же, что get_current_user, но токен принимается ещё и из query string.
 
     Часть эндпоинтов открывается браузером как обычная ссылка (медиа-файлы,
     выгрузки отчётов и аудита, скачивание сегмента архива, Prometheus,
@@ -176,6 +200,27 @@ async def get_user_from_query_token(
     поэтому токен передаётся параметром `?token=`. Способ доставки токена —
     единственное, что отличает эти эндпоинты от остальных; проверки должны
     быть теми же.
+
+    Query-параметр был **обязательным** — и это ломало ровно тех клиентов,
+    ради которых §12 держит REST API: внешняя система, отправляющая
+    штатный `Authorization: Bearer`, получала не 200 и не 401, а **422**
+    от валидатора FastAPI, до всякой проверки подписи. Замерено живым
+    опросом через настоящий nginx (цикл 62): 16 эндпоинтов — все выгрузки
+    §8, экспорт и кадры архива §5, экспорт аудита §10, выгрузка камер и
+    снимок §3, скачивание копии §11 и `/api/system/prometheus` §9.
+    Последний прямо описан в `docs/ADMIN_GUIDE.md` как «требует
+    Bearer-токен» и «готов к подключению scrape_config без
+    дополнительного экспортёра» — а на деле отвечал 422 на каждый scrape
+    Prometheus, настроенный по его же документации.
+
+    Поэтому принимаются оба транспорта. Заголовок идёт первым: он не
+    попадает ни в access-log nginx, ни в историю браузера, ни в Referer,
+    так что клиент, который умеет его поставить, не обязан класть токен
+    в URL. Query остаётся для тех, кто заголовок поставить не может.
+
+    Отсутствие обоих — 401 «Не авторизован», а не 422: нехватка учётных
+    данных это состояние авторизации, а не синтаксическая ошибка запроса,
+    и клиент по 401 знает, что делать (обновить токен), а по 422 — нет.
 
     Раньше каждый такой обработчик звал `jwt.decode` сам и брал роль прямо
     из claim'а, не заглядывая в БД. Токен подписан, так что подделать роль
@@ -186,9 +231,18 @@ async def get_user_from_query_token(
     целиком. На эндпоинтах с `require_role` то же самое отсекалось сразу,
     потому что get_current_user ходит в БД за пользователем и его ролью, —
     расхождение выходило не в дизайне, а в том, что проверка была написана
-    руками в обход общей.
+    руками в обход общей. Оба транспорта по-прежнему сходятся в
+    `user_from_token`, то есть роль читается из БД независимо от того,
+    как приехал токен.
     """
-    return await user_from_token(token, db)
+    raw = _bearer_from_header(authorization) or token
+    if not raw:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Не авторизован",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await user_from_token(raw, db)
 
 
 def require_role(*roles: str):

@@ -193,12 +193,15 @@ def test_export_forbidden_for_viewer(client, make_user, seeded_archive, request)
 
 
 def test_export_requires_token(client, seeded_archive):
+    """Без учётных данных — 401 (до цикла 62 было 422: `token` в query был
+    обязательным параметром схемы; теперь принимается ещё и заголовок
+    `Authorization: Bearer`, см. test_integration_query_token_bearer.py)."""
     r = client.get("/api/archive/export", params={
         "camera_id": seeded_archive,
         "date_from": BASE.isoformat(),
         "date_to": (BASE + timedelta(seconds=25)).isoformat(),
     })
-    assert r.status_code == 422
+    assert r.status_code == 401
 
 
 @pytest.fixture()
