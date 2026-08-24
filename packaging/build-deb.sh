@@ -256,11 +256,24 @@ cp "$REPO_ROOT/frontend/nginx-security-headers.conf" "$STAGE/etc/nginx/snippets/
 sed -e 's#/etc/nginx/snippets/nginx-locations.conf#/etc/nginx/snippets/facewatch-locations.conf#' \
     -e 's#/etc/nginx/snippets/nginx-security-headers.conf#/etc/nginx/snippets/facewatch-security-headers.conf#' \
     -i "$STAGE/etc/nginx/snippets/facewatch-locations.conf"
-sed -e 's#/etc/nginx/snippets/nginx-locations.conf#/etc/nginx/snippets/facewatch-locations.conf#' \
+# Замена docker-имён нужна и здесь: с блоком `upstream facewatch_backend`
+# адрес бэкенда переехал из location'ов в nginx.conf, а этот конвейер её
+# не делал — в пакет уезжало `server facewatch-backend:8000;`, имя, которое
+# на .deb-установке не резолвится. nginx с нерезолвимым апстримом не
+# стартует вовсе, то есть веб-интерфейса на объекте не было бы совсем.
+sed -e 's#http://facewatch-backend:8000#http://127.0.0.1:8000#g' \
+    -e 's#server facewatch-backend:8000;#server 127.0.0.1:8000;#g' \
+    -e 's#http://facewatch-mediamtx:8888#http://127.0.0.1:8888#g' \
+    -e 's#/etc/nginx/snippets/nginx-locations.conf#/etc/nginx/snippets/facewatch-locations.conf#' \
     -e 's#/etc/nginx/certs/fullchain.pem#/etc/facewatch/tls/fullchain.pem#' \
     -e 's#/etc/nginx/certs/privkey.pem#/etc/facewatch/tls/privkey.pem#' \
     -e 's#access_log /dev/stdout redacted;#access_log /var/log/nginx/facewatch-access.log redacted;#' \
     "$REPO_ROOT/frontend/nginx.conf" > "$STAGE/etc/nginx/sites-available/facewatch.conf"
+# Сторож — на ОБА файла, а не только на locations. Прежний проверял лишь
+# сниппет, поэтому переезд адреса в nginx.conf он пропустил молча: пакет
+# собрался «успешно» и упал только на install-тесте.
+grep -q 'facewatch-backend\|facewatch-mediamtx' "$STAGE/etc/nginx/sites-available/facewatch.conf" \
+    && { echo "в facewatch.conf остались docker-имена хостов" >&2; exit 1; }
 
 cp "$REPO_ROOT/packaging/deb/conf/facewatch.env.template" "$STAGE/usr/share/facewatch/facewatch.env.template"
 install -m 0755 "$REPO_ROOT/packaging/deb/scripts/facewatch-first-run" "$STAGE/usr/sbin/facewatch-first-run"
