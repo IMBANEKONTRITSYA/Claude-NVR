@@ -413,3 +413,104 @@ def test_postinst_starts_nginx_not_only_reloads_it():
     assert "systemctl start nginx" in postinst, (
         "postinst только перезагружает nginx: остановленную службу reload не поднимает"
     )
+
+
+# --- nginx: docker-имена не должны уезжать в пакет ------------------------
+
+def _build_script() -> str:
+    return (PKG / "build-deb.sh").read_text(encoding="utf-8")
+
+
+def _docker_hostnames_in(path: Path) -> list[str]:
+    """Строки файла фронтенда, где стоит docker-имя хоста.
+
+    Имена вида `facewatch-backend` / `facewatch-mediamtx` резолвит только
+    сеть docker-compose. В .deb-раскладке (§26) сервисы слушают loopback,
+    поэтому build-deb.sh обязан заменить каждое такое имя — иначе nginx
+    отвечает `host not found in upstream` и **не стартует вовсе**, то
+    есть веб-интерфейса на объекте нет совсем.
+    """
+    text = path.read_text(encoding="utf-8")
+    out = []
+    for line in text.splitlines():
+        bare = line.split("#", 1)[0]  # комментарии не попадают в конфиг nginx
+        if "facewatch-backend" in bare or "facewatch-mediamtx" in bare:
+            out.append(line.strip())
+    return out
+
+
+def _sed_pipeline_for(source_conf: str) -> str:
+    """Текст ровно того sed-конвейера, который собирает данный конфиг.
+
+    Искать замену «где-нибудь в скрипте» недостаточно и даёт ложно-зелёный
+    тест: в build-deb.sh два конвейера, и замена в конвейере для
+    `nginx-locations.conf` проходит поиск, даже когда в конвейере для
+    `nginx.conf` её нет — то есть ровно при том дефекте, который этот
+    набор обязан ловить. Поймано верификацией откатом: первая редакция
+    теста прошла на снятой замене.
+
+    Поэтому берётся кусок скрипта от `sed` до строки, где этот конвейер
+    читает свой исходный файл.
+    """
+    script = _build_script()
+    needle = f'"$REPO_ROOT/frontend/{source_conf}"'
+    end = script.index(needle)
+    start = script.rindex("\nsed ", 0, end)
+    return script[start:end]
+
+
+def _sed_substitutions(pipeline: str) -> list[tuple[str, str]]:
+    """Пары (шаблон, замена) из выражений `-e 's#A#B#'` конвейера."""
+    return re.findall(r"-e\s+'s#([^#]*)#([^#]*)#g?'", pipeline)
+
+
+def _apply(pipeline: str, line: str) -> str:
+    """Прогоняет строку через замены конвейера — как это сделает sed."""
+    for pat, repl in _sed_substitutions(pipeline):
+        line = line.replace(pat, repl)
+    return line
+
+
+@pytest.mark.parametrize("conf", ["nginx.conf", "nginx-locations.conf"])
+def test_build_script_rewrites_every_docker_hostname(conf):
+    """После конвейера сборки в конфиге не остаётся ни одного docker-имени.
+
+    Проверка **применяет** замены к каждой задетой строке, а не ищет
+    упоминание хоста где-то в скрипте. Две более слабые редакции этого
+    теста оказались ложно-зелёными и были пойманы верификацией откатом:
+    первая находила замену в чужом конвейере (для другого файла), вторая
+    считала достаточным любое упоминание хоста — и обе проходили при
+    снятой замене для строки `server facewatch-backend:8000;`, которую
+    подстановка вида `http://facewatch-backend:8000` не трогает вовсе.
+
+    Ловится класс «собралось успешно, а на объекте не стартует»: пакет
+    собирается и метаданные проходят, а nginx на .deb-установке отвечает
+    `host not found in upstream` и не стартует, то есть веб-интерфейса на
+    объекте нет совсем. Поймано на живом отказе: с переходом на
+    `upstream facewatch_backend` адрес бэкенда переехал из
+    `nginx-locations.conf` (где замена была) в `nginx.conf` (где её не
+    было).
+    """
+    pipeline = _sed_pipeline_for(conf)
+    for line in _docker_hostnames_in(ROOT / "frontend" / conf):
+        after = _apply(pipeline, line)
+        assert "facewatch-backend" not in after and "facewatch-mediamtx" not in after, (
+            f"{conf}: строка `{line}` после конвейера сборки остаётся "
+            f"`{after}` — docker-имя уезжает в пакет. На .deb-установке "
+            f"nginx не стартует: host not found in upstream"
+        )
+
+
+def test_build_script_guards_both_produced_nginx_files():
+    """Сторож «в пакете не осталось docker-имён» — на оба файла.
+
+    Проверка есть, но до цикла 62 она смотрела только на
+    `facewatch-locations.conf`. Дефект уехал ровно мимо неё: он был во
+    втором файле, `facewatch.conf`, который никто не проверял.
+    """
+    script = _build_script()
+    for produced in ("facewatch-locations.conf", "facewatch.conf"):
+        assert re.search(
+            rf"grep -q 'facewatch-backend\\\|facewatch-mediamtx'[^\n]*{re.escape(produced)}",
+            script,
+        ), f"в build-deb.sh нет сторожа docker-имён для собранного {produced}"
