@@ -836,6 +836,95 @@ jobs:
             perf-segment-continuity.txt
             perf-live-latency.json
 
+  # Опрос живой системы БРАУЗЕРОМ через НАСТОЯЩИЙ nginx (см. e2e/README.md).
+  #
+  # Между обработчиком и оператором стоят три звена, которых нет ни в одной
+  # джобе выше: боевые frontend/nginx*.conf, собранный бандл фронтенда и сам
+  # браузер с его форматами запросов, куками и WebSocket'ом. Два цикла
+  # подряд дефекты находились ровно там, и оба раза — разовым ручным
+  # опросом, а не CI:
+  #
+  #   цикл 62: 16 эндпоинтов отвергали штатный Authorization: Bearer (422);
+  #            nginx ходил к бэкенду по HTTP/1.0 без пула соединений;
+  #   цикл 63: журнал аудита писал "?" вместо имени на КАЖДОМ входе через
+  #            веб-интерфейс (§10, §14) — браузер шлёт форму как multipart,
+  #            а middleware разбирала тело parse_qs, понимающим только
+  #            urlencoded.
+  #
+  # Общий класс — «тест написан под тот транспорт, который работает».
+  # Джоба переводит опрос из разового в регулярный: до неё конфиги nginx
+  # сторожили статические проверки текста файла, а nginx -t зелен и при
+  # полностью неработающей директиве (замерено, цикл 62).
+  ui-live:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facewatch
+          POSTGRES_PASSWORD: facewatch
+          POSTGRES_DB: facewatch_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U facewatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://facewatch:facewatch@127.0.0.1:5432/facewatch_e2e
+      REDIS_URL: redis://127.0.0.1:6379/0
+      E2E_BASE_URL: http://127.0.0.1:8080
+      E2E_ADMIN_PASSWORD: E2eProbeAdmin!2026
+      ADMIN_PASSWORD: E2eProbeAdmin!2026
+      SECRET_KEY: e2e-probe-secret-key-long-enough-0123456789abcdef
+      # Нехватка playwright/psycopg2/redis обязана валить джобу, а не
+      # уводить сьют в skip: молчаливый пропуск означал бы «опрос
+      # проведён», ни разу не выполнившись, — тот же класс ложного
+      # зелёного, из-за которого джоба backend отдельно ставит ffmpeg.
+      E2E_STRICT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install nginx
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nginx openssl
+      - name: Install backend deps
+        run: pip install -r backend/requirements.txt pytest psycopg2-binary httpx
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps && npm run build
+      - name: Bring up the stack (real nginx in front of a real backend)
+        run: ./e2e/run-stack.sh
+      - name: Probe the live UI with a browser
+        run: pytest e2e -q
+      - name: Диагностика при падении
+        if: failure()
+        run: |
+          echo "--- nginx access log ---"
+          sudo tail -50 /tmp/facewatch-e2e/logs/nginx-access.log || true
+          echo "--- backend log ---"
+          tail -80 /tmp/facewatch-e2e/logs/backend.log || true
+          echo "--- собранный конфиг nginx ---"
+          sudo cat /etc/nginx/conf.d/facewatch.conf || true
+
   frontend:
     runs-on: ubuntu-latest
     steps:
