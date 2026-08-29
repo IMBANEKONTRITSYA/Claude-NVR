@@ -10,6 +10,7 @@ from ..db import get_db
 from ..models import AuditLog
 from ..auth import require_role, require_role_query
 from ..pagination import PageParams
+from ..services import csv_export
 
 
 router = APIRouter(prefix="/api/audit", tags=["audit"])
@@ -94,7 +95,12 @@ async def export_csv(
     for r in rows:
         w.writerow(_row_tuple(r))
     buf.seek(0)
-    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
+    # Байты, а не строка: кодировку журнала задаёт `csv_export.encode`
+    # (UTF-8 с BOM — иначе Excel читает кириллические «Время»,
+    # «Пользователь», «Роль» как cp1251), а отдав StreamingResponse
+    # строку, кодирование пришлось бы отдать Starlette — то есть снова
+    # получить UTF-8 без BOM в обход общего правила.
+    return StreamingResponse(iter([csv_export.encode(buf.getvalue())]), media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=audit.csv"})
 
 

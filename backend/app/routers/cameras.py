@@ -12,7 +12,7 @@ from ..auth import require_role, require_role_query, get_current_user, get_user_
 from ..schemas import (OnvifBulkAddRequest, OnvifDescribeRequest, CameraIn, CameraOut,
                        OnvifProfilesRequest, OnvifStreamUriRequest, PtzMoveIn,
                        PtzPresetGotoIn, PtzPresetSaveIn, ROIIn, RtspTest)
-from ..services import camera_config
+from ..services import camera_config, csv_export
 from ..services.encryption import encrypt, decrypt
 from ..services.pubsub import get_redis
 
@@ -653,8 +653,13 @@ async def export_cameras(
         body, media, name = camera_config.rows_to_json(rows), "application/json", "cameras.json"
     else:
         body, media, name = camera_config.rows_to_csv(rows), "text/csv", "cameras.csv"
+    # BOM у CSV ставит общий `csv_export.encode`, а не локальный
+    # "utf-8-sig": до него эта выгрузка была единственной помеченной из
+    # трёх, и именно поэтому расхождение с отчётами §8 и журналом §10
+    # никто не замечал. JSON остаётся без BOM — его читают парсеры, а не
+    # Excel, и BOM в начале ломает строгий `json.loads`.
     return Response(
-        content=body.encode("utf-8-sig" if format == "csv" else "utf-8"),
+        content=csv_export.encode(body) if format == "csv" else body.encode("utf-8"),
         media_type=media,
         headers={"Content-Disposition": f"attachment; filename={name}"},
     )

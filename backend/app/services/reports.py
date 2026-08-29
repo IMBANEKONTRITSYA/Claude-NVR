@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Camera, FaceEvent, Person
+from . import csv_export
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -102,13 +103,13 @@ def to_csv(header: list[str], rows) -> bytes:
     w.writerow(header)
     for row in rows:
         w.writerow(row)
-    # Кодировка намеренно та же, что была у скачивания до вынесения кода
-    # сюда: у Excel под Windows есть известная беда с CSV без BOM
-    # (кириллица читается как cp1251), но чинить её надо разом для всех
-    # выгрузок — журнал аудита выгружается тем же способом из
-    # routers/audit.py. Разнобой между двумя видами CSV хуже, чем
-    # одинаковое поведение обоих; вынесено в carryover.
-    return buf.getvalue().encode("utf-8")
+    # Кодировка — общая для всех выгрузок системы: BOM, иначе Excel под
+    # Windows читает кириллические заголовки отчёта как cp1251. Раньше
+    # здесь стоял простой `.encode("utf-8")` с оговоркой «чинить надо
+    # разом для всех выгрузок, иначе будет разнобой» — разнобой к этому
+    # моменту уже был (выгрузка камер §3 писала BOM), поэтому все три
+    # выгрузки сведены в `csv_export.encode`. Обоснование — там же.
+    return csv_export.encode(buf.getvalue())
 
 
 def to_xlsx(title: str, header: list[str], rows) -> bytes:
