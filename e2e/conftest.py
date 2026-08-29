@@ -6,6 +6,7 @@
 временный стенд CI, и (при желании) на настоящий объект.
 """
 import os
+import re
 import urllib.parse
 
 import pytest
@@ -71,8 +72,16 @@ class PageProbe:
         self.failed_requests: list[tuple[str, str]] = []
         self.bad_responses: list[tuple[int, str, str]] = []
         page.on("pageerror", lambda e: self.page_errors.append(str(e)[:400]))
+        # «Failed to load resource: … status of NNN» — это не отдельная
+        # жалоба, а дубль того же самого ответа, который уже посчитан в
+        # bad_responses, только без URL. Держать его в канале консоли
+        # значило бы, что один отказ приходит дважды и второй раз — без
+        # адреса, то есть его нельзя ни соотнести с разделом, ни осознанно
+        # разрешить. Настоящие ошибки JS (исключения, отвергнутые промисы)
+        # остаются здесь.
         page.on("console", lambda m: self.console_errors.append(m.text[:400])
-                if m.type == "error" else None)
+                if m.type == "error" and not m.text.startswith("Failed to load resource")
+                else None)
         # net::ERR_ABORTED — не отказ, а нормальный исход перехода: чанк
         # code-splitting'а, запрошенный предыдущим разделом, отменяется
         # браузером при уходе с него. Всё остальное (отказ соединения,
@@ -95,16 +104,33 @@ class PageProbe:
         # networkidle его застаёт не всегда.
         self.page.wait_for_timeout(1200)
 
-    def complaints(self) -> str:
+    def _path_of(self, url: str) -> str:
+        return url.replace(self.base_url, "").split("?", 1)[0]
+
+    def complaints(self, allowed: tuple[str, ...] = ()) -> str:
+        """Что раздел нажаловал за переход.
+
+        `allowed` — регулярные выражения **на путь целиком** (без query),
+        для которых отказ ожидаем и о состоянии приложения ничего не
+        говорит: в песочнице и в CI нет ни MediaMTX, ни снятых снимков
+        камер. Именно полное совпадение, а не префикс: `/api/cameras/`
+        префиксом накрыл бы и список парка, и CRUD камеры, то есть
+        разрешение молча съело бы настоящие дефекты §3.
+        """
+        rules = [re.compile(r) for r in allowed]
+        allow = lambda url: any(p.fullmatch(self._path_of(url)) for p in rules)  # noqa: E731
+        bad = [(s, m, self._path_of(u) + ("?…" if "?" in u else ""))
+               for s, m, u in self.bad_responses if not allow(u)]
+        failed = [f for f in self.failed_requests if not allow(f[0])]
         parts = []
         if self.page_errors:
             parts.append(f"исключения: {self.page_errors}")
         if self.console_errors:
             parts.append(f"консоль: {self.console_errors}")
-        if self.bad_responses:
-            parts.append(f"ответы>=400: {[(s, m, u.replace(self.base_url, '')) for s, m, u in self.bad_responses]}")
-        if self.failed_requests:
-            parts.append(f"неотправленные запросы: {self.failed_requests}")
+        if bad:
+            parts.append(f"ответы>=400: {bad}")
+        if failed:
+            parts.append(f"неотправленные запросы: {failed}")
         return "; ".join(parts)
 
 
@@ -148,6 +174,37 @@ def pg_conn():
     conn.autocommit = True
     yield conn
     conn.close()
+
+
+@pytest.fixture(scope="session")
+def seeded_camera(base_url, admin_credentials):
+    """Одна камера в парке на всё время прогона.
+
+    Без неё раздел «Живой просмотр» открывался на пустом парке и не
+    доходил ни до одной плитки — то есть проверка §4 держалась на том,
+    что база CI пуста, и перестала бы что-либо значить на первой же
+    заведённой камере. С камерой раздел проходит свой настоящий путь:
+    запрашивает плейлист у MediaMTX и снимок у бэкенда. Ни того, ни
+    другого в песочнице нет, и отказы на этих двух путях разрешены
+    предметно (см. `ALLOWED_WITHOUT_MEDIAMTX` в test_ui_live.py).
+    """
+    httpx = _need("httpx", "нужен httpx")
+    user, password = admin_credentials
+    with httpx.Client(base_url=base_url, timeout=30.0) as c:
+        token = c.post("/api/auth/login",
+                       data={"username": user, "password": password}).json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        r = c.post("/api/cameras", headers=headers, json={
+            "name": "e2e-probe-cam",
+            "rtsp_url": "rtsp://127.0.0.1:554/e2e-probe",
+            "location": "e2e",
+            "enabled": True,
+            "mode": "record_only",
+        })
+        r.raise_for_status()
+        cam_id = r.json()["id"]
+        yield cam_id
+        c.delete(f"/api/cameras/{cam_id}", headers=headers)
 
 
 @pytest.fixture(scope="session")

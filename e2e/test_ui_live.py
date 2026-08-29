@@ -31,22 +31,37 @@ SECTIONS = [
 ]
 
 
+# Два адреса, которые в песочнице и в CI обязаны отказывать, и это ничего
+# не говорит о приложении: за `/hls/` стоит MediaMTX, которого здесь нет
+# вовсе, а снимок камеры бэкенд отдаёт из файла, снятого воркером, —
+# воркера здесь тоже нет. Разрешение задано выражениями на путь целиком,
+# а не префиксом: `/api/cameras/` префиксом накрыл бы и список парка, и
+# CRUD камеры, то есть съело бы настоящие дефекты §3. На любом другом
+# адресе тот же код остаётся жалобой. Что за этими путями происходит на
+# самом деле, проверяется на объекте — `docs/DEPLOY_CHECKLIST.md`, 6.5.
+ALLOWED_WITHOUT_MEDIAMTX = (r"/hls/.*", r"/api/cameras/\d+/snapshot")
+
+
 @pytest.mark.parametrize("path,heading,spec", SECTIONS, ids=[s[0] for s in SECTIONS])
-def test_section_opens_clean_in_a_browser(logged_in, path, heading, spec):
+def test_section_opens_clean_in_a_browser(logged_in, seeded_camera, path, heading, spec):
     """Раздел открывается, показывает свой заголовок и ни на что не жалуется.
 
     «Открылся» здесь — не «вернулся 200 на HTML»: SPA отдаёт один и тот же
     index.html на любой путь, поэтому проверяется отрисованный заголовок
     раздела, а вместе с ним — отсутствие исключений React, ошибок консоли
     и ответов ≥ 400 на запросах, которые страница сделала сама.
+
+    Прогон идёт с заведённой камерой (`seeded_camera`), а не на пустом
+    парке: иначе «Живой просмотр» не доходил бы ни до одной плитки, и
+    проверка §4 держалась бы на том, что база CI пуста.
     """
     logged_in.visit(path)
     body = logged_in.page.inner_text("body")
+    complaints = logged_in.complaints(ALLOWED_WITHOUT_MEDIAMTX)
     assert heading in body, (
-        f"{spec}: раздел {path} не показал заголовок {heading!r}. "
-        f"{logged_in.complaints()}"
+        f"{spec}: раздел {path} не показал заголовок {heading!r}. {complaints}"
     )
-    assert not logged_in.complaints(), f"{spec}: раздел {path} — {logged_in.complaints()}"
+    assert not complaints, f"{spec}: раздел {path} — {complaints}"
 
 
 def test_login_from_the_browser_names_the_account_in_audit(logged_in, pg_conn):
