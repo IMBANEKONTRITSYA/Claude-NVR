@@ -1,0 +1,242 @@
+:root {
+  --bg: #0d1117;
+  --bg2: #161b22;
+  --panel: #1c2128;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #2f81f7;
+  --green: #3fb950;
+  --orange: #d29922;
+  --red: #f85149;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+}
+a { color: var(--accent); text-decoration: none; }
+
+.layout { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+.sidebar { background: var(--bg2); border-right: 1px solid var(--border); padding: 16px; }
+.sidebar h1 { font-size: 18px; margin: 0 0 16px; }
+.nav a { display: block; padding: 8px 10px; border-radius: 6px; color: var(--text); margin-bottom: 4px; }
+.nav a.active, .nav a:hover { background: var(--panel); }
+.main { padding: 20px; overflow-y: auto; }
+
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; }
+.grid { display: grid; gap: 12px; }
+.btn {
+  background: var(--accent); color: white; border: 0; padding: 8px 14px; border-radius: 6px;
+  cursor: pointer; font-size: 13px;
+}
+.btn.secondary { background: var(--panel); border: 1px solid var(--border); color: var(--text); }
+.btn.danger { background: var(--red); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+input, select, textarea {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  padding: 8px 10px; border-radius: 6px; font-size: 13px; width: 100%;
+}
+label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 12px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 8px; border-bottom: 1px solid var(--border); text-align: left; }
+th { color: var(--muted); font-weight: 500; }
+
+.tile {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px; display: flex; gap: 10px; align-items: center;
+}
+.tile.known { border-color: var(--green); }
+.tile.unknown { border-color: var(--orange); }
+.tile img { width: 64px; height: 64px; object-fit: cover; border-radius: 6px; }
+
+.kpi { font-size: 28px; font-weight: 600; }
+.muted { color: var(--muted); }
+.badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+.badge.online { background: var(--green); color: #000; }
+.badge.offline { background: var(--red); }
+.badge.disabled { background: var(--muted); }
+
+.cam-mosaic { display: grid; gap: 8px; }
+.cam-tile { background: #000; aspect-ratio: 16 / 9; position: relative; border-radius: 6px; overflow: hidden; }
+.cam-tile .lbl { position: absolute; top: 6px; left: 6px; background: rgba(0,0,0,0.6); padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+/* Причина, по которой плитка чёрная (SPEC §4). Поверх снимка, потому
+   что снимок из архива есть и при мёртвом живом потоке: без подписи
+   оператор смотрит на кадр минутной давности, считая его живым. */
+.cam-tile .nostream { position: absolute; inset: 0; color: var(--muted); display: flex;
+  flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+  text-align: center; padding: 8px; background: rgba(0, 0, 0, .62); pointer-events: none; }
+.cam-tile .nostream-hint { font-size: 11px; line-height: 1.35; opacity: .85; max-width: 34ch; }
+/* SPEC §4, цифровой зум: индикатор кратности он же кнопка сброса —
+   увеличенный кадр иначе нечем вернуть в исходное положение. */
+.cam-tile .zoom-badge { position: absolute; top: 6px; right: 6px; background: rgba(0,0,0,0.65); color: #fff; padding: 2px 7px; border-radius: 4px; font-size: 12px; cursor: pointer; user-select: none; }
+.cam-tile .zoom-badge:hover { background: rgba(0,0,0,0.85); }
+.bbox { position: absolute; border: 2px solid var(--green); border-radius: 2px; pointer-events: none; transition: all 0.2s; }
+.bbox-label { position: absolute; top: -18px; left: -2px; font-size: 11px; color: #000; padding: 1px 5px; border-radius: 3px; white-space: nowrap; }
+
+.toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; pointer-events: none; }
+.toast { padding: 10px 14px; border-radius: 6px; color: #fff; min-width: 240px; max-width: 400px; box-shadow: 0 4px 16px rgba(0,0,0,0.4); animation: slideIn 0.2s ease-out; pointer-events: auto; }
+.toast-ok { background: var(--green); color: #000; }
+.toast-err { background: var(--red); }
+.toast-warn { background: var(--orange); color: #000; }
+.toast-info { background: var(--accent); }
+@keyframes slideIn { from { transform: translateX(20px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 999; }
+.modal { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 20px; min-width: 320px; max-width: 480px; }
+
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.dot.err { background: var(--red); }
+.dot.warn { background: var(--orange); }
+
+.toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+.empty { color: var(--muted); padding: 24px; text-align: center; }
+
+/* --- Навигация: разделы вместо плоского списка из 13 ссылок ------------- */
+/* Сгруппированный список читается взглядом за один проход: пункт ищут
+   внутри раздела, а не перебором всего меню. */
+.sidebar { display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; }
+.sidebar .nav-scroll { flex: 1; overflow-y: auto; margin: 0 -16px; padding: 0 16px; }
+.nav-group { margin-bottom: 14px; }
+.nav-group > .nav-group-title {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--muted); padding: 0 10px; margin-bottom: 4px; font-weight: 600;
+}
+.nav a { font-size: 13px; padding: 7px 10px; margin-bottom: 2px; border-left: 2px solid transparent; }
+.nav a.active {
+  background: var(--panel); border-left-color: var(--accent); color: #fff; font-weight: 500;
+}
+
+/* --- Секции формы ------------------------------------------------------- */
+/* Длинная форма одним столбцом заставляет скроллить, чтобы понять, какие
+   поля вообще есть. Секция с заголовком делает состав видимым сразу. */
+.section { border-top: 1px solid var(--border); padding-top: 14px; margin-top: 14px; }
+.section:first-child { border-top: none; padding-top: 0; margin-top: 0; }
+.section > h4 {
+  margin: 0 0 10px; font-size: 12px; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--muted); font-weight: 600;
+}
+.field { margin-bottom: 10px; }
+.field > label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+.field > .hint { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.4; }
+.field input, .field select, .field textarea { margin: 0; }
+
+/* --- Вкладки ------------------------------------------------------------ */
+/* Ручное добавление и поиск в сети — независимые задачи; на одной странице
+   подряд они дают бесконечный скролл, в котором теряется список камер. */
+.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+.tabs button {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--muted); padding: 8px 14px; cursor: pointer; font-size: 13px;
+  font-family: inherit; border-radius: 0;
+}
+.tabs button:hover { color: var(--text); }
+.tabs button.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 500; }
+
+/* --- Таблицы ------------------------------------------------------------ */
+/* Плотнее и с липкой шапкой: на 120 камерах прокрутка уводила заголовки, и
+   колонку приходилось угадывать. */
+table th {
+  position: sticky; top: 0; z-index: 1; background: var(--bg2);
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--muted); font-weight: 600; text-align: left;
+}
+table td, table th { padding: 7px 10px; }
+table tbody tr { border-top: 1px solid var(--border); }
+table tbody tr:hover { background: var(--bg2); }
+.table-scroll { max-height: 60vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+
+/* Плеер архива с покадровым просмотром (SPEC §5). Контейнер получает
+   фокус ради стрелок, но рамку фокуса браузера убираем — она обводила бы
+   всё видео целиком. */
+.seg-player:focus { outline: none; }
+.seg-player:focus-visible { outline: 1px solid var(--border); }
+.seg-player-bar {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 8px; flex-wrap: wrap;
+}
+
+/* Шкала архива (SPEC §5): сутки одной камеры одной полосой.
+
+   Подложка полосы окрашена как перерыв, покрытие рисуется поверх —
+   «нет записи» обязано выглядеть иначе, чем «шкала не загрузилась».
+   Полоса кликабельна целиком, включая перерывы: клик в перерыв
+   перематывает к следующей записи, как в промышленном NVR. */
+.timeline { margin-top: 4px; }
+.timeline-strip {
+  position: relative; height: 34px; cursor: pointer;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 4px;
+  overflow: hidden;
+}
+.timeline-bar {
+  position: absolute; top: 0; bottom: 0;
+  background: var(--green); opacity: 0.75;
+}
+.timeline-tick {
+  position: absolute; top: 0; bottom: 0; width: 1px;
+  background: var(--border);
+}
+/* Каретка поверх покрытия и делений: она отвечает на вопрос «где я
+   сейчас», и спрятать её под полоской записи нельзя. */
+.timeline-head {
+  position: absolute; top: -2px; bottom: -2px; width: 2px;
+  margin-left: -1px; background: var(--accent); pointer-events: none;
+}
+.timeline-labels {
+  position: relative; height: 14px; margin-top: 2px;
+  color: var(--muted); font-size: 11px;
+}
+.timeline-labels span {
+  position: absolute; transform: translateX(-50%); white-space: nowrap;
+}
+
+/* Миниатюра кадра сегмента в выдаче архива (SPEC §7). Размер задан в CSS,
+   а не атрибутами img: строка таблицы не должна прыгать, пока картинка
+   догружается ленивой загрузкой. */
+.seg-thumb {
+  width: 96px; height: 54px; object-fit: cover;
+  border-radius: 4px; background: #000; display: block;
+}
+.btn.sm { padding: 3px 9px; font-size: 12px; }
+
+/* Пульт PTZ (SPEC §4). Показывается под развёрнутой камерой. */
+.ptz-pad { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap;
+           margin-top: 12px; padding: 12px; border: 1px solid var(--border);
+           border-radius: 8px; background: var(--panel); }
+.ptz-grid { display: grid; grid-template-columns: repeat(3, 36px); gap: 4px; }
+.ptz-center { display: block; }
+/* touch-action: none — иначе на планшете удержание стрелки прокручивает
+   страницу вместо поворота камеры, а pointerup приходит как pointercancel.
+   user-select: none — двойное нажатие подряд выделяло бы символ стрелки. */
+.ptz-btn { width: 36px; height: 36px; padding: 0; font-size: 16px; line-height: 1;
+           touch-action: none; user-select: none; }
+.ptz-zoom { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.ptz-presets { display: flex; align-items: center; gap: 8px; }
+.ptz-error { flex-basis: 100%; color: var(--orange); font-size: 13px; }
+
+/* Редактор расписания детекции (SPEC §6). */
+.sched-window { border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 8px; }
+.sched-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sched-days { display: flex; gap: 4px; flex-wrap: wrap; }
+.sched-days .btn { min-width: 34px; padding: 2px 6px; }
+
+/* Теги персон (SPEC §15). Чип узкий намеренно: на плитке списка их до
+   трёх, и они не должны отодвигать имя персоны за край. */
+.chip {
+  display: inline-flex; align-items: center; gap: 3px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+  color: var(--text); font-size: 11px; line-height: 1.6; padding: 0 7px;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.chip.muted { color: var(--muted); }
+.chip-x {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 0; margin: 0;
+}
+.chip-x:hover { color: var(--red); }

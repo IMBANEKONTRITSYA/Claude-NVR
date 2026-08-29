@@ -1,0 +1,18 @@
+.env
+node_modules/
+dist/
+*.tsbuildinfo
+__pycache__/
+*.pyc
+.venv/
+media/
+.coverage
+htmlcov/
+loadtest/results/
+dump.rdb
+
+# Самоподписанные сертификаты, которые MediaMTX генерирует рядом с собой
+# при ручном запуске из корня репозитория (замеры, отладка слоя записи).
+# Тесты и бенчмарки запускают его из своего каталога (cwd=), это страховка.
+auto.crt
+auto.key

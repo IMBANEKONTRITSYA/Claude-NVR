@@ -1,0 +1,40 @@
+[Unit]
+Description=FaceWatch: слой аналитики и обслуживание архива (worker)
+Documentation=file:///usr/share/doc/facewatch/README.md
+After=network-online.target postgresql.service redis-server.service facewatch-mediamtx.service facewatch-first-run.service
+Wants=network-online.target
+Requires=facewatch-first-run.service
+PartOf=facewatch.target
+
+[Service]
+Type=simple
+User=facewatch
+Group=facewatch
+WorkingDirectory=@PREFIX@/app/worker
+EnvironmentFile=/etc/facewatch/facewatch.env
+ExecStart=@PREFIX@/venv/worker/bin/python worker.py
+Restart=always
+RestartSec=5s
+# Числа из docker-compose.yml (deploy.resources.limits сервиса worker):
+# 6 ядер и 4 ГБ на слой аналитики.
+CPUQuota=600%
+MemoryMax=4G
+# InsightFace ищет веса в ~/.insightface — отсюда HOME на каталог данных,
+# куда пакет кладёт вложенную модель (см. facewatch-first-run).
+Environment=HOME=/var/lib/facewatch
+Environment=PYTHONUNBUFFERED=1
+# Воркер сам ограничивает ожидание нитей камер 8 секундами, но закрытие
+# VideoCapture по каждой камере на большом объекте занимает время; docker
+# здесь давал 20 с (stop_grace_period), systemd по умолчанию 90 с —
+# оставлено 30, чтобы остановка не выглядела зависшей.
+TimeoutStopSec=30s
+ProtectSystem=strict
+ReadWritePaths=/var/lib/facewatch
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=facewatch.target

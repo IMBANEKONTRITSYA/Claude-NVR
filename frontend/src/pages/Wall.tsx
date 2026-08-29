@@ -1,0 +1,158 @@
+import { useEffect, useRef, useState, useCallback } from "react";
+import { api, mediaUrl } from "../api";
+import { useWebSocket } from "../useWebSocket";
+import { isAlertEvent, playAlertBeep, shouldBeep } from "../alertSound";
+
+const PAGE = 60;
+
+function mapEvent(e: any) {
+  return {
+    event_id: e.id, camera_id: e.camera_id, person_id: e.person_id,
+    name: e.name, is_known: e.is_known, snapshot: e.snapshot_path, ts: e.ts,
+    // Теги приезжают вместе с событием — и из /api/events, и по WebSocket
+    // от воркера (SPEC §15 «Фильтры и поиск по ленте»).
+    tags: (e.tags || []) as string[],
+  };
+}
+
+export function Wall() {
+  const [items, setItems] = useState<any[]>([]);
+  const [paused, setPaused] = useState(false);
+  const [filter, setFilter] = useState<"all" | "known" | "unknown">("all");
+  const [tag, setTag] = useState("");
+  const [hasMore, setHasMore] = useState(true);
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
+  const loadingRef = useRef(false);
+  const itemsRef = useRef<any[]>([]);
+  itemsRef.current = items;
+  const hasMoreRef = useRef(true);
+  hasMoreRef.current = hasMore;
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  // Звуковой алерт §6: глобальный флаг настроек читается через
+  // /api/settings/client — сама форма настроек admin-only, а звук нужен
+  // оператору и наблюдателю. Отказ запроса означает «звук выключен».
+  const [soundOn, setSoundOn] = useState(false);
+  const lastBeepRef = useRef(0);
+  useEffect(() => {
+    api.getClientSettings()
+      .then((c: any) => setSoundOn(String(c.alert_sound_enabled) === "1"))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    api.events(PAGE).then((evs: any[]) => {
+      setItems(evs.map(mapEvent));
+      if (evs.length < PAGE) setHasMore(false);
+    });
+  }, []);
+
+  // Бесконечный скролл: подгружаем историю, когда sentinel попадает в вьюпорт
+  const loadMore = useCallback(async () => {
+    if (loadingRef.current || !hasMoreRef.current) return;
+    const cur = itemsRef.current;
+    if (cur.length === 0) return;
+    loadingRef.current = true;
+    try {
+      const minId = Math.min(...cur.map(i => i.event_id));
+      const evs: any[] = await api.raw(`/api/events?limit=${PAGE}&before_id=${minId}`);
+      if (evs.length < PAGE) setHasMore(false);
+      if (evs.length) {
+        setItems(prev => {
+          const seen = new Set(prev.map(i => i.event_id));
+          return [...prev, ...evs.map(mapEvent).filter(i => !seen.has(i.event_id))];
+        });
+      }
+    } catch {}
+    loadingRef.current = false;
+  }, []);
+
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el) return;
+    const obs = new IntersectionObserver(entries => {
+      if (entries[0].isIntersecting) loadMore();
+    }, { rootMargin: "400px" });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [loadMore]);
+
+  useWebSocket("/ws/faces", (msg) => {
+    // SPEC §6: звук — третий канал алертов наравне с Telegram и почтой.
+    // Пауза глушит и его: оператор, нажавший «Пауза», просматривает ленту,
+    // а не следит за новыми событиями.
+    if (soundOn && !pausedRef.current && isAlertEvent(msg)) {
+      const now = Date.now();
+      if (shouldBeep(lastBeepRef.current, now)) {
+        lastBeepRef.current = now;
+        playAlertBeep();
+      }
+    }
+    if (msg.type === "face") {
+      // Дедуп: событие могло уже прийти в начальной странице истории
+      setItems(prev => (pausedRef.current || prev.some(i => i.event_id === msg.event_id))
+        ? prev : [msg, ...prev]);
+    } else if (msg.type === "enhanced") {
+      // Подменяем фото на улучшенное по event_id
+      setItems(prev => prev.map(i => i.event_id === msg.event_id ? { ...i, snapshot: msg.snapshot } : i));
+    }
+  });
+
+  const ago = (iso: string) => {
+    const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+    if (s < 60) return `${s} сек`;
+    if (s < 3600) return `${Math.floor(s / 60)} мин`;
+    return `${Math.floor(s / 3600)} ч`;
+  };
+
+  // Справочник тегов для фильтра ленты. Берётся один раз: теги правят на
+  // карточке персоны, а не здесь, и лента не должна дёргать справочник на
+  // каждое входящее событие.
+  const [tagCatalog, setTagCatalog] = useState<{ tag: string; count: number }[]>([]);
+  useEffect(() => {
+    api.personTags().then((r: any) => setTagCatalog(Array.isArray(r) ? r : [])).catch(() => {});
+  }, []);
+
+  const visible = items.filter(i =>
+    (filter === "all" || (filter === "known" && i.is_known) || (filter === "unknown" && !i.is_known))
+    && (!tag || (i.tags || []).includes(tag))
+  );
+
+  return (
+    <div>
+      <h2>Стена распознавания</h2>
+      <div className="toolbar">
+        <button className="btn secondary" onClick={() => setPaused(p => !p)}>{paused ? "Возобновить" : "Пауза"}</button>
+        <select value={filter} onChange={e => setFilter(e.target.value as any)} style={{ width: 200 }}>
+          <option value="all">Все</option>
+          <option value="known">Только известные</option>
+          <option value="unknown">Только неизвестные</option>
+        </select>
+        <select value={tag} onChange={e => setTag(e.target.value)} style={{ width: 200 }} aria-label="Фильтр по тегу">
+          <option value="">Все теги</option>
+          {tagCatalog.map(t => <option key={t.tag} value={t.tag}>{t.tag} ({t.count})</option>)}
+        </select>
+        <span className="muted">Показано: {visible.length}</span>
+      </div>
+      <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))" }}>
+        {visible.map(i => (
+          <div key={i.event_id} className={`tile ${i.is_known ? "known" : "unknown"}`}>
+            {i.snapshot ? <img src={mediaUrl(i.snapshot)} loading="lazy" /> : <div style={{ width: 64, height: 64, background: "#000" }} />}
+            <div>
+              <div>{i.name}</div>
+              <div className="muted" style={{ fontSize: 12 }}>Камера #{i.camera_id} · {ago(i.ts)}</div>
+              {!!(i.tags || []).length && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginTop: 3 }}>
+                  {(i.tags as string[]).map(t => <span key={t} className="chip">{t}</span>)}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+        {visible.length === 0 && <div className="empty">Пока нет событий</div>}
+      </div>
+      <div ref={sentinelRef} style={{ height: 1 }} />
+      {!hasMore && items.length > 0 && <div className="empty">История загружена полностью</div>}
+    </div>
+  );
+}

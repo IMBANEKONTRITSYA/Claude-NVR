@@ -1,0 +1,36 @@
+Package: facewatch
+Version: @VERSION@
+Section: video
+Priority: optional
+Architecture: amd64
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: FaceWatch <noreply@example.invalid>
+Homepage: https://github.com/IMBANEKONTRITSYA/Claude-NVR
+Depends: adduser,
+ ca-certificates,
+ openssl,
+ nginx,
+ redis-server,
+ ffmpeg,
+ libgl1,
+ libglib2.0-0t64 | libglib2.0-0,
+ libgomp1,
+ postgresql-16 | postgresql-15 | postgresql-17 | postgresql,
+ postgresql-16-pgvector | postgresql-15-pgvector | postgresql-17-pgvector
+Description: FaceWatch — NVR со встроенным распознаванием лиц
+ Промышленный сетевой видеорегистратор: запись всех камер remux'ом через
+ MediaMTX, live-просмотр, архив с поиском, детекция движения, отчёты,
+ ONVIF Profile S/G — плюс слой аналитики с распознаванием лиц,
+ кластеризацией персон и поиском по фото.
+ .
+ Пакет содержит переносимый Python-рантайм и все сервисы FaceWatch
+ (backend, worker, upscaler), статический бинарник MediaMTX, собранный
+ фронтенд и конфигурацию nginx. PostgreSQL, Redis, nginx и ffmpeg
+ ставятся из репозитория дистрибутива как зависимости.
+ .
+ Сервисы поднимаются systemd-юнитами facewatch-backend,
+ facewatch-worker, facewatch-upscaler и facewatch-mediamtx,
+ сгруппированными в facewatch.target. Секреты (пароль администратора,
+ ключ шифрования RTSP-учёток, JWT-секрет) генерируются при первой
+ установке в /etc/facewatch/, данные и архив живут в
+ /var/lib/facewatch/.
