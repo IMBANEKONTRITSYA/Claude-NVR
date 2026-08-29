@@ -183,6 +183,13 @@ def test_send_now_delivers_csv_attachment(client, admin_headers, make_schedule, 
     files = _attachments(mail_settings.messages[0][2])
     assert files[0][0] == "cameras.csv"
     assert "Камера" in files[0][1].decode("utf-8")
+    # Отчёт, пришедший почтой, открывают тем же Excel, что и скачанный:
+    # без BOM его кириллические заголовки читаются как cp1251 (см.
+    # services/csv_export.py). Проверка байтов, а не декодированного
+    # текста, — `.decode("utf-8")` выше проходит при обоих исходах.
+    assert files[0][1].startswith(b"\xef\xbb\xbf"), (
+        f"вложение §8 ушло без BOM: {files[0][1][:20]!r}"
+    )
 
 
 def test_send_now_falls_back_to_alert_recipients(client, admin_headers, make_schedule, mail_settings):
