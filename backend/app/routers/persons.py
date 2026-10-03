@@ -15,6 +15,7 @@ from ..params import limit_param
 from ..services.biometrics import erase_person
 from ..services.pubsub import get_redis
 from ..services.person_tags import TagError, merge_tags, normalize_tag, normalize_tags
+from ..services.person_centroid import recompute_centroid
 
 router = APIRouter(prefix="/api/persons", tags=["persons"])
 
@@ -215,8 +216,14 @@ async def merge_persons(src_id: int, dst_id: int, _=Depends(require_role("admin"
         dst.tags = merge_tags(dst.tags, src.tags)
     await db.execute(update(FaceEvent).where(FaceEvent.person_id == src_id).values(person_id=dst_id))
     await db.execute(delete(Person).where(Person.id == src_id))
+    # Центроид цели пересчитывается ПОСЛЕ переноса событий и в той же
+    # транзакции: им, а не галереей, карточка узнаётся (см.
+    # services/person_centroid.py). Без этого шага слияние не меняло
+    # распознавание вообще — появление, попадавшее в слитую карточку,
+    # заводило третью, и оператор сливал её снова.
+    recomputed = await recompute_centroid(db, dst_id)
     await db.commit()
-    return {"ok": True}
+    return {"ok": True, "centroid_recomputed": recomputed}
 
 
 @router.get("/{pid}/gallery", response_model=list[dict])
