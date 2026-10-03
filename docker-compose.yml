@@ -1,0 +1,341 @@
+# ТЗ 12: "структурированные логи... с ротацией". Docker-драйвер json-file по
+# умолчанию не ограничен по размеру — на системе, работающей 24/7 (ТЗ:
+# "стабильно работать 24/7 без деградации"), это медленная, но верная утечка
+# места на диске. Единый якорь на все сервисы: 10 файлов по 10 МБ (100 МБ на
+# контейнер) с лихвой хватает на разбор инцидента и не требует держать
+# отдельный лог-агрегатор (Loki) для однокомпьютерного развёртывания.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "10"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: facewatch-postgres
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-facewatch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-facewatch}
+      POSTGRES_DB: ${POSTGRES_DB:-facewatch}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      # Только на loopback: backend/worker/upscaler ходят по внутренней
+      # docker-сети (хост "postgres"), порт наружу нужен лишь для локальной
+      # отладки psql с той же машины. POSTGRES_PASSWORD по умолчанию —
+      # публично известное значение "facewatch" (ТЗ 13), поэтому открывать
+      # порт на все интерфейсы означало бы БД без реальной защиты.
+      # Хост-порт настраиваемый (POSTGRES_HOST_PORT, по умолчанию 5432) —
+      # на Windows этот порт иногда недоступен для докера из-за особенностей
+      # Hyper-V/WSL2-сети или сторонних security-агентов (WSAEACCES при
+      # биндинге, не видно ни в netstat, ни в excludedportrange), тогда
+      # проще переопределить хост-порт в .env, чем разбираться с ОС.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-facewatch}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: facewatch-redis
+    logging: *default-logging
+    ports:
+      # Redis не требует пароля по умолчанию — публикация на все интерфейсы
+      # дала бы любому в локальной сети полный доступ к очередям/кэшу.
+      # Хост-порт настраиваемый (REDIS_HOST_PORT) — см. комментарий у
+      # postgres выше про недоступность фиксированных портов на некоторых
+      # Windows-машинах.
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  mediamtx:
+    # Версия зафиксирована, а не `latest`. Слой записи разговаривает с
+    # MediaMTX по Control API, набор прав и имена полей рантайма которого
+    # менялись между выпусками; с `latest` рабочее развёртывание ломается
+    # от `docker compose pull`, без единого изменения в репозитории, и
+    # выглядит это как «сегодня все камеры почернели». Обновление версии —
+    # осознанный коммит, после которого гоняются тесты слоя записи.
+    image: bluenviron/mediamtx:1.16.0
+    container_name: facewatch-mediamtx
+    logging: *default-logging
+    environment:
+      # Пароль Control API (см. authInternalUsers в mediamtx/mediamtx.yml).
+      # Индекс 1 — вторая запись списка, пользователь `facewatch`. То же
+      # значение подставляется воркеру в MEDIAMTX_API_URL ниже; они обязаны
+      # совпадать, иначе слой записи молча остаётся без путей.
+      MTX_AUTHINTERNALUSERS_1_PASS: ${MEDIAMTX_API_PASSWORD:-facewatch-mediamtx-api}
+    ports:
+      # MediaMTX не публикует наружу ни Control API, ни запись. Он тянет
+      # камеры сам и раздаёт HLS через внутреннюю docker-сеть (хост
+      # "mediamtx"), куда ходит nginx — публикация наружу никому не нужна и
+      # означала бы, что любой в локальной сети смотрит камеры без входа в
+      # систему. Оставлено на loopback только для локальной отладки через
+      # VLC/ffplay. Control API (9997) не публикуется вовсе: им управляется
+      # запись, доступ к нему равен доступу к конфигурации всех камер.
+      # Хост-порты настраиваемые (см. комментарий у postgres про Windows).
+      - "127.0.0.1:${MEDIAMTX_RTSP_HOST_PORT:-8554}:8554"     # RTSP
+      - "127.0.0.1:${MEDIAMTX_HLS_HOST_PORT:-8888}:8888"      # HLS
+      - "127.0.0.1:${MEDIAMTX_WEBRTC_HOST_PORT:-8889}:8889"   # WebRTC
+    volumes:
+      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
+      # SPEC §20: MediaMTX — единственный процесс, пишущий все камеры.
+      # Сегменты идут в тот же том, что читает архив backend'а и чистит
+      # ротация воркера.
+      - media:/media
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:9997/v3/config/global/get >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          # SPEC §23: бюджет слоя записи — 2-4 ядра на 120 камер remux'ом.
+          cpus: '4.0'
+          memory: 2G
+
+  backend:
+    build: ./backend
+    container_name: facewatch-backend
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-facewatch}:${POSTGRES_PASSWORD:-facewatch}@postgres:5432/${POSTGRES_DB:-facewatch}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      RTSP_ENCRYPTION_KEY: ${RTSP_ENCRYPTION_KEY:-ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ=}
+      MEDIA_PATH: /media
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      # SPEC §11. Тот же том, в который пишет cron-контейнер `backup` ниже:
+      # интерфейс обязан показывать все копии, а не только снятые кнопкой.
+      BACKUP_PATH: /backups
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 3 * * *}
+      WORKER_URL: http://worker:9000
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      # Сторож живости цикла событий (§13 «авторестарт сервисов», §19 RTO).
+      # Ловит заблокированный цикл — синхронный вызов в обработчике, дедлок
+      # в C-расширении, вставший том, — то есть состояние, в котором не
+      # отвечает вообще ничто, включая сам healthcheck ниже. Порог
+      # отставания и отсрочка вынесены наружу: на сильно нагруженном
+      # объекте их имеет смысл поднять. См. backend/app/liveness.py.
+      BACKEND_WATCHDOG_ENABLED: ${BACKEND_WATCHDOG_ENABLED:-1}
+      BACKEND_WATCHDOG_LAG_BUDGET_SEC: ${BACKEND_WATCHDOG_LAG_BUDGET_SEC:-60}
+      BACKEND_WATCHDOG_KILL_GRACE_SEC: ${BACKEND_WATCHDOG_KILL_GRACE_SEC:-60}
+    volumes:
+      - media:/media
+      # §11 «ручной запуск» и список копий в интерфейсе: rw, потому что
+      # кнопка «Создать бэкап» пишет дамп сюда же, куда пишет cron.
+      - backups:/backups
+    ports:
+      # Хост-порт настраиваемый (BACKEND_HOST_PORT) — см. комментарий у
+      # postgres про Windows.
+      - "${BACKEND_HOST_PORT:-8000}:8000"
+    healthcheck:
+      # Красный healthcheck сам по себе контейнер НЕ перезапускает: Docker
+      # лишь метит его unhealthy, на restart: это не влияет. Здесь он —
+      # сигнал оператору и `depends_on: service_healthy`; за перезапуск
+      # отвечает сторож живости внутри процесса (выход с кодом 17, на
+      # который уже реагирует restart: unless-stopped).
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+
+  worker:
+    build: ./worker
+    container_name: facewatch-worker
+    logging: *default-logging
+    depends_on:
+      backend:
+        condition: service_started
+      # Воркер заводит пути записи через Control API MediaMTX сразу в первом
+      # же цикле менеджера: без готового API первая синхронизация просто
+      # логировала бы ошибку и ждала следующего тика.
+      mediamtx:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-facewatch}:${POSTGRES_PASSWORD:-facewatch}@postgres:5432/${POSTGRES_DB:-facewatch}
+      REDIS_URL: redis://redis:6379/0
+      RTSP_ENCRYPTION_KEY: ${RTSP_ENCRYPTION_KEY:-ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ=}
+      MEDIA_PATH: /media
+      RETENTION_DAYS: ${RETENTION_DAYS:-14}
+      # Control API MediaMTX: воркер синхронизирует по нему пути слоя записи
+      # (SPEC §20). Порт наружу не публикуется — только внутренняя сеть.
+      # Логин и пароль — в самом адресе: MediaMTX отдаёт Control API
+      # анонимно только с loopback, а воркер приходит из своего
+      # контейнера. Пароль обязан совпадать с MTX_AUTHINTERNALUSERS_1_PASS
+      # сервиса mediamtx выше.
+      MEDIAMTX_API_URL: http://facewatch:${MEDIAMTX_API_PASSWORD:-facewatch-mediamtx-api}@mediamtx:9997
+      # Сторож живости менеджера (§13 «авторестарт сервисов», §19 RTO).
+      # Бюджеты этапов заданы в коде (worker/liveness.py) — они привязаны к
+      # характеру этапа, а не к развёртыванию; наружу вынесена отсрочка
+      # перед убийством: на объекте с медленным дисковым массивом её имеет
+      # смысл увеличить, а WORKER_WATCHDOG_ENABLED=0 отключает сторожа
+      # целиком, если перезапуском заведует внешний супервизор.
+      WORKER_WATCHDOG_ENABLED: ${WORKER_WATCHDOG_ENABLED:-1}
+      WORKER_WATCHDOG_KILL_GRACE_SEC: ${WORKER_WATCHDOG_KILL_GRACE_SEC:-60}
+    volumes:
+      - media:/media
+      # Модели распознавания. В образ они вкладываются на сборке, но том
+      # нужен для изолированного сервера: туда их кладут вручную, если
+      # сборка шла без доступа в интернет. Путь — тот, куда смотрит
+      # InsightFace по умолчанию (~/.insightface у пользователя root).
+      - insightface-models:/root/.insightface
+    healthcheck:
+      # Проверяется живость воркера, а НЕ готовность модели: с цикла 26
+      # отказ загрузки модели не роняет воркер (SPEC §2 — «отказ аналитики
+      # не влияет на запись»), и помечать контейнер нездоровым из-за неё
+      # значило бы уронить запись всех камер из-за неработающей аналитики.
+      # Состояние модели отдаётся полем model_ready того же /health и видно
+      # в «Мониторинге».
+      #
+      # Живость воркера с цикла 38 — это живость МЕНЕДЖЕРА, а не нити
+      # uvicorn, которая обслуживает /health. Раньше эндпоинт отвечал
+      # безусловным {"ok": true} и потому не краснел ровно в том случае,
+      # ради которого healthcheck заведён: менеджер встал, запись не
+      # синхронизируется, сегменты не индексируются, retention не работает
+      # — контейнер «здоров». Теперь /health смотрит на отметки этапов
+      # (worker/liveness.py) и отдаёт 503 с именем зависшего этапа.
+      #
+      # ВАЖНО: сам по себе красный healthcheck контейнер НЕ перезапускает —
+      # Docker лишь метит его unhealthy, на restart: это не влияет. За
+      # перезапуск отвечает сторож живости внутри процесса (он выходит с
+      # кодом 17, и уже на выход реагирует restart: unless-stopped).
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9000/health',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # API поднимается до загрузки модели, поэтому запас нужен только на
+      # старт интерпретатора и импорт cv2/insightface.
+      start_period: 60s
+    restart: unless-stopped
+    # По умолчанию Docker ждёт SIGTERM только 10с и досылает SIGKILL —
+    # graceful shutdown (закрытие VideoCapture по каждой камере) может не
+    # уложиться. Воркер сам ограничивает суммарное ожидание нитей 8с, здесь
+    # оставляем запас. Записи это больше не касается: её ведёт MediaMTX,
+    # рестарт воркера архива не прерывает (SPEC §2).
+    stop_grace_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: '6.0'
+          memory: 4G
+
+  upscaler:
+    build: ./upscaler
+    container_name: facewatch-upscaler
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-facewatch}:${POSTGRES_PASSWORD:-facewatch}@postgres:5432/${POSTGRES_DB:-facewatch}
+      REDIS_URL: redis://redis:6379/0
+      MEDIA_PATH: /media
+      UPSCALE_BACKEND: ${UPSCALE_BACKEND:-gfpgan}
+    volumes:
+      - media:/media
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 3G
+
+  backup:
+    # Официальный образ postgres:16-alpine — версия pg_dump совпадает с
+    # сервером (pgvector/pg16), плюс встроенный busybox crond, отдельный
+    # Dockerfile/образ не нужен (ТЗ 12: ежедневный автобэкап + ручной запуск).
+    image: postgres:16-alpine
+    container_name: facewatch-backup
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-facewatch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-facewatch}
+      POSTGRES_DB: ${POSTGRES_DB:-facewatch}
+      # Cron-выражение расписания бэкапа (по умолчанию — раз в сутки, 03:00).
+      BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 3 * * *}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - ./backup:/backup:ro
+      # По умолчанию именованный том Docker. Для хранения на отдельном диске
+      # или сетевом хранилище (ТЗ 12) переопределите путь через
+      # docker-compose.override.yml, например:
+      #   volumes: { backups: { driver: local, driver_opts: { type: none, o: bind, device: D:/facewatch-backups } } }
+      - backups:/backups
+    entrypoint: ["/backup/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep crond >/dev/null"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  frontend:
+    build: ./frontend
+    container_name: facewatch-frontend
+    logging: *default-logging
+    depends_on:
+      - backend
+    ports:
+      # Хост-порты настраиваемые (см. комментарий у postgres про Windows).
+      - "${FRONTEND_HTTP_HOST_PORT:-8080}:80"
+      # ТЗ 13: TLS/HTTPS доступен по умолчанию — самоподписанный сертификат
+      # генерируется автоматически при первом запуске (docker-entrypoint.sh).
+      - "${FRONTEND_HTTPS_HOST_PORT:-8443}:443"
+    volumes:
+      # Сертификат переживает пересоздание контейнера — иначе браузеру
+      # пришлось бы заново принимать предупреждение при каждом обновлении.
+      - frontend_certs:/etc/nginx/certs
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  media:
+  backups:
+  frontend_certs:
+  # Модели распознавания: вкладываются в образ на сборке, том нужен для
+  # изолированного сервера, куда их кладут вручную (см. INSTALL).
+  insightface-models:

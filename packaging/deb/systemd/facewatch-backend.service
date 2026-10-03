@@ -1,0 +1,48 @@
+[Unit]
+Description=FaceWatch: слой приложения (FastAPI)
+Documentation=file:///usr/share/doc/facewatch/README.md
+After=network-online.target postgresql.service redis-server.service facewatch-first-run.service
+Wants=network-online.target
+# Requires НЕТ намеренно: без БД бэкенд честно падает и перезапускается по
+# Restart=always, а Requires=postgresql.service увёл бы его в inactive при
+# ручном рестарте СУБД и оставил там до вмешательства оператора.
+# А вот на скрипт первого запуска Requires есть: без роли, базы и
+# расширения pgvector стартовать бессмысленно.
+Requires=facewatch-first-run.service
+PartOf=facewatch.target
+
+[Service]
+Type=simple
+User=facewatch
+Group=facewatch
+WorkingDirectory=@PREFIX@/app/backend
+EnvironmentFile=/etc/facewatch/facewatch.env
+# Второй файл ПОСЛЕ первого: в нём асинхронная форма DATABASE_URL для
+# asyncpg, перекрывающая синхронную из общего файла (systemd берёт
+# последнее присваивание). Собрать одну переменную из другой он не умеет,
+# а две формы URL нужны потому, что backend ходит asyncpg'ом, а
+# worker/upscaler — psycopg2.
+EnvironmentFile=/etc/facewatch/backend.env
+# Только loopback: наружу приложение отдаёт nginx, он же держит TLS,
+# rate limiting и заголовки безопасности (SPEC §14).
+ExecStart=@PREFIX@/venv/backend/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8000 --log-config app/logging_config.json
+# SPEC §13. Сторож живости внутри процесса выходит с кодом 17 на
+# заблокированном цикле событий — Restart=always отрабатывает и его.
+Restart=always
+RestartSec=5s
+CPUQuota=200%
+MemoryMax=1G
+# HOME нужен библиотекам, которые кладут кэш рядом с домашним каталогом.
+Environment=HOME=/var/lib/facewatch
+Environment=PYTHONUNBUFFERED=1
+ProtectSystem=strict
+ReadWritePaths=/var/lib/facewatch
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=facewatch.target

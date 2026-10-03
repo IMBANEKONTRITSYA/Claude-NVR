@@ -1,0 +1,12 @@
+[Unit]
+# Один рычаг на всю систему: `systemctl restart facewatch.target` поднимает
+# и роняет все четыре сервиса разом, не заставляя оператора помнить их
+# имена. Слои при этом остаются независимыми (SPEC §2): цель ничего не
+# связывает между собой, у неё нет Requires на сервисы — падение аналитики
+# не тянет за собой запись, и наоборот.
+Description=FaceWatch NVR (все сервисы)
+Documentation=file:///usr/share/doc/facewatch/README.md
+After=network-online.target postgresql.service redis-server.service
+
+[Install]
+WantedBy=multi-user.target

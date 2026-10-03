@@ -1,0 +1,43 @@
+[Unit]
+Description=FaceWatch: слой записи (MediaMTX)
+Documentation=https://github.com/bluenviron/mediamtx
+# Сеть нужна по-настоящему: MediaMTX сам открывает RTSP-соединения к
+# камерам (pull), и старт до поднятия интерфейсов дал бы пачку отказов на
+# каждой камере с последующим переподключением по экспоненте.
+After=network-online.target
+Wants=network-online.target
+PartOf=facewatch.target
+
+[Service]
+Type=simple
+User=facewatch
+Group=facewatch
+# Пароль Control API приходит переменной окружения, а не правкой
+# /etc/facewatch/mediamtx.yml: тот файл — conffile, и подстановка секрета
+# прямо в него означала бы, что dpkg на каждом апгрейде спрашивает
+# оператора, что делать с «изменённой конфигурацией». Механизм родной для
+# MediaMTX (MTX_* перекрывают поля файла) и тот же, что в docker-compose.yml.
+EnvironmentFile=/etc/facewatch/mediamtx.env
+ExecStart=@PREFIX@/bin/mediamtx /etc/facewatch/mediamtx.yml
+# SPEC §13 «авторестарт сервисов». MediaMTX — единственный процесс,
+# пишущий все камеры: его смерть равна остановке всего архива.
+Restart=always
+RestartSec=5s
+# SPEC §26: «Лимиты ресурсов через systemd (CPUQuota/MemoryMax) — аналог
+# лимитов docker-compose». Числа взяты оттуда же (deploy.resources.limits
+# сервиса mediamtx): 4 ядра и 2 ГБ на слой записи.
+CPUQuota=400%
+MemoryMax=2G
+# Архив и сегменты. /opt и / остаются только на чтение.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/facewatch
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# journald собирает stdout/stderr — отдельных файлов логов у сервисов нет
+# (SPEC §26: «Логи: systemd journal»).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=facewatch.target

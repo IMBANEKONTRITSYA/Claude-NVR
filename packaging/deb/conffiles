@@ -1,0 +1,4 @@
+/etc/facewatch/mediamtx.yml
+/etc/nginx/sites-available/facewatch.conf
+/etc/nginx/snippets/facewatch-locations.conf
+/etc/nginx/snippets/facewatch-security-headers.conf

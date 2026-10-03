@@ -1,0 +1,1066 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    # ТЗ 14: "покрытие кода тестами не менее 70% (back-end)". Раньше юнит-тесты
+    # (auth/шифрование/валидация) шли без реальной БД, поэтому обработчики
+    # роутеров почти не покрывались — service-контейнеры дают
+    # tests/test_integration_routes.py настоящий Postgres+Redis, как в
+    # docker-compose.yml (та же образ pgvector/pgvector:pg16), без
+    # необходимости поднимать полный docker compose стек в CI.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facewatch
+          POSTGRES_PASSWORD: facewatch
+          POSTGRES_DB: facewatch_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U facewatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://facewatch:facewatch@localhost:5432/facewatch_test
+      REDIS_URL: redis://localhost:6379/0
+      ALLOW_INSECURE_DEFAULT_SECRETS: "true"
+      # Дефолт settings.MEDIA_PATH ("/media") предполагает контейнер, где он
+      # смонтирован и доступен на запись; на голом раннере это корень ФС,
+      # не пишется от непривилегированного пользователя — TestClient падал
+      # с PermissionError на самом первом os.makedirs() при старте lifespan.
+      MEDIA_PATH: /tmp/facewatch-media
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ffmpeg
+        # Экспорт фрагмента архива (SPEC §5) собирает MP4 вызовом ffmpeg, и
+        # в production-образе бэкенда он есть (backend/Dockerfile). На
+        # раннере GitHub его нет: тесты экспорта аккуратно пропускаются
+        # (skipif на shutil.which), и в этом-то и опасность — прогон
+        # выглядит зелёным, а целая функция ТЗ не проверяется вовсе.
+        # Замерено: без этого шага 20 тестов уходят в skip и покрытие
+        # падает с 77.5% до 74.7%, ниже порога джобы.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install postgresql-client (SPEC §11, бэкап)
+        # Ручной запуск бэкапа снимает дамп настоящим pg_dump
+        # (backend/app/services/backup.py). Без клиента интеграционные
+        # тесты §11 ушли бы в skip — то есть функция ТЗ выглядела бы
+        # проверенной, ни разу не выполнившись, ровно как это было с
+        # ffmpeg выше. Версия обязана быть не старше сервиса pgvector:pg16.
+        run: |
+          sudo apt-get install -y --no-install-recommends postgresql-client-16 \
+            || sudo apt-get install -y --no-install-recommends postgresql-client
+          pg_dump --version
+      - name: Install backend deps
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          # aiosmtpd — лёгкий SMTP-сервер для тестов почты (SPEC §11).
+          # Без него tests/test_integration_smtp.py уходил бы в skip целиком,
+          # то есть почтовый канал алертов не проверялся бы в CI вовсе — тот
+          # же класс молчаливого пропуска, что и ffmpeg выше.
+          pip install -r requirements.txt pytest pytest-cov aiosqlite aiosmtpd
+      - name: Run tests with coverage
+        working-directory: backend
+        # Цикл 5 поднял честное покрытие с 58.9% до 70.9% (тесты
+        # persons/search/reports/ws), но порог CI остался на 55 — разрыв в
+        # 16 п.п. не ловил регресс покрытия. Порог поднят до 68 (чуть ниже
+        # измеренных 71%, запас на мелкие колебания между прогонами), чтобы
+        # CI действительно проваливался при просадке покрытия, а не только
+        # показывал его в отчёте (см. docs/reviews/REVIEW_LOG.md, цикл 6).
+        # Цикл 19: тесты «ссылочных» эндпоинтов (test_query_token_identity.py,
+        # переписанный test_media_rbac.py) подняли покрытие до 76% — порог
+        # поднят до 74, чтобы разрыв с фактическим покрытием снова не рос.
+        # Цикл 21: test_query_param_bounds.py (границы числовых параметров на
+        # 12 эндпоинтах) поднял покрытие до 78% — порог поднят до 76.
+        # Цикл 23: test_startup_migrations.py (блок стартовых миграций на
+        # временной БД) поднял покрытие до 79% — порог поднят до 77.
+        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=77 -q
+
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run pure-logic worker tests
+        working-directory: worker
+        # Полный requirements.txt воркера тянет OpenCV/InsightFace/ONNX Runtime —
+        # слишком тяжело для CI. tests/test_backoff.py и test_onvif_client.py
+        # зависят только от stdlib + defusedxml (лёгкая чистая зависимость,
+        # защита от XML entity expansion — см. onvif_client.py), test_onvif_api.py —
+        # от onvif_api.py, который сознательно вынесен из embed_api.py, чтобы не
+        # тащить за собой cv2/insightface (см. onvif_api.py); fastapi/httpx лёгкие,
+        # cv2/insightface/onnxruntime по-прежнему не ставятся в CI.
+        # Цикл 24: sqlalchemy добавлена ради tests/test_segment_index.py —
+        # индексация сегментов слоя записи ходит в БД, и без неё тест
+        # graceful-скипался бы, то есть production path слоя записи не
+        # проверялся бы в CI вообще (тест сам поднимает SQLite-файл, сервис
+        # Postgres джобе не нужен).
+        run: |
+          python -m pip install --upgrade pip
+          # aiosmtpd: worker/mailer.py — только stdlib, поэтому его тест
+          # (tests/test_mailer.py) выполняется в этой лёгкой джобе, а не
+          # скипается вместе с тестами, которым нужен cv2.
+          pip install pytest fastapi httpx defusedxml sqlalchemy aiosmtpd
+          pytest tests/ -q
+
+  worker-full:
+    runs-on: ubuntu-latest
+    # Наборы воркера, которым нужен настоящий `worker.py` — то есть
+    # cv2/insightface/onnxruntime, Postgres, Redis и MediaMTX.
+    #
+    # **Зачем отдельная джоба: до неё эти наборы не выполнялись в CI ни
+    # разу.** Лёгкая джоба выше ставит только stdlib-часть, поэтому 26
+    # модулей уходят в `pytest.importorskip("worker")` — и признак этого в
+    # выводе джобы неотличим от «тестов нет»: она честно печатает
+    # «572 passed, 44 skipped» и зеленеет. Полный набор — **742 теста**,
+    # то есть 170 из них не исполнялись нигде, кроме машины автора.
+    #
+    # Что именно оставалось непроверенным, стоит перечислить, потому что
+    # список неслучаен. Под `importorskip` лежат сторожа **ровно того
+    # свойства §2**, которое чинили четыре цикла подряд:
+    #
+    # * `test_model_failure_isolation.py` — «отказ аналитики не роняет
+    #   запись» (цикл 22);
+    # * `test_model_load_does_not_block_record_layer.py` — цикл 55;
+    # * `test_cleanup_does_not_block_record_layer.py` — цикл 57;
+    # * `test_quota_does_not_block_record_layer.py` — цикл 59;
+    # * `test_cleanup_status_wiring.py`, `test_quota_status_wiring.py` —
+    #   проводка состояний в §9;
+    #
+    # плюс `test_retention_rotation.py` (§5), `test_motion_recording.py` и
+    # `test_detection_schedule_gating.py` (§6), `test_record_layer_alerts.py`
+    # (§9), `test_camera_worker_resource_release.py` (утечки захватов),
+    # `test_person_dedup_lock.py` (advisory-lock цикла 16).
+    #
+    # Цена — около четырёх минут, из них ~1 минута на установку
+    # requirements воркера, которую джоба `perf` и так платит.
+    #
+    # Лёгкая джоба при этом НЕ отменяется и не поглощается: она держит
+    # отдельное свойство — что `liveness.py`, `cleanup_status.py`,
+    # `model_loader.py` и прочие модули решений остаются на голом stdlib и
+    # проверяются без тяжёлых зависимостей. Полный прогон это свойство не
+    # различает.
+    services:
+      postgres:
+        # Тот же образ, что у джоб backend и perf: одна версия сервера на
+        # весь CI. pgvector здесь нужен по-настоящему — наборы
+        # `test_process_faces_*` пишут эмбеддинги.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facewatch
+          POSTGRES_PASSWORD: facewatch
+          POSTGRES_DB: facewatch_worker_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U facewatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://facewatch:facewatch@localhost:5432/facewatch_worker_test
+      REDIS_URL: redis://localhost:6379/0
+      # Своя база, отдельная от `facewatch_test` бэкенда, и это не
+      # придирка: схемы воркера и бэкенда пересекаются по именам таблиц и
+      # расходятся по колонкам, а `create_all` существующие таблицы не
+      # достраивает. Общая база даёт лавину `UndefinedColumnError`, которая
+      # выглядит как регресс кода (урок цикла 58).
+      MEDIA_PATH: /tmp/facewatch-media
+      # Сторож живости убил бы процесс прогона на медленном раннере.
+      WORKER_WATCHDOG_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Download pinned MediaMTX
+        # Тот же способ и та же привязка к версии, что в record-layer-live:
+        # версия берётся из docker-compose.yml, а не пишется руками.
+        run: |
+          set -euo pipefail
+          VER=$(grep -oP 'image:\s*bluenviron/mediamtx:\K\S+' docker-compose.yml)
+          mkdir -p "$RUNNER_TEMP/mtx"
+          curl -fsSL -o "$RUNNER_TEMP/mtx.tar.gz" \
+            "https://github.com/bluenviron/mediamtx/releases/download/v${VER}/mediamtx_v${VER}_linux_amd64.tar.gz"
+          tar xzf "$RUNNER_TEMP/mtx.tar.gz" -C "$RUNNER_TEMP/mtx" mediamtx
+          echo "MEDIAMTX_BIN=$RUNNER_TEMP/mtx/mediamtx" >> "$GITHUB_ENV"
+      - name: Install full worker deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r worker/requirements.txt
+          pip install pytest httpx aiosmtpd
+      - name: Create pgvector extension and worker schema
+        working-directory: worker
+        # Наборы `test_process_faces_*` идут production path к настоящему
+        # Postgres, но схему не создают: единственный, кто зовёт
+        # `create_all`, — `test_segment_index.py`, и он работает по своему
+        # файлу SQLite. На свежей базе без этого шага они дают
+        # `relation "cameras" does not exist` — не находка в коде, а
+        # непоставленный стенд (урок цикла 59).
+        #
+        # `CREATE EXTENSION` обязателен отдельной строкой: образ
+        # `pgvector/pgvector:pg16` кладёт расширение в систему, но НЕ
+        # включает его в базе. Джоба `backend` обходится без такого шага
+        # только потому, что за неё это делает `lifespan` приложения при
+        # старте; у воркера точки входа, которая бы это сделала, нет —
+        # в бою расширение включает бэкенд. Без строки `create_all` падает
+        # на `type "vector" does not exist` (колонка `persons.centroid`).
+        run: |
+          python - <<'PY'
+          from sqlalchemy import text
+
+          import worker
+
+          with worker.engine.begin() as conn:
+              conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+          worker.Base.metadata.create_all(worker.engine)
+          print("схема воркера создана")
+          PY
+      - name: Run full worker tests
+        working-directory: worker
+        # `-rs` обязателен: без него пропуски видны только числом в итоге, а
+        # весь смысл джобы в том, чтобы их было видно поимённо.
+        #
+        # Проверка ниже — сторож против возврата того самого класса, ради
+        # которого джоба заведена. Она валит прогон, если хоть один модуль
+        # ушёл в skip по причине «нужен полный requirements.txt»: в этой
+        # джобе он поставлен целиком, поэтому такой пропуск означает не
+        # «нечем проверить», а «джоба перестала делать свою работу».
+        #
+        # Единственный законный пропуск здесь — `test_limit_actually_bounds_cpu`
+        # (`ORT_THREAD_LIMIT_TEST=1`): он поднимает настоящую модель и меряет
+        # занятые ядра минутами. Он не подпадает под проверку, потому что
+        # причина у него другая.
+        run: |
+          set -o pipefail
+          pytest tests/ -q -rs | tee /tmp/worker-full.txt
+          if grep -qiE 'SKIPPED.*(полный|требует) requirements' /tmp/worker-full.txt; then
+            echo "::error::Модули ушли в skip по отсутствию requirements воркера — в этой джобе они поставлены целиком."
+            grep -iE 'SKIPPED.*requirements' /tmp/worker-full.txt
+            exit 1
+          fi
+
+  record-layer-live:
+    runs-on: ubuntu-latest
+    # Слой записи против НАСТОЯЩЕГО MediaMTX, а не против двойника Control
+    # API из worker/tests/test_record_layer.py.
+    #
+    # Заведена потому, что двойник уже дважды молча разошёлся с настоящим
+    # сервером, и оба раза это находил не он, а ручной запуск бинарника:
+    # цикл 30 (длительности возвращаются как `5m0s`) и цикл 34 (нулевая
+    # длительность в v1.16.0 — пустая строка, а не `0s`). Оба раза
+    # `test_sync_is_idempotent` был зелёным, а на боевом сервере
+    # синхронизация патчила каждый путь на каждом тике менеджера. Третий
+    # раз ловить это вручную незачем: MediaMTX — статический бинарник, он
+    # ставится и запускается на раннере без Docker.
+    #
+    # Джоба быстрая (~1 минута из-за скачивания бинарника): весь набор
+    # укладывается в 6 секунд, потому что ждёт появления файла, а не
+    # ротации сегмента боевой длительности.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ffmpeg
+        # Нужен дважды: как источник RTSP (публикует синтетический поток в
+        # MediaMTX) и как ffprobe для проверки §24 «только remux».
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Download pinned MediaMTX
+        # Версия обязана совпадать с docker-compose.yml — иначе
+        # проверяется не то, что поедет на объект. Сверку делает сам тест
+        # (test_binary_matches_the_pinned_version), читая docker-compose.yml,
+        # поэтому здесь версия тоже берётся оттуда, а не пишется руками.
+        run: |
+          set -euo pipefail
+          VER=$(grep -oP 'image:\s*bluenviron/mediamtx:\K\S+' docker-compose.yml)
+          echo "MediaMTX $VER"
+          # Распаковка в отдельный каталог обязательна: в корне репозитория
+          # уже есть КАТАЛОГ mediamtx/ (конфигурация сервера), и tar,
+          # доставая файл с тем же именем в cwd, падает с
+          # «mediamtx: Cannot open: File exists».
+          mkdir -p "$RUNNER_TEMP/mtx"
+          curl -fsSL -o "$RUNNER_TEMP/mtx.tar.gz" \
+            "https://github.com/bluenviron/mediamtx/releases/download/v${VER}/mediamtx_v${VER}_linux_amd64.tar.gz"
+          tar xzf "$RUNNER_TEMP/mtx.tar.gz" -C "$RUNNER_TEMP/mtx" mediamtx
+          echo "MEDIAMTX_BIN=$RUNNER_TEMP/mtx/mediamtx" >> "$GITHUB_ENV"
+      - name: Install worker test deps
+        # Только stdlib-часть: тест живёт в том же модуле record_layer.py,
+        # который намеренно не тянет cv2/insightface.
+        run: pip install pytest
+      - name: Run record layer tests against real MediaMTX
+        working-directory: worker
+        # Все наборы `*_live.py`, а не один перечисленный файл: цикл 43
+        # добавил ещё два (статус потока и его восстановление), и оба
+        # проверяют ровно тот класс расхождений с сервером, ради которого
+        # джоба заведена — семантику полей рантайма и поведение
+        # переподключения. Перечислять их руками значило бы, что третий
+        # такой набор молча не поедет в CI.
+        run: pytest tests/test_*_live.py -q
+
+  upscaler:
+    runs-on: ubuntu-latest
+    # До цикла 20 у сервиса апскейла не было ни тестов, ни CI-джобы —
+    # единственный сервис проекта без покрытия вообще, и найденный в цикле
+    # 20 P1 (сессия БД, открытая на всё время инференса) сидел именно там.
+    # Postgres нужен по-настоящему: проверка смотрит в pg_stat_activity и
+    # проверяет, что ротация может удалить строку во время апскейла, —
+    # на моках ни то, ни другое не наблюдаемо.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facewatch
+          POSTGRES_PASSWORD: facewatch
+          POSTGRES_DB: facewatch_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U facewatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://facewatch:facewatch@localhost:5432/facewatch_test
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install upscaler deps (без GFPGAN/torch)
+        working-directory: upscaler
+        # Полный requirements.txt тянет torch/basicsr/gfpgan — гигабайты и
+        # минуты сборки. Сам GFPGAN импортируется лениво, внутри
+        # _load_gfpgan(), поэтому модуль импортируется и тестируется без
+        # него; в тестах enhance() и так подменяется, потому что прогон
+        # модели в CI недопустимо долгий.
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy opencv-python-headless sqlalchemy psycopg2-binary redis pytest
+      - name: Run upscaler tests
+        working-directory: upscaler
+        run: pytest tests/ -q
+
+  perf:
+    runs-on: ubuntu-latest
+    # Бенчмарки горячих путей (SPEC §19, §23, §26): decode FPS, стоимость
+    # префильтра движения, ms/лицо на CPU. Джоба НЕ гейтит мердж по
+    # абсолютным числам и не может: раннер GitHub мощнее целевого сервера
+    # (2× Xeon E5-2670, без AVX2), и любой порог, взятый с него, на
+    # целевом железе не значил бы ничего.
+    #
+    # Смысл в другом: числа печатаются в лог и складываются в артефакт,
+    # чтобы отчёт цикла сравнивал их с прошлым циклом на одинаковом
+    # раннере. Деградация больше 15% — carryover P2, решение принимает
+    # цикл, а не CI.
+    #
+    # continue-on-error: бенчмарк не должен ронять мердж функциональной
+    # правки, если ffmpeg на раннере повёл себя иначе.
+    continue-on-error: true
+    defaults:
+      run:
+        # `pipefail` на всю джобу, и это не косметика.
+        #
+        # Почти каждый шаг здесь оканчивается `| tee perf-*.txt`. Шелл
+        # GitHub Actions по умолчанию — `bash -e {0}`, **без** `pipefail`:
+        # код возврата конвейера берётся от последней команды, то есть от
+        # `tee`, который успешен всегда. Упавший бенчмарк отчитывался
+        # зелёным шагом и пустым артефактом.
+        #
+        # Это не гипотеза. Цикл 55 обнаружил так **два** молчащих замера
+        # сразу: `bench_rto.py --hang-only` (§13, §19 RTO — драйвер падал
+        # на `import uvicorn`, стоящем в цепочке `app.liveness`) и
+        # собственный новый `bench_model_load_stall.py` (падал на
+        # `import redis`). Первый молчал не один цикл, а отчёты всё это
+        # время ссылались на его число как на измеренное.
+        #
+        # `-u` намеренно НЕ включается: шаги ссылаются на переменные,
+        # которых на форк-прогонах может не быть, и падение по ним было бы
+        # новым классом ложной красноты вместо ложной зелени.
+        #
+        # **Поведение джобы при этом меняется, и это осознанный размен.**
+        # Раньше упавший в конвейере бенчмарк не останавливал ничего:
+        # следующие шаги шли своим чередом, потому что шаг числился
+        # успешным. Теперь первый упавший бенчмарк валит джобу, и
+        # оставшиеся замеры этого прогона не собираются.
+        #
+        # Размен в пользу этого варианта: мердж джоба всё равно не гейтит
+        # (`continue-on-error` выше), поэтому цена красноты — потерянные
+        # числа одного прогона, а цена прежнего поведения — числа,
+        # потерянные НАВСЕГДА и незаметно (замер §13/§19 RTO молчал так не
+        # один цикл). Если когда-нибудь захочется собирать все замеры
+        # несмотря на падения — это `continue-on-error: true` на каждом
+        # шаге по отдельности; учтите, что тогда джоба снова станет
+        # зелёной при упавших шагах, и признаком поломки останется только
+        # чтение списка шагов.
+        shell: bash -eo pipefail {0}
+    services:
+      # Только ради `bench_segment_scan.py` (цикл 53): проход индексации
+      # архива меряется вместе с его запросами к БД, а на SQLite «до
+      # правки» вообще не выполнимо — там `IN` со всеми путями каталога
+      # упирается в предел числа параметров, которого у Postgres нет.
+      # Образ тот же, что у джобы backend, хотя pgvector этому замеру не
+      # нужен: одна версия сервера на весь CI.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facewatch
+          POSTGRES_PASSWORD: facewatch
+          POSTGRES_DB: facewatch_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U facewatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://facewatch:facewatch@localhost:5432/facewatch_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Install bench deps
+        # insightface — ради группы `chain`: она единственная отвечает на
+        # §19 «детекция ≥ 5 FPS/канал» и §16 «0.5-1.5 ядра на камеру»
+        # целиком, на настоящей модели. До цикла 36 группа в CI не гонялась
+        # вовсе, и оба норматива отслеживались только замерами вручную из
+        # песочницы — то есть между циклами не сравнивались никак.
+        #
+        # **Ставится `worker/requirements.txt` целиком, а не список пакетов
+        # руками.** Список руками пробовался в цикле 55 и разошёлся с
+        # реальной цепочкой импорта **дважды подряд**: сперва не хватило
+        # `redis`, потом — `scikit-learn`. Оба раза это всплывало только в
+        # CI и только после того, как `pipefail` перестал прятать падение.
+        # Файл требований — единственный источник, который не разъезжается
+        # с кодом, потому что по нему же собирается production-образ.
+        # Побочная польза: бенчмарки идут на **тех же пинах**, что поедут
+        # на объект, а не на «свежайшем с PyPI».
+        #
+        # Кому это нужно из замеров:
+        #
+        # * `bench_model_load_stall.py` импортирует настоящий `worker` —
+        #   иначе он мерил бы не менеджер воркера, а свою заглушку;
+        # * `bench_rto.py --hang-only` поднимает драйвер, который тянет
+        #   `app.liveness` → `app.logging_utils` → `uvicorn.logging`
+        #   (`uvicorn` есть в требованиях воркера). Без него драйвер умирал
+        #   молча — его stderr уходит в DEVNULL, — а замер печатал «драйвер
+        #   замера не дошёл до блокировки» и выходил с ненулевым кодом,
+        #   который съедал `tee`. §13/§19 RTO не считался в CI не один цикл.
+        #
+        # `onnx` и `scikit-image` в требованиях воркера отсутствуют: они
+        # нужны только группам `bench.py` и ставятся отдельно.
+        run: |
+          pip install -r worker/requirements.txt
+          pip install onnx scikit-image
+      - name: Run benchmarks
+        run: python perf/bench.py --json | tee perf-results.json
+      - name: Measure hang detection (SPEC §13, §19 RTO)
+        # Слагаемое RTO для класса отказа «сервис жив и не отвечает».
+        # Postgres и Redis не нужны — замер поднимает настоящего сторожа
+        # живости над настоящим заблокированным циклом событий и берёт
+        # время до выхода процесса, поэтому идёт в этой джобе.
+        #
+        # Смысл его в CI — не порог, а отслеживание: до цикла 38 механизма
+        # не было вовсе, а замер отчитывался числом из healthcheck, которое
+        # ни к чему не приводило (Docker по красному healthcheck контейнер
+        # не перезапускает). Число сравнивается циклом с прошлым.
+        run: python perf/bench_rto.py --hang-only | tee perf-rto-hang.txt
+
+      - name: Measure remux cost on real MediaMTX (SPEC §19, §16)
+        # §19 «remux ≤ 0.04 ядра/камера» и вилка §16, на которой стоит вся
+        # автоконфигурация (autoconfig.REC_CORES_PER_CAMERA). Замер
+        # существовал с цикла 32, но в CI не был подключён — то есть между
+        # циклами не отслеживался, хотя это удельная стоимость всего слоя
+        # записи.
+        #
+        # `--pull` — продакшн-конфигурация: MediaMTX сам открывает
+        # RTSP-соединение к камере. Прежний режим (push) её не покрывал, и
+        # это было записано как known gap; замерено, что клиент RTSP
+        # добавляет ~55 % CPU на камеру, то есть прежнее число занижало
+        # боевую стоимость.
+        run: |
+          set -euo pipefail
+          VER=$(grep -oP 'image:\s*bluenviron/mediamtx:\K\S+' docker-compose.yml)
+          mkdir -p "$RUNNER_TEMP/mtx"
+          curl -fsSL -o "$RUNNER_TEMP/mtx.tar.gz" \
+            "https://github.com/bluenviron/mediamtx/releases/download/v${VER}/mediamtx_v${VER}_linux_amd64.tar.gz"
+          tar xzf "$RUNNER_TEMP/mtx.tar.gz" -C "$RUNNER_TEMP/mtx" mediamtx
+          pip install psutil
+          MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
+            python perf/bench_remux.py --pull --quick 1 4 8 | tee perf-remux.txt
+
+      - name: Measure record-layer stall caused by model load (SPEC §2)
+        # §2 требует, чтобы «падение/деградация одного слоя не затрагивала
+        # другой». Отказ загрузки модели закрыт с цикла 22 и проверяется
+        # тестами; деградация — медленная загрузка — не проверялась ничем
+        # до цикла 55, а стоила слою записи ровно столько же, сколько
+        # длится загрузка (замер 1:1).
+        #
+        # Число здесь — не порог, а сторож приёма: пока загрузка идёт в
+        # своей нити, `stall_sec` равен длительности загрузки только в
+        # синхронном варианте, а в боевом обязан оставаться около нуля.
+        # Возврат синхронной загрузки виден в этой строке сразу.
+        #
+        # Держим 20 секунд, а не боевые минуты: зависимость измерена
+        # линейной, и удлинение прогона ничего не добавляет.
+        run: python perf/bench_model_load_stall.py --hold 20 | tee perf-model-load-stall.txt
+
+      - name: Measure record-layer stall caused by archive cleanup (SPEC §2, §5)
+        # Тот же класс, что и замер выше, и добавлен ровно тем же способом
+        # (цикл 55 нашёл ложную зелень «замер прошёл, но ничего не мерил» —
+        # прогоняем свой замер и здесь).
+        #
+        # `cleanup_old` — единственный этап прохода менеджера без предела
+        # на объём работы: у циклической перезаписи `LIMIT 5000`, у уборки
+        # по движению `LIMIT 1000`, а retention берёт всё просроченное.
+        # На 120 камерах суточная порция — десятки тысяч `unlink()` по HDD,
+        # и пока она шла в нити менеджера, столько же не выполнялась
+        # циклическая перезапись — на переполненном томе запись встала бы
+        # целиком.
+        #
+        # Число здесь тоже не порог, а сторож приёма: пока уборка идёт в
+        # своей нити (`start_cleanup_pass`), `stall_sec` равен длительности
+        # уборки только в синхронном варианте, а в боевом обязан оставаться
+        # около нуля. Возврат вызова `cleanup_old()` в тело `manager()`
+        # виден в этой строке сразу.
+        run: python perf/bench_cleanup_stall.py --hold 20 | tee perf-cleanup-stall.txt
+
+      - name: Measure record-layer stall caused by disk quota (SPEC §2, §5)
+        # Тот же класс, что два замера выше, и последний этап прохода
+        # менеджера, переживший обе правки: строка `"disk_quota": 900.0`
+        # осталась в таблице бюджетов сторожа живости страницей ниже
+        # объяснения, почему такой строки там быть не должно.
+        #
+        # Отличия от уборки — все не в пользу прежнего порядка. Уборка идёт
+        # раз в час, перезапись — каждым проходом менеджера (~10 с), и ровно
+        # потому, что «между часовыми проходами 120 камер успевают дописать
+        # ~108 ГБ»: пока том переполнен, долгий проход не эпизод, а
+        # установившийся режим. `LIMIT 5000` ограничивает строки, а не
+        # время: это до 10 000 `unlink()` по HDD.
+        #
+        # Число здесь тоже не порог, а сторож приёма: пока перезапись идёт в
+        # своей нити (`start_quota_pass`), `stall_sec` равен её длительности
+        # только в синхронном варианте, а в боевом обязан оставаться около
+        # нуля. Возврат вызова `enforce_disk_quota()` в тело `manager()`
+        # виден в этой строке сразу. Обе самопроверки замера (синхронный
+        # обязан прождать, асинхронный обязан НЕ прождать) роняют шаг сами.
+        run: python perf/bench_quota_stall.py --hold 20 | tee perf-quota-stall.txt
+
+      - name: Measure stream recovery after a break (SPEC §19)
+        # §19 «Запись: восстановление потока ≤ 5 секунд после обрыва» —
+        # норматив, который до цикла 40 не измерялся ни разу. RTO циклов
+        # 38-39 мерил восстановление СЕРВИСА (падение процесса, зависание),
+        # а это другой отказ: при обрыве потока запись не падает, она
+        # перестаёт писать одну камеру, и вопрос в том, сколько архива
+        # теряется сверх самого обрыва.
+        #
+        # Меряется добавка системы: от момента, когда камера снова отдаёт
+        # поток, до момента, когда файл этой камеры снова растёт. Обрыв
+        # берётся разной длительности, потому что §2/§13 обещают
+        # «экспоненциальную задержку»: если бы она росла, короткий обрыв
+        # укладывался бы в норматив, а длинный — нет.
+        #
+        # С цикла 43 замер идёт ДВАЖДЫ: боевая конфигурация (супервизор
+        # восстановления включён) и прежняя, без него. Одного числа мало —
+        # выигрыш супервизора и разброс раннера иначе неразличимы, а
+        # сравнивать с числом прошлого цикла можно только внутри одной
+        # модели CPU (carryover циклов 39-41).
+        #
+        # Бинарник MediaMTX уже скачан шагом замера remux выше.
+        run: |
+          MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
+            python perf/bench_recovery.py | tee perf-recovery.txt
+          MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
+            python perf/bench_recovery.py --no-supervisor | tee perf-recovery-baseline.txt
+
+      - name: Measure segment continuity (SPEC §19, «0 пропущенных сегментов»)
+        # Последний норматив §19, который не измерялся ни разу за 49 циклов.
+        # Остальные меряются одним процессом, а этот требует, чтобы
+        # настоящий MediaMTX несколько раз перевернул сегмент на настоящем
+        # потоке: норматив нарушается на СТЫКЕ файлов, и ни двойник Control
+        # API, ни `test_segments_land_in_the_configured_media_root` (он
+        # считает файлы, а не секунды) этого места не касаются.
+        #
+        # Считаются секунды потерянного видео: имя файла даёт начало
+        # сегмента, ffprobe — фактическую длительность, разница на стыке —
+        # разрыв. Минутный сегмент вместо боевого пятиминутного (§20) —
+        # единственное отклонение, и оно консервативно: за три минуты
+        # выходит три переворота вместо половины одного.
+        #
+        # Ненулевой код возврата валит джобу по той же причине, что и
+        # batch-outage ниже: пропуски записи не видны ни в одном
+        # функциональном тесте, а восстанавливать по ним архив уже поздно.
+        #
+        # Бинарник MediaMTX скачан шагом замера remux выше.
+        run: |
+          MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
+            python perf/bench_segment_continuity.py --minutes 3 \
+            | tee perf-segment-continuity.txt
+
+      - name: Run batch-outage recovery benchmark
+        # Тот же норматив §19, но на отказе, ради которого он и написан:
+        # моргнул коммутатор и отвалились все камеры разом. Замер цикла 43
+        # мерил одну камеру и потому не видел очередь в пуле опроса — на
+        # 120 молчащих камерах вернувшаяся ждала 16.4 с при бюджете в 5 с.
+        #
+        # MediaMTX здесь не нужен: «камеры» — локальные сокеты, а Control
+        # API двойник. Меряется момент, когда до пересоздания пути дошла
+        # очередь, а сколько его исполняет сам MediaMTX, замерил шаг выше.
+        #
+        # Ненулевой код возврата означает нарушение §19 и валит джобу: это
+        # тот случай, когда «замерили и записали в отчёт» недостаточно —
+        # регрессия здесь не видна ни в одном функциональном тесте.
+        #
+        # Размеры включают 600 — вдвое больше верха диапазона §1 («от 12
+        # до 250+»). До цикла 48 опрос упирался в потолок пула нитей
+        # (256), и на 600 камерах замер давал 6.4 с, то есть §19
+        # нарушался; неблокирующий проход (`stream_recovery.probe_many`)
+        # укладывает любой размер в один таймаут. Без этой точки регрессия
+        # вернулась бы незамеченной: на 250 камерах оба прохода зелёные.
+        run: |
+          python perf/bench_recovery_batch.py --cameras 1 30 120 250 600 \
+            | tee perf-recovery-batch.txt
+
+      - name: Run analytics chain benchmark
+        # Отдельным шагом, потому что тянет модель `buffalo_s` (~125 МБ) из
+        # сети: отказ скачивания помечается в результате как `skipped` и не
+        # должен уносить остальные группы, уже сложенные в артефакт выше.
+        # --repeat 3: одиночный прогон на общем раннере GitHub гуляет ±20 %
+        # при нетронутом коде аналитики (цикл 36 → 37 → 38: 8.17 → 6.41 →
+        # 6.75 FPS, ни один PR тех циклов не касался пути аналитики), и это
+        # измерено напрямую: три прогона подряд одного и того же кода дали
+        # разброс 16.6 %. Правило «деградация > 15 % — carryover P2» на
+        # одиночном числе срабатывало от шума и промолчало бы о настоящей
+        # просадке той же величины. Медиана из трёх плюс печать разброса.
+        run: python perf/bench.py --only chain --repeat 3 --json | tee perf-chain.json
+
+      - name: Measure face-feed ACL filter cost (SPEC §18 на горячем пути §4)
+        # Фильтр ленты лиц по роли (цикл 51) стоит на пути, по которому
+        # сообщение `box` уходит на КАЖДЫЙ кадр каждой камеры analytics —
+        # иначе живая сетка §4 рисовала бы рамку с задержкой. Ролям с
+        # карточками персон он отдаёт исходную строку без разбора,
+        # наблюдателю — разбирает JSON и собирает подмножество полей.
+        # Шаг сторожит, чтобы эта пересборка не выросла в статью расхода:
+        # замер печатает долю ядра при 600 сообщ/с, то есть на потолке
+        # §19 (120 камер × 5 FPS).
+        run: python perf/bench_face_feed_acl.py --json | tee perf-face-acl.json
+
+      - name: Measure the cost of stream FPS and bitrate (SPEC §9)
+        # FPS и битрейт потоков записи (цикл 52) считаются в проходе
+        # менеджера — том же, который синхронизирует пути записи и ставит
+        # статусы камер. Битрейт бесплатен (арифметика над уже полученным
+        # счётчиком), а FPS снимается ffprobe и стоит ~65 мс на сегмент,
+        # поэтому число проб на проход ограничено бюджетом. Шаг сторожит
+        # именно бюджет: без него объект, у которого сегменты
+        # перевернулись одновременно (общий рестарт MediaMTX), получил бы
+        # ~7.5 с проб в проходе, идущем раз в 5 секунд. Замер завершается
+        # ненулевым кодом, если худший проход дороже 1.5 с.
+        run: python perf/bench_stream_rate.py --json | tee perf-stream-rate.json
+
+      - name: Measure the cost of an archive indexing pass (SPEC §5, §19)
+        # Шаг индексации идёт в цикле менеджера каждые ~10 с и обходит
+        # каталог архива целиком. Каталог плоский, его размер —
+        # retention × камеры × сегменты в сутки, то есть при значениях по
+        # умолчанию (30 суток, 120 камер, сегменты по 5 минут) больше
+        # миллиона файлов. Замер цикла 53 на таком каталоге: **16.7 с на
+        # проход**, то есть проход дольше собственного интервала и 167 %
+        # ядра постоянно; с отсечкой «докуда архив уже заполнен» — 1.0 с.
+        #
+        # В CI каталог уменьшен до 17 280 файлов (20 камер × 3 суток):
+        # миллион файлов на раннере это ~2 ГБ и лишние минуты, а сторожить
+        # надо не миллисекунды раннера, а само отношение — сломайся
+        # отсечка, оно схлопывается к 1.1× (проверено откатом). Порог 3×
+        # с запасом ниже 8.3×, которые шаг даёт на этом размере.
+        run: |
+          pip install sqlalchemy psycopg2-binary
+          python perf/bench_segment_scan.py --cameras 20 --days 3 --min-speedup 3
+
+      - name: Compare analytics concurrency models (SPEC §17)
+        # Слой аналитики устроен на нитях с общей моделью, и это решение
+        # держится на замере, а не на рассуждении: цикл 40 прогнал ту же
+        # цепочку K каналами сразу — нитями и процессами — и получил
+        # одинаковую полезную работу на ядро при 2.6-кратной разнице в
+        # памяти. Шаг сторожит именно это: если правка пути аналитики
+        # заставит каналы сериализоваться под GIL, `fps_per_core` у нитей
+        # просядет относительно процессов в том же прогоне.
+        #
+        # Две точки по 10 с (а не полный набор 1/2/4 по 20 с): смысл в
+        # сравнении режимов между собой ВНУТРИ одного прогона на одном
+        # раннере, а не в абсолютных числах — их с общего пула GitHub
+        # сравнивать между циклами всё равно нельзя (цикл 39: 58 % разницы
+        # от смены модели CPU раннера).
+        run: python perf/bench_scaling.py --channels 2 --seconds 10 --json | tee perf-scaling.json
+
+      - name: Measure both layers under load (SPEC §19 CPU, §2 независимость)
+        # Первый замер проекта, в котором слои работают ОДНОВРЕМЕННО.
+        # Все прежние меряли их порознь: `bench_remux.py` — запись при
+        # простаивающей аналитике, `bench.py --only chain` и
+        # `bench_scaling.py` — аналитику при отсутствующей записи. Два
+        # утверждения ТЗ из раздельных замеров не следуют вовсе:
+        #
+        #   §19 «CPU ≤ 80 % при полной нагрузке» — величина про машину, а
+        #   не про процесс, и до цикла 41 числилась как «не измерено»;
+        #   §2 «Отказ аналитики НЕ влияет на запись» — ОТКАЗ проверялся
+        #   остановкой воркера, а ДЕГРАДАЦИЯ под нагрузкой — нет. Вопрос
+        #   не «переживёт ли запись падение аналитики», а «не начнёт ли
+        #   она терять сегменты, когда аналитика займёт процессор».
+        #
+        # Замер идёт двумя фазами на одном наборе камер (только запись →
+        # запись + аналитика) и сравнивает их: удельное CPU записи, темп
+        # прироста архива в МБ/с и FPS каналов. Просадка темпа архива
+        # больше 5 % во второй фазе означала бы, что аналитика вытесняет
+        # запись, то есть §2 не выполняется.
+        #
+        # Бинарник MediaMTX уже скачан шагом замера remux выше.
+        run: |
+          MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
+            python perf/bench_load.py --cameras 8 --analytics 2 --json | tee perf-load.json
+
+      - name: Measure how memory scales with camera count (SPEC §16)
+        # На числах этого замера стоит калькулятор ресурсов
+        # (`backend/app/services/autoconfig.py`): он говорит
+        # администратору, сколько камер держит его сервер. До цикла 47 он
+        # брал верх вилок §16 (100 МБ и 2048 МБ на камеру) как удельную
+        # константу — а обе вилки писались под раскладку «процесс на
+        # камеру», которой в реализации нет: запись ведёт один MediaMTX
+        # на все камеры, аналитика — нити с общей моделью. На сервере из
+        # §20 с 32 ГБ это давало 4 канала аналитики там, где по
+        # процессору проходит 29.
+        #
+        # Здесь меряется НАКЛОН, а не точка: RSS при нескольких значениях
+        # N, приближение прямой `база + наклон × N`, и наружу отдаётся
+        # верхняя доверительная граница наклона. Замер отказывается
+        # отдавать её вовсе, если расход растёт быстрее прямой, — то есть
+        # если экстраполировать нельзя.
+        #
+        # Повторов здесь меньше, чем в замере цикла 47 (8): полный прогон
+        # идёт около 20 минут, а джобе нужен сторож регрессии, а не
+        # публикуемое число. Три повтора достаточны, чтобы поймать уход
+        # наклона в разы; уточнять константы калькулятора надо длинным
+        # прогоном и вручную.
+        run: |
+          MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
+            python perf/bench_ram_scaling.py --record-points 2,4,8 \
+              --analytics-points 1,2,3 --repeat 3 --measure 8 \
+              --json | tee perf-ram-scaling.json
+
+      - name: Measure live latency to the browser (SPEC §4, §19 ≤ 3 с)
+        # Норматив «задержка live ≤ 3 секунд» — про то, что видит
+        # оператор, то есть про всю цепочку до картинки на экране. Цикл 33
+        # померил только серверную часть (160 мс до отдачи сегмента) и
+        # записал в carryover, что два слагаемых из трёх требуют браузера;
+        # с тех пор норматив 12 циклов числился незакрытым. Здесь он
+        # меряется целиком: ffmpeg → MediaMTX → LL-HLS → Chrome + hls.js →
+        # <video>, по мигающему кадру, без OCR.
+        #
+        # Chrome, а не chromium из apt: поток несёт H.264, а сборки без
+        # проприетарных кодеков его не декодируют — замер упёрся бы не в
+        # задержку, а в отсутствие кодека. На раннерах GitHub Chrome
+        # предустановлен.
+        #
+        # hls.js берётся из frontend/node_modules: плеер обязан быть тем
+        # же, что у оператора, иначе меряется чужой профиль буфера.
+        #
+        # Ненулевой код возврата означает нарушение §4/§19 и валит джобу
+        # (в пределах continue-on-error всей джобы): регрессия задержки не
+        # видна ни в одном функциональном тесте.
+        run: |
+          set -euo pipefail
+          pip install playwright
+          (cd frontend && npm ci --no-audit --no-fund)
+          MEDIAMTX_BIN="$RUNNER_TEMP/mtx/mediamtx" \
+          BENCH_CHROMIUM="$(command -v google-chrome || command -v google-chrome-stable)" \
+            python perf/bench_live_latency.py --json | tee perf-live-latency.json
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results
+          path: |
+            perf-results.json
+            perf-chain.json
+            perf-face-acl.json
+            perf-scaling.json
+            perf-load.json
+            perf-ram-scaling.json
+            perf-rto-hang.txt
+            perf-model-load-stall.txt
+            # `perf-cleanup-stall.txt` собирался с цикла 57, но в этот список
+            # не попал — то есть выкладывался в лог шага и нигде не
+            # сохранялся. Добавлен вместе с парным ему `perf-quota-stall.txt`.
+            perf-cleanup-stall.txt
+            perf-quota-stall.txt
+            perf-remux.txt
+            perf-recovery.txt
+            perf-recovery-baseline.txt
+            perf-recovery-batch.txt
+            perf-segment-continuity.txt
+            perf-live-latency.json
+
+  # Опрос живой системы БРАУЗЕРОМ через НАСТОЯЩИЙ nginx (см. e2e/README.md).
+  #
+  # Между обработчиком и оператором стоят три звена, которых нет ни в одной
+  # джобе выше: боевые frontend/nginx*.conf, собранный бандл фронтенда и сам
+  # браузер с его форматами запросов, куками и WebSocket'ом. Два цикла
+  # подряд дефекты находились ровно там, и оба раза — разовым ручным
+  # опросом, а не CI:
+  #
+  #   цикл 62: 16 эндпоинтов отвергали штатный Authorization: Bearer (422);
+  #            nginx ходил к бэкенду по HTTP/1.0 без пула соединений;
+  #   цикл 63: журнал аудита писал "?" вместо имени на КАЖДОМ входе через
+  #            веб-интерфейс (§10, §14) — браузер шлёт форму как multipart,
+  #            а middleware разбирала тело parse_qs, понимающим только
+  #            urlencoded.
+  #
+  # Общий класс — «тест написан под тот транспорт, который работает».
+  # Джоба переводит опрос из разового в регулярный: до неё конфиги nginx
+  # сторожили статические проверки текста файла, а nginx -t зелен и при
+  # полностью неработающей директиве (замерено, цикл 62).
+  ui-live:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facewatch
+          POSTGRES_PASSWORD: facewatch
+          POSTGRES_DB: facewatch_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U facewatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://facewatch:facewatch@127.0.0.1:5432/facewatch_e2e
+      REDIS_URL: redis://127.0.0.1:6379/0
+      E2E_BASE_URL: http://127.0.0.1:8080
+      E2E_ADMIN_PASSWORD: E2eProbeAdmin!2026
+      ADMIN_PASSWORD: E2eProbeAdmin!2026
+      SECRET_KEY: e2e-probe-secret-key-long-enough-0123456789abcdef
+      # Нехватка playwright/psycopg2/redis обязана валить джобу, а не
+      # уводить сьют в skip: молчаливый пропуск означал бы «опрос
+      # проведён», ни разу не выполнившись, — тот же класс ложного
+      # зелёного, из-за которого джоба backend отдельно ставит ffmpeg.
+      E2E_STRICT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install nginx
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nginx openssl
+      - name: Install backend deps
+        run: pip install -r backend/requirements.txt pytest psycopg2-binary httpx
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps && npm run build
+      - name: Bring up the stack (real nginx in front of a real backend)
+        run: ./e2e/run-stack.sh
+      - name: Probe the live UI with a browser
+        run: pytest e2e -q
+      - name: Диагностика при падении
+        if: failure()
+        run: |
+          echo "--- nginx access log ---"
+          sudo tail -50 /tmp/facewatch-e2e/logs/nginx-access.log || true
+          echo "--- backend log ---"
+          tail -80 /tmp/facewatch-e2e/logs/backend.log || true
+          echo "--- собранный конфиг nginx ---"
+          sudo cat /etc/nginx/conf.d/facewatch.conf || true
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+      # SPEC §21 перечисляет JS-тестраннер в стеке, но до цикла 28 его в
+      # проекте не было вовсе: логика интерфейса проверялась только
+      # статическими проверками из backend/tests, которые видят текст
+      # файла, а не поведение. Первый набор — раскладка стены и цифровой
+      # зум (§4): сколько плиток реально попадёт на экран, тестом видно, а
+      # чтением исходника — нет.
+      - name: Unit tests
+        working-directory: frontend
+        run: npm test
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pip-audit
+        run: pip install pip-audit
+      # -r читает requirements.txt напрямую (без установки тяжёлых ML-пакетов
+      # воркера) и резолвит версии против БД уязвимостей PyPI/OSV.
+      - name: Audit backend dependencies
+        run: |
+          pip-audit -r backend/requirements.txt --ignore-vuln PYSEC-2026-1325
+      - name: Audit worker dependencies
+        run: |
+          pip-audit -r worker/requirements.txt --ignore-vuln PYSEC-2026-1325
+      # PYSEC-2026-1325 — таймингова атака Minerva в чистом Python-бэкенде
+      # пакета ecdsa (транзитивная зависимость python-jose). Апстрим не
+      # выпускает фикс (архитектурное ограничение), а FaceWatch подписывает
+      # JWT только алгоритмом HS256 (симметричный HMAC) — код ecdsa вообще
+      # не выполняется. Игнорируем предметно, а не глобально.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+      # npm audit не блокирует сборку: оставшиеся находки — esbuild/vite
+      # (уязвимость только dev-сервера, не собранного билда) и react-router
+      # RSC-режим (проект не использует React Server Components/framework
+      # mode, только клиентский declarative-роутинг) — не применимы к
+      # продакшен-развёртыванию, но остаются видимыми в логе CI.
+      - name: Audit frontend dependencies (report only)
+        working-directory: frontend
+        continue-on-error: true
+        run: npm audit --audit-level=moderate
+
+  # SPEC.md §14: "Нагрузочное тестирование: сценарий на 16 камер, проверка
+  # стабильности FPS и задержек". loadtest/locustfile.py закрывает API-слой
+  # этого требования (см. loadtest/README.md для честных границ теста —
+  # не покрывает реальную RTSP-декодировку/инференс воркера, нужны физические
+  # камеры/GPU). Рекомендация цикла 13 (docs/reviews/REVIEW_LOG.md): держать
+  # это необязательным workflow_dispatch-джобом, а не частью обычного
+  # push/PR-конвейера — прогон занимает минуты, а не секунды, и не должен
+  # блокировать обычную разработку. Запускается вручную из вкладки Actions
+  # или через `gh workflow run ci.yml`.
+  loadtest:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: facewatch
+          POSTGRES_PASSWORD: facewatch
+          POSTGRES_DB: facewatch_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U facewatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://facewatch:facewatch@localhost:5432/facewatch_test
+      REDIS_URL: redis://localhost:6379/0
+      ALLOW_INSECURE_DEFAULT_SECRETS: "true"
+      MEDIA_PATH: /tmp/facewatch-media
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install backend deps + locust
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt locust
+      - name: Start backend
+        working-directory: backend
+        run: |
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/backend.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/api/health && exit 0
+            sleep 1
+          done
+          echo "backend did not become healthy in time"
+          cat /tmp/backend.log
+          exit 1
+      - name: Run 16-camera load test (SPEC 14)
+        run: |
+          locust -f loadtest/locustfile.py --headless \
+              -u 16 -r 4 -t 2m \
+              --host http://127.0.0.1:8000 \
+              --csv loadtest/results/ci-run \
+              --exit-code-on-error 1
+      - name: Show backend log on failure
+        if: failure()
+        run: cat /tmp/backend.log || true
+      - name: Upload load test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-results
+          path: loadtest/results/
+          retention-days: 14
