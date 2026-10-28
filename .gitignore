@@ -11,6 +11,21 @@ htmlcov/
 loadtest/results/
 dump.rdb
 
+# Local deployment probes, credentials-adjacent logs, footage and backups.
+/.local/
+/network-*.json
+/deploy-*.json
+/deploy-*.log
+/mediamtx-*.log
+/*-results.log
+/perf-host-*.json
+/perf-host-*.log
+/playwright-install.log
+/e2e-dependencies.log
+/e2e-actions-retest.log
+/.pytest_cache/
+/scripts/local-*
+
 # Самоподписанные сертификаты, которые MediaMTX генерирует рядом с собой
 # при ручном запуске из корня репозитория (замеры, отладка слоя записи).
 # Тесты и бенчмарки запускают его из своего каталога (cwd=), это страховка.
