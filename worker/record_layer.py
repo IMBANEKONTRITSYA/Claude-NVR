@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -434,6 +435,16 @@ SEGMENT_JOIN_TOLERANCE_SEC = 2.0
 
 _FFPROBE_TIMEOUT_SEC = 10.0
 
+# Сколько времени один проход индексации может потратить на ffprobe.
+# Индексация идёт в цикле менеджера, а ffprobe стоит ~56 мс на файл
+# (замерено в песочнице; на одном ядре E5-2670 — дольше): массовый обрыв —
+# перезагрузка коммутатора — дал бы по вызову на камеру подряд, то есть
+# 6.7 с на 120 камерах и 14 с на 250, и всё это время цикл не публиковал бы
+# статусы и не синхронизировал запись. Сверх бюджета граница берётся по
+# mtime: она завышает длительность меньше чем на часть (~1 с), а разрыв
+# остаётся видимым — точность падает на секунду, а не на обрыв.
+PROBE_BUDGET_SEC = 1.0
+
 
 def probe_media_duration(path: str) -> float | None:
     """Фактическая длительность видео в файле по ffprobe, либо None.
@@ -492,7 +503,8 @@ def segment_end(started: float, next_started: float | None, mtime: float,
 def collect_complete_segments(segments_dir: str, now: float,
                               settle_sec: float = SEGMENT_SETTLE_SEC,
                               after: dict[int, float] | None = None,
-                              probe=probe_media_duration) -> list[dict]:
+                              probe=probe_media_duration,
+                              probe_budget_sec: float = PROBE_BUDGET_SEC) -> list[dict]:
     """Дописанные сегменты слоя записи, готовые к занесению в архив.
 
     Признак «дописан» двойной, и оба нужны:
@@ -523,6 +535,17 @@ def collect_complete_segments(segments_dir: str, now: float,
         return []
 
     after = after or {}
+    budget = [probe_budget_sec]
+
+    def budgeted_probe(path: str):
+        if budget[0] <= 0:
+            return None
+        started = time.monotonic()
+        try:
+            return probe(path)
+        finally:
+            budget[0] -= time.monotonic() - started
+
     by_cam: dict[int, list[tuple[int, str]]] = {}
     for name in names:
         parsed = parse_segment_name(name)
@@ -549,7 +572,7 @@ def collect_complete_segments(segments_dir: str, now: float,
             # Конец — по видео в файле, а не по началу соседа: после обрыва
             # камеры сосед начинается позже, чем кончилось видео (D05).
             next_started = float(entries[idx + 1][0]) if has_successor else None
-            ended = segment_end(float(ts), next_started, st.st_mtime, probe=probe, path=full)
+            ended = segment_end(float(ts), next_started, st.st_mtime, probe=budgeted_probe, path=full)
             out.append({
                 "camera_id": cam_id,
                 "file_path": full,

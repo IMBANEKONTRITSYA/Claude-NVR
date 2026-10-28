@@ -8,7 +8,10 @@
 """
 import pytest
 
-from record_layer import SEGMENT_JOIN_TOLERANCE_SEC, segment_end
+import os
+import time
+
+from record_layer import SEGMENT_JOIN_TOLERANCE_SEC, collect_complete_segments, segment_end
 
 START = 1_793_197_794.0
 
@@ -70,3 +73,38 @@ def test_last_segment_ends_at_its_video_not_beyond():
 def test_end_never_precedes_start():
     end = segment_end(START, START + 28, mtime=START - 5, probe=_Probe(None), path="x.mp4")
     assert end == START
+
+
+def _outage_archive(tmp_path, cameras: int):
+    """По два сегмента на камеру с обрывом между ними — массовый обрыв."""
+    for cam in range(1, cameras + 1):
+        for i, start in enumerate((1_000_000, 1_000_060)):
+            f = tmp_path / f"cam{cam}_{start}.mp4"
+            f.write_bytes(b"x")
+            # первый файл «писался» 10 с из 60 до следующего — обрыв
+            os.utime(f, (start + 10, start + 10) if i == 0 else (start + 60, start + 60))
+    return str(tmp_path)
+
+
+def test_mass_outage_does_not_stall_the_manager_loop(tmp_path):
+    """Массовый обрыв: ffprobe ограничен бюджетом прохода, а не числом камер.
+
+    Индексация идёт в цикле менеджера. Без бюджета 40 камер × 0.1 с
+    ffprobe — 4 с простоя цикла (на объекте: 14 с на 250 камерах).
+    """
+    seg_dir = _outage_archive(tmp_path, cameras=40)
+    probe = _Probe(None)
+
+    def slow_probe(path):
+        time.sleep(0.1)
+        return probe(path)
+
+    t0 = time.monotonic()
+    found = collect_complete_segments(seg_dir, now=2_000_000, probe=slow_probe, probe_budget_sec=0.5)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.5, f"проход занял {elapsed:.1f} с — ffprobe не ограничен бюджетом"
+    assert probe.calls < 40, "ffprobe вызван на каждый сегмент массового обрыва"
+    # Сверх бюджета граница — по mtime: разрыв виден у всех камер.
+    firsts = [s for s in found if s["started_ts"] == 1_000_000]
+    assert len(firsts) == 40
+    assert all(s["ended_ts"] == 1_000_010 for s in firsts)
