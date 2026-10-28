@@ -124,6 +124,9 @@ services:
       RTSP_ENCRYPTION_KEY: ${RTSP_ENCRYPTION_KEY:-ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ=}
       MEDIA_PATH: /media
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      # Пояс объекта для первого запуска (services/display_timezone.py);
+      # пусто — пояс системы контейнера, то есть обычно UTC.
+      FACEWATCH_TIMEZONE: ${FACEWATCH_TIMEZONE:-}
       # SPEC §11. Тот же том, в который пишет cron-контейнер `backup` ниже:
       # интерфейс обязан показывать все копии, а не только снятые кнопкой.
       BACKUP_PATH: /backups

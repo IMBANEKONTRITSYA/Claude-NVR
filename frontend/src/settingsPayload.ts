@@ -49,6 +49,9 @@ export function settingsPayload(s: any): Record<string, unknown> {
     smtp_from: s.smtp_from || "",
     alert_email_to: s.alert_email_to || "",
     alert_sound_enabled: num(s.alert_sound_enabled, 0),
+    // Пусто — ключ не отправляется вовсе (undefined выпадает из JSON), и
+    // пояс в БД остаётся прежним, а не сбрасывается в пустую строку (400).
+    display_timezone: s.display_timezone || undefined,
     frame_skip: num(s.frame_skip, 1),
     motion_prefilter: num(s.motion_prefilter, 1),
     idle_fps: num(s.idle_fps, 2),

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, getToken, getRole } from "../api";
 import { useUI } from "../ui";
 import { describeSchedule, emptySchedule } from "../reportSchedule";
+import { formatServerTime } from "../timeZone";
 
 export function Reports() {
   const { toast } = useUI();
@@ -101,7 +102,7 @@ export function Reports() {
               </div>
               {s.last_sent_at && (
                 <div className="muted" style={{ fontSize: 12 }}>
-                  Последняя отправка: {new Date(s.last_sent_at).toLocaleString()}
+                  Последняя отправка: {formatServerTime(s.last_sent_at)}
                 </div>
               )}
               {/* Причина отказа обязана быть видна здесь: иначе «отчёт не

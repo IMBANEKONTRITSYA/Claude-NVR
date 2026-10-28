@@ -7,6 +7,7 @@ import { AnalyticsSource, streamCell } from "../analyticsStream";
 import { modelBanner } from "../modelLoad";
 import { cleanupBanner } from "../archiveCleanup";
 import { quotaBanner } from "../diskQuota";
+import { formatServerTime } from "../timeZone";
 
 function Bar({ percent, warn, crit }: { percent: number; warn?: number; crit?: number }) {
   // Умолчания через ?? , а не в сигнатуре: вызывающие передают warn/crit
@@ -299,7 +300,7 @@ function RecordLayerPanel() {
                         {x.frames_in_error}
                       </td>
                       <td className="muted">
-                        {x.online_since ? new Date(x.online_since).toLocaleString("ru-RU") : "—"}
+                        {formatServerTime(x.online_since)}
                       </td>
                     </tr>
                   ))}

@@ -94,6 +94,25 @@ $secretKey = New-RandomHex 32
 $rtspKey = New-FernetKey
 $adminPassword = New-Password 16
 
+# Пояс хоста в виде IANA (Europe/Moscow), а не Windows-имени («Russian
+# Standard Time»): контейнеры пояса хоста не видят, а backend понимает только
+# IANA. В Windows PowerShell 5.1 (.NET Framework) перевода Windows→IANA нет,
+# но WinRT-календарь Windows 10+ отдаёт имя IANA сразу; в PowerShell 7 есть
+# TryConvertWindowsIdToIanaId. Не вышло ни так, ни так — пусто: сервер возьмёт
+# UTC, и пояс выставляется в Настройках (там же кнопка «пояс этого компьютера»).
+$hostTimeZone = ''
+try {
+    $null = [Windows.Globalization.Calendar, Windows.Globalization, ContentType = WindowsRuntime]
+    $hostTimeZone = (New-Object Windows.Globalization.Calendar).GetTimeZone()
+} catch { }
+if (-not $hostTimeZone) {
+    try {
+        $iana = $null
+        if ([System.TimeZoneInfo]::TryConvertWindowsIdToIanaId([System.TimeZoneInfo]::Local.Id, [ref]$iana)) { $hostTimeZone = $iana }
+    } catch { }
+}
+if ($hostTimeZone -notmatch '^[A-Za-z_]+(/[A-Za-z0-9_+\-]+)*$') { $hostTimeZone = '' }
+
 # -Encoding UTF8 обязателен: .env.example лежит в UTF-8 без BOM и содержит
 # кириллические комментарии, а Get-Content в PowerShell 5.1 по умолчанию
 # читает в ANSI — комментарии уехали бы в .env мозаикой.
@@ -102,6 +121,7 @@ $out = foreach ($line in $lines) {
     if ($line -match '^SECRET_KEY=') { "SECRET_KEY=$secretKey" }
     elseif ($line -match '^RTSP_ENCRYPTION_KEY=') { "RTSP_ENCRYPTION_KEY=$rtspKey" }
     elseif ($line -match '^ADMIN_PASSWORD=') { "ADMIN_PASSWORD=$adminPassword" }
+    elseif ($line -match '^FACEWATCH_TIMEZONE=') { "FACEWATCH_TIMEZONE=$hostTimeZone" }
     else { $line }
 }
 
@@ -122,4 +142,6 @@ Write-Host "=== .env создан со случайными секретами =
 Write-Host "Логин администратора:  admin"
 Write-Host "Пароль администратора: $adminPassword"
 Write-Host "(сохранён в .env, при желании смените в интерфейсе после входа)"
+if ($hostTimeZone) { Write-Host "Часовой пояс объекта:  $hostTimeZone (меняется в Настройках)" }
+else { Write-Host "Часовой пояс не определён — выставьте его в Настройках после входа" }
 Write-Host ""

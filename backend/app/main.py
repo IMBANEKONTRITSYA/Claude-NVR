@@ -7,6 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi import HTTPException
 from sqlalchemy import func, select, text
+from .services.display_timezone import detect_system_timezone
 from .db import engine, Base, SessionLocal
 from .models import User
 from .auth import hash_password, get_user_from_query_token
@@ -194,6 +195,9 @@ async def lifespan(app: FastAPI):
             "alert_sound_enabled": "0",
             "alert_cooldown_sec": "300",
             "record_segment_min": "5",
+            # Пояс показа времени — из системы при первом запуске; дальше
+            # его меняет администратор (services/display_timezone.py).
+            "display_timezone": detect_system_timezone(),
             # SPEC §16, §19: потолок CPU слоя аналитики. Ноль — «подобрать
             # автоматически по числу ядер сервера»: значение в БД не может
             # быть верным для всех объектов, а сервер воркер видит сам

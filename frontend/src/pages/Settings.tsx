@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, backupDownloadUrl } from "../api";
 import { useUI } from "../ui";
 import { settingsPayload } from "../settingsPayload";
+import { browserTimeZone, setDisplayTimeZone, zoneLabel } from "../timeZone";
 import { backupHealth, formatBytes, formatStamp } from "../backupView";
 
 // ВАЖНО: Field объявлен вне Settings — компонент, объявленный внутри рендера,
@@ -130,6 +131,8 @@ export function Settings() {
     try {
       const r = await api.putSettings(settingsPayload(s));
       setS(r);
+      // Пояс показа применяется сразу: открытые страницы перерисуются.
+      setDisplayTimeZone(r.display_timezone);
       setMsg({ type: "ok", text: "Сохранено. Воркер применит изменения в течение ~10 секунд." });
     } catch (e: any) { setMsg({ type: "err", text: e.message }); }
     finally { setBusy(false); }
@@ -255,6 +258,8 @@ export function Settings() {
         <button className="btn secondary" onClick={testMail}>Отправить тестовое письмо</button>
       </div>
 
+      <TimeZoneCard value={s.display_timezone} onChange={(tz: string) => setS((p: any) => ({ ...p, display_timezone: tz }))} />
+
       <div className="card" style={{ maxWidth: 520, marginBottom: 16 }}>
         <h3 style={{ marginTop: 0 }}>Звуковое оповещение</h3>
         <div style={{ marginBottom: 14 }}>
@@ -276,6 +281,43 @@ export function Settings() {
         {msg && <div style={{ marginBottom: 10, color: msg.type === "ok" ? "var(--green)" : "var(--red)" }}>{msg.text}</div>}
         <button className="btn" onClick={save} disabled={busy}>{busy ? "Сохранение..." : "Сохранить"}</button>
       </div>
+    </div>
+  );
+}
+
+
+/**
+ * Часовой пояс объекта: в нём интерфейс показывает время и читает фильтры.
+ *
+ * Начальное значение — пояс системы при первом запуске сервера. Список —
+ * из самого браузера (Intl.supportedValuesOf), а не захардкоженный: база
+ * поясов обновляется вместе с браузером. Подсказка «пояс этого компьютера»
+ * — для случая, когда сервер не увидел пояса хоста (Docker без
+ * FACEWATCH_TIMEZONE отдаёт UTC).
+ */
+function TimeZoneCard({ value, onChange }: { value: string; onChange: (tz: string) => void }) {
+  const zones: string[] = (() => {
+    try { return (Intl as any).supportedValuesOf("timeZone"); } catch { return []; }
+  })();
+  const list = zones.includes("UTC") ? zones : ["UTC", ...zones];
+  if (value && !list.includes(value)) list.unshift(value);
+  const here = browserTimeZone();
+  return (
+    <div className="card" style={{ maxWidth: 520, marginBottom: 16 }}>
+      <h3 style={{ marginTop: 0 }}>Часовой пояс</h3>
+      <label>Пояс объекта</label>
+      <select value={value || "UTC"} onChange={e => onChange(e.target.value)}>
+        {list.map(z => <option key={z} value={z}>{zoneLabel(z)}</option>)}
+      </select>
+      <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+        В этом поясе показывается время архива, журнала и событий и читаются фильтры дат.
+        Архив хранится в UTC — смена пояса записи не трогает.
+      </div>
+      {here && here !== value && (
+        <button className="btn secondary" style={{ marginTop: 8 }} onClick={() => onChange(here)}>
+          Взять пояс этого компьютера: {zoneLabel(here)}
+        </button>
+      )}
     </div>
   );
 }

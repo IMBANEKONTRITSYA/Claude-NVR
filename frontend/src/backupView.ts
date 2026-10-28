@@ -1,3 +1,4 @@
+import { formatMs } from "./timeZone";
 // SPEC §11 «Резервное копирование: автоматическое раз в сутки + ручной
 // запуск». Чистая часть карточки бэкапов: форматирование и — главное —
 // решение о том, здоров ли автоматический бэкап.
@@ -34,7 +35,7 @@ export function stampOf(name: string): Date | null {
 export function formatStamp(name: string): string {
   const dt = stampOf(name);
   if (!dt) return name;
-  return dt.toLocaleString();
+  return formatMs(dt.getTime());
 }
 
 export type BackupHealth = {
