@@ -73,21 +73,25 @@ def fragmented(live_services, real_embeddings):
         s.commit()
         cam_id = cam.id
 
-    with worker.Session() as s:
-        for rec in real_embeddings:
-            emb = np.asarray(rec["embedding"], dtype=np.float32)
-            p = worker.Person(name="", status="unknown", centroid=emb.tolist(),
-                              created_at=worker.datetime.utcnow())
-            s.add(p)
-            s.flush()
-            ev = worker.FaceEvent(camera_id=cam_id, person_id=p.id,
-                                  ts=worker.datetime.utcnow(), embedding=emb.tolist(),
-                                  is_known=False, enhanced=False)
-            s.add(ev)
-            created.append({"person_id": p.id, "identity": rec["identity"]})
-        s.commit()
-
+    # Засев — внутри try: камера уже зафиксирована, и упади засев посередине
+    # (так и было 2026-10-03 на NOT NULL is_known), уборка без try не
+    # запускалась бы вовсе. Протёкшие камеры с шифротекстом 'x' затем
+    # роняли выгрузку камер в наборах бэкенда на той же базе.
     try:
+        with worker.Session() as s:
+            for rec in real_embeddings:
+                emb = np.asarray(rec["embedding"], dtype=np.float32)
+                p = worker.Person(name="", status="unknown", centroid=emb.tolist(),
+                                  created_at=worker.datetime.utcnow())
+                s.add(p)
+                s.flush()
+                ev = worker.FaceEvent(camera_id=cam_id, person_id=p.id,
+                                      ts=worker.datetime.utcnow(), embedding=emb.tolist(),
+                                      is_known=False, enhanced=False)
+                s.add(ev)
+                created.append({"person_id": p.id, "identity": rec["identity"]})
+            s.commit()
+
         yield {"cam_id": cam_id, "created": created}
     finally:
         with worker.Session() as s:
