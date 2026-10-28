@@ -26,6 +26,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -421,10 +423,76 @@ def parse_segment_name(filename: str) -> tuple[int, int] | None:
 # даже если следующего файла ещё нет (камера отвалилась ровно на границе).
 SEGMENT_SETTLE_SEC = 30.0
 
+# Насколько последняя запись в файл может отставать от начала следующего
+# сегмента, чтобы стык считался непрерывным. На настоящем MediaMTX 1.16.1
+# (recordPartDuration 1 с) mtime закрытого по ротации файла оказывается на
+# 0.9 с ПОЗЖЕ начала следующего — он дописывается и закрывается уже после
+# переключения. Запас в 2 с — две длительности части: меньше любого
+# реального обрыва, который стоит показывать на шкале, и больше дрожания
+# сброса на диск.
+SEGMENT_JOIN_TOLERANCE_SEC = 2.0
+
+_FFPROBE_TIMEOUT_SEC = 10.0
+
+
+def probe_media_duration(path: str) -> float | None:
+    """Фактическая длительность видео в файле по ffprobe, либо None.
+
+    None — «не удалось узнать» (нет ffprobe, файл не разобран, таймаут), и
+    вызывающий обязан иметь запасной ответ: отсутствие ffprobe не должно
+    останавливать индексацию архива.
+    """
+    exe = shutil.which("ffprobe")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run(
+            [exe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=_FFPROBE_TIMEOUT_SEC, check=False,
+        ).stdout.strip()
+        value = float(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def segment_end(started: float, next_started: float | None, mtime: float,
+                probe=probe_media_duration, path: str = "") -> float:
+    """Конец видео в сегменте — по тому, что в файле есть, а не по соседу.
+
+    DEPLOY_FINDINGS D05 (развёртывание 2026-10-28): конец брался как начало
+    следующего файла. При ротации это точная граница — MediaMTX режет встык.
+    Но после обрыва камеры MediaMTX закрывает файл досрочно, а следующий
+    заводит только когда камера вернулась, и весь обрыв засчитывался
+    закрытому файлу: на объекте сегмент с 7.6 с видео числился 13-секундным,
+    шкала архива не показывала разрыва, мониторинг — «Пропусков записи: 0»,
+    а экспорт окна через разрыв возвращал 5.8 с вместо 10 при ответе 200.
+    Воспроизведено на MediaMTX 1.16.1: при обрыве 16 с файл с 6.13 с видео
+    получал 28 с.
+
+    Признак обрыва — mtime: при ротации последняя запись в файл приходится
+    на начало следующего (с запасом `SEGMENT_JOIN_TOLERANCE_SEC`), при
+    обрыве — на момент пропажи потока. Только в этом случае спрашивается
+    ffprobe: на штатной ротации его вызов был бы платой за каждый сегмент
+    каждой камеры без пользы. Нет ffprobe — граница по mtime: она завышает
+    длительность не больше чем на часть (~1 с), а не на весь обрыв.
+    """
+    if next_started is not None and next_started - mtime <= SEGMENT_JOIN_TOLERANCE_SEC:
+        return max(float(started), float(next_started))
+    end = mtime
+    duration = probe(path) if path else None
+    if duration is not None:
+        end = started + duration
+    if next_started is not None:
+        end = min(end, float(next_started))
+    return max(float(started), end)
+
 
 def collect_complete_segments(segments_dir: str, now: float,
                               settle_sec: float = SEGMENT_SETTLE_SEC,
-                              after: dict[int, float] | None = None) -> list[dict]:
+                              after: dict[int, float] | None = None,
+                              probe=probe_media_duration) -> list[dict]:
     """Дописанные сегменты слоя записи, готовые к занесению в архив.
 
     Признак «дописан» двойной, и оба нужны:
@@ -478,12 +546,10 @@ def collect_complete_segments(segments_dir: str, now: float,
             has_successor = idx + 1 < len(entries)
             if not has_successor and (now - st.st_mtime) < settle_sec:
                 continue
-            # Конец сегмента: начало следующего, если он есть (точная
-            # граница, MediaMTX режет встык), иначе время последней записи
-            # в файл.
-            ended = float(entries[idx + 1][0]) if has_successor else st.st_mtime
-            if ended < ts:
-                ended = float(ts)
+            # Конец — по видео в файле, а не по началу соседа: после обрыва
+            # камеры сосед начинается позже, чем кончилось видео (D05).
+            next_started = float(entries[idx + 1][0]) if has_successor else None
+            ended = segment_end(float(ts), next_started, st.st_mtime, probe=probe, path=full)
             out.append({
                 "camera_id": cam_id,
                 "file_path": full,

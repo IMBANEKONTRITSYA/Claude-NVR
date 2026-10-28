@@ -274,3 +274,71 @@ def test_export_skips_segment_missing_on_disk(
     assert r.status_code == 200, r.text
     # Остались второй и третий сегменты — примерно 15 секунд вместо 20.
     assert _probe_duration(r.content, tmp_path) > 0
+
+
+@pytest.fixture
+def archive_with_gap(pg_conn, request):
+    """Два сегмента с настоящим разрывом между ними — как после обрыва камеры.
+
+    Первый файл — 7 с видео, следующий начинается через 13 с после него:
+    ровно картина D05 (DEPLOY_FINDINGS_2026-10-28) уже с правильной
+    границей, которую теперь пишет индексация (record_layer.segment_end).
+    """
+    os.makedirs(SEG_DIR, exist_ok=True)
+    files, seg_ids = [], []
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO cameras (name, rtsp_url_enc, location, enabled, status, created_at) "
+            "VALUES ('export-gap-cam', 'unused-enc-blob', '', true, 'offline', NOW()) RETURNING id"
+        )
+        cam_id = cur.fetchone()[0]
+        for i, (start, seconds) in enumerate(((0, 7), (13, 10))):
+            path = os.path.join(SEG_DIR, f"export_gap_cam{cam_id}_{i}.mp4")
+            _make_mp4(path, seconds)
+            files.append(path)
+            cur.execute(
+                "INSERT INTO video_segments "
+                "(camera_id, started_at, ended_at, file_path, event_type, duration_sec, size_bytes) "
+                "VALUES (%s, %s, %s, %s, 'continuous', %s, %s) RETURNING id",
+                (cam_id, BASE + timedelta(seconds=start), BASE + timedelta(seconds=start + seconds),
+                 path, seconds, os.path.getsize(path)),
+            )
+            seg_ids.append(cur.fetchone()[0])
+
+    def _cleanup():
+        with pg_conn.cursor() as cur:
+            cur.execute("DELETE FROM video_segments WHERE id = ANY(%s)", (seg_ids,))
+            cur.execute("DELETE FROM cameras WHERE id = %s", (cam_id,))
+        for p in files:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    request.addfinalizer(_cleanup)
+    return cam_id
+
+
+def test_export_reports_coverage_of_window_with_gap(client, admin_token, archive_with_gap, tmp_path):
+    """Окно через разрыв: ответ говорит, сколько видео в нём на самом деле.
+
+    D05: окно 10 с через обрыв отдавалось файлом 5.8 с при ответе 200, и
+    по ответу о разрыве судить было нельзя. Окно 5..15 с: 2 с из первого
+    файла (5..7) и 2 с из второго (13..15) — 4 с видео на 10 с окна.
+    Заголовок сверяется и с длительностью скачанного файла: число, которое
+    не совпадает с тем, что внутри, было бы хуже его отсутствия.
+    """
+    r = client.get("/api/archive/export", params=_params(archive_with_gap, admin_token, 5, 15))
+    assert r.status_code == 200, r.text
+    assert float(r.headers["x-archive-window-seconds"]) == pytest.approx(10.0)
+    covered = float(r.headers["x-archive-covered-seconds"])
+    assert covered == pytest.approx(4.0)
+    # Remux режет по ключевым кадрам (GOP 1 с) — допуск на вход раньше окна.
+    assert abs(_probe_duration(r.content, tmp_path) - covered) <= 2.0
+
+
+def test_export_without_gap_reports_full_coverage(client, admin_token, seeded_archive):
+    r = client.get("/api/archive/export", params=_params(seeded_archive, admin_token, 5, 25))
+    assert r.status_code == 200, r.text
+    assert float(r.headers["x-archive-covered-seconds"]) == pytest.approx(
+        float(r.headers["x-archive-window-seconds"]))
