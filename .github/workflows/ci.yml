@@ -212,7 +212,7 @@ jobs:
         # версия берётся из docker-compose.yml, а не пишется руками.
         run: |
           set -euo pipefail
-          VER=$(grep -oP 'image:\s*bluenviron/mediamtx:\K\S+' docker-compose.yml)
+          VER=$(grep -oP 'image:\s*(?:bluenviron/|facewatch-)mediamtx:\K[0-9.]+' docker-compose.yml)
           mkdir -p "$RUNNER_TEMP/mtx"
           curl -fsSL -o "$RUNNER_TEMP/mtx.tar.gz" \
             "https://github.com/bluenviron/mediamtx/releases/download/v${VER}/mediamtx_v${VER}_linux_amd64.tar.gz"
@@ -307,7 +307,7 @@ jobs:
         # поэтому здесь версия тоже берётся оттуда, а не пишется руками.
         run: |
           set -euo pipefail
-          VER=$(grep -oP 'image:\s*bluenviron/mediamtx:\K\S+' docker-compose.yml)
+          VER=$(grep -oP 'image:\s*(?:bluenviron/|facewatch-)mediamtx:\K[0-9.]+' docker-compose.yml)
           echo "MediaMTX $VER"
           # Распаковка в отдельный каталог обязательна: в корне репозитория
           # уже есть КАТАЛОГ mediamtx/ (конфигурация сервера), и tar,
@@ -519,7 +519,7 @@ jobs:
         # боевую стоимость.
         run: |
           set -euo pipefail
-          VER=$(grep -oP 'image:\s*bluenviron/mediamtx:\K\S+' docker-compose.yml)
+          VER=$(grep -oP 'image:\s*(?:bluenviron/|facewatch-)mediamtx:\K[0-9.]+' docker-compose.yml)
           mkdir -p "$RUNNER_TEMP/mtx"
           curl -fsSL -o "$RUNNER_TEMP/mtx.tar.gz" \
             "https://github.com/bluenviron/mediamtx/releases/download/v${VER}/mediamtx_v${VER}_linux_amd64.tar.gz"

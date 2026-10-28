@@ -66,7 +66,8 @@ services:
     # от `docker compose pull`, без единого изменения в репозитории, и
     # выглядит это как «сегодня все камеры почернели». Обновление версии —
     # осознанный коммит, после которого гоняются тесты слоя записи.
-    image: bluenviron/mediamtx:1.16.0
+    build: ./mediamtx
+    image: facewatch-mediamtx:1.16.1-healthcheck
     container_name: facewatch-mediamtx
     logging: *default-logging
     environment:
