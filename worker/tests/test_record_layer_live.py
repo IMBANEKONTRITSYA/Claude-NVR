@@ -63,11 +63,15 @@ def _free_port() -> int:
 
 
 def _pinned_version() -> str:
-    """Версия MediaMTX из docker-compose.yml — единственный источник."""
+    """Version of the upstream binary, including the shell-enabled wrapper image."""
     text = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-    m = re.search(r"image:\s*bluenviron/mediamtx:(\S+)", text)
+    m = re.search(r"image:\s*(?:bluenviron/|facewatch-)mediamtx:(\d+\.\d+\.\d+)", text)
     assert m, "в docker-compose.yml не найден образ MediaMTX"
-    return m.group(1).strip()
+    version = m.group(1)
+    if "facewatch-mediamtx:" in text:
+        dockerfile = (ROOT / "mediamtx/Dockerfile").read_text(encoding="utf-8")
+        assert f"FROM bluenviron/mediamtx:{version} AS upstream" in dockerfile
+    return version
 
 
 @pytest.fixture(scope="module")

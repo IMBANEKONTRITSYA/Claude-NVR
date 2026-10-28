@@ -66,7 +66,8 @@ services:
     # от `docker compose pull`, без единого изменения в репозитории, и
     # выглядит это как «сегодня все камеры почернели». Обновление версии —
     # осознанный коммит, после которого гоняются тесты слоя записи.
-    image: bluenviron/mediamtx:1.16.0
+    build: ./mediamtx
+    image: facewatch-mediamtx:1.16.1-healthcheck
     container_name: facewatch-mediamtx
     logging: *default-logging
     environment:
@@ -325,7 +326,7 @@ services:
       # пришлось бы заново принимать предупреждение при каждом обновлении.
       - frontend_certs:/etc/nginx/certs
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
       interval: 30s
       timeout: 5s
       retries: 3

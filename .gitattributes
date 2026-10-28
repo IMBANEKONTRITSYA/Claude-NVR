@@ -19,3 +19,7 @@
 
 # Остальное — обычная нормализация в LF внутри репозитория.
 * text=auto
+
+# Linux entrypoints must keep LF on Windows checkouts as well.
+# CRLF changes the shebang to /bin/sh\r and containers cannot start.
+*.sh text eol=lf
