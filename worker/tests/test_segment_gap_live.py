@@ -39,6 +39,13 @@ pytestmark = pytest.mark.skipif(
 OUTAGE_SEC = 8.0
 
 
+def _mediamtx_env() -> dict:
+    """Без RTSP_*: MediaMTX читает их как свои настройки, и RTSP_ENCRYPTION_KEY
+    из окружения проекта роняет его при старте («RTSP_ENCRYPTION: json:
+    Unmarshal(nil *conf.alias)»)."""
+    return {k: v for k, v in os.environ.items() if not k.startswith(("RTSP_", "MTX_"))}
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -102,7 +109,7 @@ def outage(tmp_path_factory):
         f"    recordPath: {seg_dir}/%path_%s\n"
         "    recordPartDuration: 1s\n    recordSegmentDuration: 1h\n",
         encoding="utf-8")
-    mtx = subprocess.Popen([MEDIAMTX_BIN, str(conf)], cwd=str(conf.parent),
+    mtx = subprocess.Popen([MEDIAMTX_BIN, str(conf)], cwd=str(conf.parent), env=_mediamtx_env(),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     pub = _publisher(rtsp_port)
     try:
