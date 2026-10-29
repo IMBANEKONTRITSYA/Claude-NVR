@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api, getToken, getRole } from "../api";
 import { useUI } from "../ui";
 import { describeSchedule, emptySchedule } from "../reportSchedule";
-import { formatServerTime } from "../timeZone";
+import { formatServerTime, zoneLabel } from "../timeZone";
 
 export function Reports() {
   const { toast } = useUI();
@@ -202,7 +202,7 @@ export function Reports() {
                   <input type="number" min={0} max={59} style={{ width: 70 }}
                          value={draft.minute} onChange={upd("minute", v => parseInt(v) || 0)} />
                 </label>
-                <span className="muted" style={{ fontSize: 11 }}>по времени сервера</span>
+                <span className="muted" style={{ fontSize: 11 }}>по времени объекта: {zoneLabel()}</span>
               </div>
             </>
           )}

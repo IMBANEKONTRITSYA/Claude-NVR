@@ -25,6 +25,7 @@ main.py) — дальше пояс меняет администратор в н
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_TIMEZONE = "UTC"
@@ -77,3 +78,53 @@ def detect_system_timezone(environ=os.environ, etc_timezone: str = "/etc/timezon
         if is_valid_timezone(name):
             return name
     return DEFAULT_TIMEZONE
+
+
+# --- Время в файлах, которые уходят за пределы интерфейса --------------------
+#
+# Выгрузки CSV/Excel и письма планировщика читают люди без интерфейса под
+# рукой: столбец «Время» в UTC без пометки на объекте в UTC+5 читается как
+# местное и сдвигает каждое событие на пять часов. Поэтому туда время идёт
+# уже в поясе объекта, а пояс назван в заголовке столбца.
+
+EXPORT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def zone(name: str | None) -> ZoneInfo:
+    return ZoneInfo(name if is_valid_timezone(name) else DEFAULT_TIMEZONE)
+
+
+async def load_display_timezone(db) -> str:
+    """Пояс объекта из настроек; `UTC`, если он не задан или испорчен."""
+    from sqlalchemy import select
+
+    from ..models import Setting
+
+    value = (await db.execute(
+        select(Setting.value).where(Setting.key == "display_timezone")
+    )).scalar_one_or_none()
+    return value if is_valid_timezone(value) else DEFAULT_TIMEZONE
+
+
+def utc_to_local(ts: datetime, tz: str) -> datetime:
+    """UTC без пояса → стенное время объекта без пояса."""
+    return ts.replace(tzinfo=timezone.utc).astimezone(zone(tz)).replace(tzinfo=None)
+
+
+def local_to_utc(ts: datetime, tz: str) -> datetime:
+    """Стенное время объекта без пояса → UTC без пояса.
+
+    Несуществующее время перевода часов (02:30 весной) и двойное (осенью)
+    разрешаются по fold=0 — как у zoneinfo по умолчанию: отчёт уйдёт в
+    один из двух моментов, а не пропадёт.
+    """
+    return ts.replace(tzinfo=zone(tz)).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def format_local(ts: datetime | None, tz: str) -> str:
+    return utc_to_local(ts, tz).strftime(EXPORT_TIME_FORMAT) if ts else ""
+
+
+def zone_header(title: str, tz: str) -> str:
+    """«Время» → «Время (Asia/Yekaterinburg)»."""
+    return f"{title} ({tz})"

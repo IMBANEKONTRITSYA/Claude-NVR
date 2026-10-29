@@ -19,11 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Camera, FaceEvent, Person
 from . import csv_export
+from .display_timezone import format_local, load_display_timezone, zone_header
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-async def _appearances(db: AsyncSession, days: int):
+async def _appearances(db: AsyncSession, days: int, tz: str):
     since = datetime.utcnow() - timedelta(days=days)
     r = await db.execute(
         select(FaceEvent.id, FaceEvent.ts, Camera.name, Person.id, Person.name, Person.status)
@@ -32,11 +33,11 @@ async def _appearances(db: AsyncSession, days: int):
         .where(FaceEvent.ts >= since)
         .order_by(FaceEvent.ts.desc())
     )
-    return [[x[0], x[1].isoformat(), x[2], x[3] or "", x[4] or "Неизвестный", x[5] or ""]
+    return [[x[0], format_local(x[1], tz), x[2], x[3] or "", x[4] or "Неизвестный", x[5] or ""]
             for x in r.all()]
 
 
-async def _persons_summary(db: AsyncSession, days: int):
+async def _persons_summary(db: AsyncSession, days: int, tz: str):
     since = datetime.utcnow() - timedelta(days=days)
     r = await db.execute(
         select(
@@ -50,11 +51,11 @@ async def _persons_summary(db: AsyncSession, days: int):
         .order_by(func.count(FaceEvent.id).desc())
     )
     return [[x[0], x[1] or "Неизвестный", x[2] or "", x[3],
-             x[4].isoformat() if x[4] else "", x[5].isoformat() if x[5] else ""]
+             format_local(x[4], tz), format_local(x[5], tz)]
             for x in r.all()]
 
 
-async def _cameras_activity(db: AsyncSession, days: int):
+async def _cameras_activity(db: AsyncSession, days: int, tz: str):
     since = datetime.utcnow() - timedelta(days=days)
     r = await db.execute(
         select(
@@ -91,6 +92,14 @@ KINDS: dict[str, tuple] = {
 }
 
 FORMATS = ("csv", "xlsx")
+
+# Столбцы со временем: в файле они в поясе объекта, и пояс дописывается в
+# заголовок — см. services/display_timezone.py.
+TIME_COLUMNS = frozenset({"Время", "Первое", "Последнее"})
+
+
+def header_for(header: list[str], tz: str) -> list[str]:
+    return [zone_header(h, tz) if h in TIME_COLUMNS else h for h in header]
 
 
 def kind_title(kind: str) -> str:
@@ -134,7 +143,9 @@ async def build_report(db: AsyncSession, kind: str, fmt: str, days: int) -> tupl
     if fmt not in FORMATS:
         raise ValueError(f"неизвестный формат: {fmt}")
     _, header, query, sheet = KINDS[kind]
-    rows = await query(db, days)
+    tz = await load_display_timezone(db)
+    rows = await query(db, days, tz)
+    header = header_for(header, tz)
     if fmt == "csv":
         return f"{kind}.csv", to_csv(header, rows), "text/csv"
     return f"{kind}.xlsx", to_xlsx(sheet, header, rows), XLSX_MIME
