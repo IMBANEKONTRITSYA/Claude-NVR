@@ -19,6 +19,7 @@ from ..profiles import profile_settings
 from ..services import autoconfig
 from ..services.pubsub import get_redis
 from ..services.storage import (BYTES_PER_GB, DISK_CRIT_PCT, DISK_WARN_PCT,
+                                measured_bytes_per_day, wsl_virtual_disk_note,
                                 calibration, days_left, disk_alert_level,
                                 nominal_gb_per_day, required_gb)
 from .cameras import DEFAULT_ANALYTICS_MAX
@@ -330,16 +331,24 @@ async def storage_report(_=Depends(require_role("admin", "operator")),
     segments_day = (await db.execute(
         select(func.count(VideoSegment.id)).where(VideoSegment.started_at >= day_ago)
     )).scalar() or 0
+    # Какое время запись за эти сутки действительно покрывает — знаменатель
+    # суточного расхода, см. measured_bytes_per_day (D07).
+    first_start, last_end = (await db.execute(
+        select(func.min(VideoSegment.started_at), func.max(VideoSegment.ended_at))
+        .where(VideoSegment.started_at >= day_ago)
+    )).one()
+    span_sec = (last_end - first_start).total_seconds() if first_start and last_end else 0.0
 
     # Номинал считается по фактическому битрейту основного потока из SPEC §1
     # (2048 kbps). Это не настройка: слой записи ведёт remux потока как есть
     # (§24 запрещает перекодирование), поэтому битрейт задаёт камера, а не
     # система, и «настроить» его здесь было бы враньём.
     nominal_per_day_gb = nominal_gb_per_day(MAIN_STREAM_KBPS, len(enabled))
-    measured_per_day_gb = measured_bytes / BYTES_PER_GB
+    measured_rate = measured_bytes_per_day(measured_bytes, span_sec)
+    measured_per_day_gb = (measured_rate or 0.0) / BYTES_PER_GB
 
-    source = "measured" if measured_bytes > 0 else "nominal"
-    per_day_bytes = measured_bytes if measured_bytes > 0 else nominal_per_day_gb * BYTES_PER_GB
+    source = "measured" if measured_rate is not None else "nominal"
+    per_day_bytes = measured_rate if measured_rate is not None else nominal_per_day_gb * BYTES_PER_GB
     left = days_left(free, per_day_bytes)
 
     warn = await _setting_int(db, "disk_warn_pct", int(DISK_WARN_PCT))
@@ -364,6 +373,11 @@ async def storage_report(_=Depends(require_role("admin", "operator")),
             calibration(measured_per_day_gb, nominal_per_day_gb)
         ),
         "forecast_source": source,
+        # Сколько часов записи легло в основу прогноза: прогноз по десяти
+        # минутам и по суткам — разные по надёжности числа.
+        "forecast_basis_hours": round(span_sec / 3600.0, 2),
+        # Не None — архив на виртуальном диске WSL2, ёмкость не настоящая (D07).
+        "virtual_disk_note": wsl_virtual_disk_note(settings.MEDIA_PATH),
         "days_left": round(left, 1) if left is not None else None,
         "cameras_recording": len(enabled),
         "retention_days": global_retention,
