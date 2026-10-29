@@ -31,6 +31,13 @@ export interface LiveFailure {
   playlistStatus: number;
   /** Тело мастер-плейлиста, если оно получено. */
   playlistBody?: string;
+  /**
+   * Статус камеры по слою записи (`cam.status`): `online` — путь в MediaMTX
+   * заведён и поток идёт. Нужен, чтобы отличить «путь не заведён» от
+   * «путь есть, а HLS из него не собирается» — у ответа плейлиста для них
+   * один и тот же код.
+   */
+  recordStatus?: string;
 }
 
 export interface LiveDiagnosis {
@@ -87,7 +94,20 @@ export function diagnoseLiveFailure(
   failure: LiveFailure,
   canPlayType?: (type: string) => string,
 ): LiveDiagnosis {
-  const { playlistStatus, playlistBody } = failure;
+  const { playlistStatus, playlistBody, recordStatus } = failure;
+
+  // Путь заведён и пишется, а плейлист не отдаётся: MediaMTX не смог
+  // собрать из потока HLS. На объекте (DEPLOY_FINDINGS D04, 2026-10-28) так
+  // вели себя H.265-камеры — в журнале MediaMTX «muxer error: unable to
+  // extract DTS: invalid DeltaPocS0», — а плитка говорила «поток не заведён»
+  // при зелёном «пишется» в мониторинге, то есть отправляла дежурного
+  // чинить исправный слой записи.
+  if (recordStatus === "online" && (playlistStatus === 404 || playlistStatus >= 500)) {
+    return {
+      title: "Медиасервер не собрал поток для браузера",
+      hint: "Камера на связи и пишется в архив, но живое видео из её потока не упаковалось (чаще всего — H.265 некоторых камер). Ниже — снимок, обновляется раз в 10 с; для живого видео переведите основной поток камеры в H.264.",
+    };
+  }
 
   if (playlistStatus === 0) {
     return {
@@ -117,7 +137,7 @@ export function diagnoseLiveFailure(
       && !browserPlaysHevc(canPlayType)) {
     return {
       title: "Браузер не воспроизводит H.265",
-      hint: "Камера отдаёт поток в H.265, а этот браузер его не декодирует. Запись и архив при этом идут штатно; для просмотра подойдёт Safari либо перевод основного потока камеры в H.264.",
+      hint: "Камера отдаёт поток в H.265, а этот браузер его не декодирует. Запись и архив идут штатно; ниже — снимок, обновляется раз в 10 с. Для живого видео — Safari либо перевод основного потока камеры в H.264.",
     };
   }
   if (playlistStatus === 200) {

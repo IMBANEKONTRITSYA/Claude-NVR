@@ -154,6 +154,10 @@ function PtzPad({ camId }: { camId: number }) {
   );
 }
 
+// Раз в 10 с: backend кэширует снимок на 8 с, так что каждый запрос плитки —
+// новый кадр, а не повтор; при 16 плитках это ~0.25 ядра на сервере.
+const SNAPSHOT_REFRESH_MS = 10_000;
+
 function CameraTile({ cam, boxes, onClick }: any) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
@@ -167,6 +171,19 @@ function CameraTile({ cam, boxes, onClick }: any) {
   // Снимок — запасной путь, когда HLS не играет. Если и он не отдался,
   // камера действительно недоступна, и только тогда честно говорим об этом.
   const [snapshotFailed, setSnapshotFailed] = useState(false);
+  // Снимок обновляется, пока плитка в режиме снимка: у камер без аналитики
+  // его снимает backend с RTSP-пути MediaMTX по запросу (D04), и кадр
+  // десятиминутной давности выдавал бы себя за живой.
+  const [snapshotTick, setSnapshotTick] = useState(0);
+  // Статус на момент отказа — через ref: эффект плеера зависит только от
+  // cam.id, и пересоздавать плеер на каждую смену статуса незачем.
+  // Адрес снимка — один на период обновления. camSnapshotUrl ставит метку
+  // времени, и вычисленный прямо в разметке он менялся на каждой
+  // перерисовке плитки (раз в секунду), то есть браузер перезапрашивал
+  // снимок ежесекундно — 16 запросов в секунду на стену из 16 плиток.
+  const snapshotSrc = useMemo(() => camSnapshotUrl(cam.id), [cam.id, snapshotTick]);
+  const statusRef = useRef<string | undefined>(cam.status);
+  statusRef.current = cam.status;
   // Прямоугольник, который видео реально занимает внутри плитки. Нужен для
   // рамок лиц: при object-fit contain кадр вписывается с полями, и рамка,
   // посчитанная от размеров плитки, уехала бы на величину поля.
@@ -217,7 +234,7 @@ function CameraTile({ cam, boxes, onClick }: any) {
       } catch {
         playlistStatus = 0;
       }
-      if (!cancelled) setDiagnosis(diagnoseLiveFailure({ playlistStatus, playlistBody }));
+      if (!cancelled) setDiagnosis(diagnoseLiveFailure({ playlistStatus, playlistBody, recordStatus: statusRef.current }));
     };
 
     if (v.canPlayType("application/vnd.apple.mpegurl")) {
@@ -236,6 +253,12 @@ function CameraTile({ cam, boxes, onClick }: any) {
       hlsRef.current = null;
     };
   }, [cam.id]);
+
+  useEffect(() => {
+    if (!error || snapshotFailed) return;
+    const t = setInterval(() => setSnapshotTick(n => n + 1), SNAPSHOT_REFRESH_MS);
+    return () => clearInterval(t);
+  }, [error, snapshotFailed]);
 
   // Пересчёт прямоугольника видео: при смене размера плитки (в том числе
   // при входе в полноэкранный режим) и когда стали известны размеры кадра.
@@ -338,7 +361,7 @@ function CameraTile({ cam, boxes, onClick }: any) {
           style={{ width: "100%", height: "100%", objectFit: "contain",
                    display: error ? "none" : "block" }} />
         {error && !snapshotFailed && (
-          <img src={camSnapshotUrl(cam.id)} alt=""
+          <img src={snapshotSrc} alt=""
             style={{ width: "100%", height: "100%", objectFit: "contain" }}
             onError={() => setSnapshotFailed(true)} />
         )}

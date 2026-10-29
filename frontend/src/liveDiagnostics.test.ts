@@ -84,6 +84,30 @@ describe("диагноз чёрной плитки", () => {
     expect(d.hint).toContain("Мониторинг");
   });
 
+  it("404 при камере, которая пишется, — отказ муксера, а не «не заведён» (D04)", () => {
+    // На объекте: H.265-камера, путь ready, мониторинг «пишется», HLS 404.
+    const d = diagnoseLiveFailure({ playlistStatus: 404, recordStatus: "online" });
+    expect(d.title).not.toContain("не заведён");
+    expect(d.title).toBe("Медиасервер не собрал поток для браузера");
+    expect(d.hint).toContain("пишется в архив");
+    expect(d.hint).toContain("H.264");
+  });
+
+  it("500 муксера при камере, которая пишется, — тот же диагноз", () => {
+    expect(diagnoseLiveFailure({ playlistStatus: 500, recordStatus: "online" }).title)
+      .toBe("Медиасервер не собрал поток для браузера");
+  });
+
+  it("404 при камере не на связи — по-прежнему «не заведён»", () => {
+    for (const recordStatus of ["offline", "unknown", undefined]) {
+      expect(diagnoseLiveFailure({ playlistStatus: 404, recordStatus }).title).toContain("не заведён");
+    }
+  });
+
+  it("401 у пишущейся камеры — всё равно сессия, а не муксер", () => {
+    expect(diagnoseLiveFailure({ playlistStatus: 401, recordStatus: "online" }).title).toBe("Нет доступа к видеопотоку");
+  });
+
   it("недоступный сервер отличается от отказа сервера", () => {
     expect(diagnoseLiveFailure({ playlistStatus: 0 }).title).toBe("Медиасервер недоступен");
     expect(diagnoseLiveFailure({ playlistStatus: 503 }).title).toBe("Ошибка медиасервера");
