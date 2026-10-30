@@ -29,6 +29,8 @@ systemd гоняется в CI (джоба `deb`). **Проверять на о�
 
 ---
 
+> Повторная проверка 30.10.2026: новые пункты §8 отмечены [в чек-листе PR #173](https://github.com/IMBANEKONTRITSYA/Claude-NVR/blob/docs/cycle65-report-20261028/docs/DEPLOY_CHECKLIST.md): 10/36 новых, совмещённо 70/223. Здесь сохранены 60/187 базовых до слияния расширения. [Подробный отчёт](DEPLOY_RECHECK_2026-10-30.md).
+
 ## 0. Перед запуском
 
 - [x] `.env` заполнен из `.env.example`; **`SECRET_KEY`, `ADMIN_PASSWORD`,
