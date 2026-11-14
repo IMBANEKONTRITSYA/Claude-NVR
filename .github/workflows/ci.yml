@@ -331,6 +331,18 @@ jobs:
         # переподключения. Перечислять их руками значило бы, что третий
         # такой набор молча не поедет в CI.
         run: pytest tests/test_*_live.py -q
+      - name: Run live snapshot test against real MediaMTX (D04)
+        # Снимок для камер без аналитики снимается ffmpeg'ом с RTSP MediaMTX
+        # (backend/app/services/live_preview.py). Проверяется, что снимок —
+        # кадр, а не серое месиво декода с P-кадра, на H.264 и H.265; без
+        # настоящего MediaMTX это не проверить, поэтому шаг здесь, а не в
+        # джобе backend. Тесту нужен только app.config — отсюда одна зависимость;
+        # лежит в tests_live/, вне autouse-фикстур tests/conftest.py, которые
+        # требуют Postgres и молча пропустили бы тест (см. tests_live/README.md).
+        working-directory: backend
+        run: |
+          pip install pydantic-settings
+          pytest tests_live -q -rs
 
   upscaler:
     runs-on: ubuntu-latest
@@ -371,7 +383,15 @@ jobs:
         # модели в CI недопустимо долгий.
         run: |
           python -m pip install --upgrade pip
-          pip install numpy opencv-python-headless sqlalchemy psycopg2-binary redis pytest
+          # Версии — из upscaler/requirements.txt, а не «последние». Без
+          # закрепления джоба 2026-10-03 подтянула SQLAlchemy 2.1, у которой
+          # драйвер по умолчанию для postgresql:// сменился с psycopg2 на
+          # psycopg 3: `import upscaler` падал на create_engine, conftest
+          # ронял весь прогон, и джоба краснела на любом PR без связи с
+          # его правкой. Образ сервиса ставит закреплённые версии — CI
+          # обязан проверять их же. torch/GFPGAN-стек не ставится намеренно
+          # (тесты его подменяют, см. upscaler/tests).
+          pip install $(grep -E '^(numpy|opencv-python-headless|redis|sqlalchemy|psycopg2-binary)==' requirements.txt) pytest
       - name: Run upscaler tests
         working-directory: upscaler
         run: pytest tests/ -q

@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.mediamtx_env import mediamtx_env
+
 from record_layer import MediaMTXClient, path_conf, path_name, segments_dir
 from record_status import ONLINE, OFFLINE, path_live, stream_states
 
@@ -78,7 +80,7 @@ def live(tmp_path_factory):
         "    source: publisher\n",
         encoding="utf-8")
 
-    mtx = subprocess.Popen([MEDIAMTX_BIN, str(conf)], cwd=str(conf.parent),
+    mtx = subprocess.Popen([MEDIAMTX_BIN, str(conf)], cwd=str(conf.parent), env=mediamtx_env(),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     client = MediaMTXClient(f"http://127.0.0.1:{api_port}", timeout=5)
     _wait(lambda: client.list_path_configs() is not None, 20,

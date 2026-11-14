@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,6 +8,7 @@ from sqlalchemy import select
 from starlette.background import BackgroundTask
 from ..config import settings
 from ..db import get_db
+from ..timeparams import NaiveUtc
 from ..models import VideoSegment
 from ..auth import require_role, require_role_query
 from ..params import limit_param
@@ -22,8 +24,8 @@ router = APIRouter(prefix="/api/archive", tags=["archive"])
 @router.get("/segments", response_model=list[SegmentOut])
 async def list_segments(
     camera_id: int | None = None,
-    date_from: datetime | None = None,
-    date_to: datetime | None = None,
+    date_from: NaiveUtc | None = None,
+    date_to: NaiveUtc | None = None,
     event_type: str | None = None,
     person_id: int | None = None,
     limit: int = limit_param(200),
@@ -42,9 +44,9 @@ async def list_segments(
 
 @router.get("/timeline", response_model=TimelineOut)
 async def timeline(
-    camera_id: int = Query(..., ge=1),
-    date_from: datetime = Query(...),
-    date_to: datetime = Query(...),
+    camera_id: Annotated[int, Query(ge=1)],
+    date_from: Annotated[NaiveUtc, Query()],
+    date_to: Annotated[NaiveUtc, Query()],
     _=Depends(require_role("admin", "operator")),
     db: AsyncSession = Depends(get_db),
 ):
@@ -160,9 +162,9 @@ async def segment_thumb(
 
 @router.get("/export")
 async def export_fragment(
-    camera_id: int = Query(..., ge=1),
-    date_from: datetime = Query(...),
-    date_to: datetime = Query(...),
+    camera_id: Annotated[int, Query(ge=1)],
+    date_from: Annotated[NaiveUtc, Query()],
+    date_to: Annotated[NaiveUtc, Query()],
     db: AsyncSession = Depends(get_db),
     _=Depends(require_role_query("admin", "operator")),
 ):
@@ -237,9 +239,20 @@ async def export_fragment(
     # Каталог удаляется задачей ответа — то есть после того, как файл
     # полностью ушёл клиенту. Удалить его здесь означало бы отдавать
     # FileResponse на уже удалённый файл.
+    # Сколько видео в окне на самом деле есть. Без этого ответ 200 ничего не
+    # говорил о разрывах: на объекте окно 10 с через обрыв камеры отдавалось
+    # файлом 5.8 с (DEPLOY_FINDINGS D05). Скачивание из интерфейса идёт
+    # навигацией браузера и заголовков не видит — там разрыв показывает
+    # шкала архива; заголовки — для внешних клиентов REST API (§12) и для
+    # проверки экспорта без ffprobe.
+    covered_sec = sum(p.duration for p in pieces)
     return FileResponse(
         out_path,
         media_type="video/mp4",
         filename=out_name,
+        headers={
+            "X-Archive-Window-Seconds": f"{window_sec:.3f}",
+            "X-Archive-Covered-Seconds": f"{covered_sec:.3f}",
+        },
         background=BackgroundTask(export_svc.cleanup_workdir, workdir),
     )

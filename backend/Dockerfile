@@ -31,4 +31,9 @@ RUN pip install -r requirements.txt
 COPY app ./app
 
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-config", "app/logging_config.json"]
+# --timeout-graceful-shutdown 5: без него uvicorn по SIGTERM ждёт, пока
+# закроются все соединения, а цикл /ws/faces и /ws/cameras стоит в ожидании
+# Redis до 30 с. Замерено: с одной открытой вкладкой Стены выход за 29 с,
+# Docker к этому моменту уже добил процесс SIGKILL'ом через 10 с (код 137,
+# DEPLOY_FINDINGS D09). С флагом — 5.2 с; без соединений — 0.2 с, как и было.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-config", "app/logging_config.json", "--timeout-graceful-shutdown", "5"]

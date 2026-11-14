@@ -303,15 +303,54 @@ def test_no_recursive_chown_over_the_archive():
 
 # ------------------------------------------------------------ сборка
 
+def _mediamtx_pins() -> dict[str, str | None]:
+    """Версия MediaMTX во всех трёх местах, где она записана.
+
+    Источник истины — строка FROM в mediamtx/Dockerfile: образ-обёртка
+    (D01, healthcheck на BusyBox) собирается из закреплённого upstream-образа,
+    и тот же номер читают build-deb.sh и джоба CI record-layer-live.
+    Значение None — «не нашлось», а не исключение: отсутствие пина само
+    по себе дефект, и сообщение об этом должно быть понятным.
+    """
+    def find(pattern: str, text: str):
+        m = re.search(pattern, text, re.MULTILINE)
+        return m.group(1) if m else None
+
+    return {
+        "mediamtx/Dockerfile": find(r"^FROM\s+bluenviron/mediamtx:(\d+\.\d+\.\d+)",
+                                    (ROOT / "mediamtx" / "Dockerfile").read_text(encoding="utf-8")),
+        "docker-compose.yml": find(r"image:\s*(?:bluenviron/|facewatch-)mediamtx:(\d+\.\d+\.\d+)",
+                                   (ROOT / "docker-compose.yml").read_text(encoding="utf-8")),
+        "packaging/versions.env": find(r"^MEDIAMTX_VERSION=(\S+?)\r?$",
+                                       (PKG / "versions.env").read_text(encoding="utf-8")),
+    }
+
+
 def test_mediamtx_version_matches_compose():
     """Пакет обязан везти ту версию сервера записи, против которой в CI
-    гоняется джоба record-layer-live. Разойдясь, они проверяли бы разное."""
-    versions = (PKG / "versions.env").read_text(encoding="utf-8")
-    pinned = re.search(r"^MEDIAMTX_VERSION=(\S+)$", versions, re.MULTILINE).group(1)
-    compose = re.search(r"image:\s*bluenviron/mediamtx:(\S+)", (ROOT / "docker-compose.yml").read_text(encoding="utf-8")).group(1)
-    assert pinned == compose, (
-        f"versions.env пинит MediaMTX {pinned}, docker-compose.yml — {compose}"
-    )
+    гоняется джоба record-layer-live. Разойдясь, они проверяли бы разное.
+
+    Не теоретический случай: при развёртывании 2026-10-28 Docker-образ
+    перевели на 1.16.1 (1.16.0 падает на RTCP настоящих камер, D03), а
+    versions.env остался на 1.16.0 — и прежняя редакция этого теста не
+    сообщила о расхождении, а упала AttributeError на собственном regex,
+    потому что строка `image: bluenviron/mediamtx:` из compose исчезла.
+    """
+    pins = _mediamtx_pins()
+    missing = [where for where, ver in pins.items() if ver is None]
+    assert not missing, f"не найдена версия MediaMTX в: {missing}"
+    assert len(set(pins.values())) == 1, f"версии MediaMTX расходятся: {pins}"
+
+
+def test_build_script_reads_the_same_mediamtx_source():
+    """build-deb.sh сверяет versions.env с тем же источником, что и тест.
+
+    Иначе тест зелёный, а сборка пакета падает (или наоборот): ровно так
+    сломалась сборка после перехода compose на собираемый образ.
+    """
+    build = (PKG / "build-deb.sh").read_text(encoding="utf-8")
+    assert "mediamtx/Dockerfile" in build, "build-deb.sh не читает версию из mediamtx/Dockerfile"
+    assert "bluenviron/mediamtx:\\K\\S+' \"$REPO_ROOT/docker-compose.yml\"" not in build
 
 
 def test_downloaded_artifacts_are_pinned_by_checksum():
@@ -514,3 +553,28 @@ def test_build_script_guards_both_produced_nginx_files():
             rf"grep -q 'facewatch-backend\\\|facewatch-mediamtx'[^\n]*{re.escape(produced)}",
             script,
         ), f"в build-deb.sh нет сторожа docker-имён для собранного {produced}"
+
+
+def test_mediamtx_unit_does_not_read_the_shared_env():
+    """Юнит MediaMTX не читает общий facewatch.env.
+
+    MediaMTX (наследие rtsp-simple-server) разбирает переменные окружения с
+    префиксом RTSP_ как свои настройки. В facewatch.env лежит
+    RTSP_ENCRYPTION_KEY — ключ шифрования учёток камер, — и MediaMTX,
+    получив его, не стартует: «RTSP_ENCRYPTION: json: Unmarshal(nil
+    *conf.alias)» (снято на 1.16.1). Сейчас юнит читает свой mediamtx.env, и
+    это разделение — не вкус, а условие запуска слоя записи; сторож держит
+    его от «упрощения» до одного общего файла.
+    """
+    unit = (PKG / "deb" / "systemd" / "facewatch-mediamtx.service").read_text(encoding="utf-8")
+    env_files = re.findall(r"^EnvironmentFile=-?(\S+)", unit, re.MULTILINE)
+    assert env_files, "у юнита MediaMTX нет EnvironmentFile — откуда пароль Control API?"
+    assert all(not f.endswith("/facewatch.env") for f in env_files), (
+        f"юнит MediaMTX читает {env_files}: RTSP_ENCRYPTION_KEY из facewatch.env уронит его при старте"
+    )
+    # mediamtx.env пишет скрипт первого запуска — проверяется его here-doc.
+    first_run = (PKG / "deb" / "scripts" / "facewatch-first-run").read_text(encoding="utf-8")
+    m = re.search(r'cat > "\$ETC/mediamtx\.env" <<EOF\n(.*?)\nEOF', first_run, re.S)
+    assert m, "не найдено, где facewatch-first-run пишет mediamtx.env"
+    bad = [l for l in m.group(1).splitlines() if re.match(r"\s*RTSP_", l)]
+    assert not bad, f"в mediamtx.env переменные RTSP_*: {bad}"

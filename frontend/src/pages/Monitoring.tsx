@@ -511,6 +511,15 @@ function StorageCalculator() {
 }
 
 /** Хранилище архива: заполнение, фактический расход, прогноз (SPEC §5, §21). */
+/** «12 мин» / «3.5 ч» / «сутки» — на скольких часах записи построен прогноз.
+ *  Прогноз по десяти минутам и по суткам — разные по надёжности числа (D07). */
+function basisLabel(hours: number | undefined): string {
+  if (hours == null || !Number.isFinite(hours)) return "—";
+  if (hours >= 23.5) return "суткам";
+  if (hours < 1) return `${Math.round(hours * 60)} мин`;
+  return `${hours.toFixed(1)} ч`;
+}
+
 function StoragePanel({ isAdmin }: { isAdmin: boolean }) {
   const [s, setS] = useState<any>(null);
   const [err, setErr] = useState("");
@@ -538,6 +547,12 @@ function StoragePanel({ isAdmin }: { isAdmin: boolean }) {
   return (
     <div className="card" style={{ marginBottom: 16 }}>
       <h3 style={{ marginTop: 0 }}>Хранилище архива</h3>
+      {s.virtual_disk_note && (
+        <div style={{ padding: "8px 12px", borderRadius: 4, marginBottom: 12,
+                      border: "1px solid var(--orange)", fontSize: 13 }}>
+          {s.virtual_disk_note}
+        </div>
+      )}
       {alertText && (
         <div style={{
           padding: "8px 12px", borderRadius: 4, marginBottom: 12,
@@ -551,7 +566,7 @@ function StoragePanel({ isAdmin }: { isAdmin: boolean }) {
           hint={`свободно ${s.disk_free_gb} ГБ из ${s.disk_total_gb} ГБ`} />
         <Metric label="Хватит места на" value={left}
           hint={s.forecast_source === "measured"
-            ? `по фактическому расходу ${s.measured_gb_per_day} ГБ/сут`
+            ? `по фактическому расходу ${s.measured_gb_per_day} ГБ/сут · по ${basisLabel(s.forecast_basis_hours)} записи`
             : `расчётно, ${s.nominal_gb_per_day} ГБ/сут — фактических данных пока нет`} />
         <Metric label="Расход за сутки" value={`${s.measured_gb_per_day} ГБ`}
           hint={`расчётный ${s.nominal_gb_per_day} ГБ · сегментов ${s.segments_last_day}`} />

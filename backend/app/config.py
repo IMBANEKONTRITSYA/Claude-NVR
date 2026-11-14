@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "change-me"
     RTSP_ENCRYPTION_KEY: str = "ZmFjZXdhdGNoLWRldi1rZXktMzJieXRlcy1iYXNlNjQ="
     MEDIA_PATH: str = "/media"
+    # RTSP MediaMTX — источник снимка для камер без аналитики (D04): кадр
+    # снимается с пути, который MediaMTX и так тянет с камеры, повторного
+    # подключения к камере нет. Те же переменные, что у воркера: в пакете
+    # их задаёт facewatch.env (127.0.0.1:8554), в docker-compose хватает
+    # умолчания — имени сервиса.
+    MEDIAMTX_HOST: str = "mediamtx"
+    MEDIAMTX_PORT: int = 8554
     ADMIN_PASSWORD: str = "admin"
     # SPEC §11 «Резервное копирование: автоматическое раз в сутки + ручной
     # запуск». Каталог общий для всех, кто пишет дампы: cron-контейнера
