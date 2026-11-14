@@ -27,7 +27,11 @@ allowed-tools: Bash(git diff:*), Bash(git log:*), Bash(git status), Bash(git fet
    - Не уйдёт ли новый тест в `skip` в CI (нет Postgres/ffmpeg/pg_dump)
    - Порог покрытия backend — 77 %
 
-4. **Документация** — `docs/API_DOCS.md`, `docs/USER_GUIDE.md`, `docs/CHANGELOG.md`
+4. **Объём (режим MVP, см. CLAUDE.md)**
+   - Изменение чинит пункт MVP или красный CI, а не добавляет новую функцию
+   - Нет попутного рефакторинга и посторонних файлов; новые отчёты/аудиты вместо исправления — 🟡
+
+5. **Документация** — `docs/API_DOCS.md`, `docs/USER_GUIDE.md`, `docs/CHANGELOG.md`
 
 ## Формат отчёта
 
