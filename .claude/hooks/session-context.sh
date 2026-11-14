@@ -5,7 +5,7 @@ cd "${CLAUDE_PROJECT_DIR:-.}" 2>/dev/null || exit 0
 
 echo "=== Контекст сессии FaceWatch ==="
 echo "Ветка: $(git branch --show-current 2>/dev/null || echo 'не в git')"
-echo "Рабочая база для PR: claude/pensive-brown-28588t (main пустой)"
+echo "Рабочая база для PR: claude/pensive-brown-28588t (main — стабильная копия; PR с head = рабочая ветка не открывать)"
 echo "Изменённых файлов: $(git status --short 2>/dev/null | wc -l | tr -d ' ')"
 echo "Последний коммит: $(git log -1 --pretty=format:'%h %s' 2>/dev/null || echo 'нет')"
 

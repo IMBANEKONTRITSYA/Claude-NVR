@@ -9,7 +9,7 @@ allowed-tools: Bash(git diff:*), Bash(git log:*), Bash(git status), Bash(git fet
 ## Шаги
 
 1. **Определи изменения**
-   - База — `claude/pensive-brown-28588t` (`main` в этом репозитории пустой):
+   - База — рабочая ветка `claude/pensive-brown-28588t` (`main` — её стабильная копия):
      `git diff origin/claude/pensive-brown-28588t...HEAD --stat`
    - Если ветки нет локально — `git fetch --depth=50 origin claude/pensive-brown-28588t`
    - Прочитай полный дифф
