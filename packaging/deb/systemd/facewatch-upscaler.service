@@ -1,0 +1,35 @@
+[Unit]
+Description=FaceWatch: нейросетевой апскейл лиц (upscaler)
+Documentation=file:///usr/share/doc/facewatch/README.md
+After=network-online.target postgresql.service redis-server.service facewatch-first-run.service
+Wants=network-online.target
+Requires=facewatch-first-run.service
+PartOf=facewatch.target
+
+[Service]
+Type=simple
+User=facewatch
+Group=facewatch
+WorkingDirectory=@PREFIX@/app/upscaler
+EnvironmentFile=/etc/facewatch/facewatch.env
+ExecStart=@PREFIX@/venv/upscaler/bin/python upscaler.py
+Restart=always
+RestartSec=10s
+# Числа из docker-compose.yml (deploy.resources.limits сервиса upscaler):
+# 2 ядра и 3 ГБ. Апскейл по SPEC §15 «не влияет на скорость live-детекции»,
+# поэтому квота здесь — не про производительность апскейла, а про то,
+# чтобы он не отобрал процессор у аналитики и записи.
+CPUQuota=200%
+MemoryMax=3G
+Environment=HOME=/var/lib/facewatch
+Environment=PYTHONUNBUFFERED=1
+ProtectSystem=strict
+ReadWritePaths=/var/lib/facewatch
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=facewatch.target

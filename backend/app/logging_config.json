@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "filters": {
+    "redact_token": {
+      "()": "app.logging_utils.RedactTokenFilter"
+    }
+  },
+  "formatters": {
+    "default": {
+      "()": "uvicorn.logging.DefaultFormatter",
+      "fmt": "%(levelprefix)s %(message)s",
+      "use_colors": null
+    },
+    "access": {
+      "()": "app.logging_utils.RedactedAccessFormatter",
+      "fmt": "%(levelprefix)s %(client_addr)s - \"%(request_line)s\" %(status_code)s"
+    }
+  },
+  "handlers": {
+    "default": {
+      "formatter": "default",
+      "class": "logging.StreamHandler",
+      "stream": "ext://sys.stderr",
+      "filters": [
+        "redact_token"
+      ]
+    },
+    "access": {
+      "formatter": "access",
+      "class": "logging.StreamHandler",
+      "stream": "ext://sys.stdout",
+      "filters": [
+        "redact_token"
+      ]
+    }
+  },
+  "loggers": {
+    "uvicorn": {
+      "handlers": [
+        "default"
+      ],
+      "level": "INFO",
+      "propagate": false
+    },
+    "uvicorn.error": {
+      "level": "INFO"
+    },
+    "uvicorn.access": {
+      "handlers": [
+        "access"
+      ],
+      "level": "INFO",
+      "propagate": false
+    }
+  }
+}

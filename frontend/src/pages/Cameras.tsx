@@ -1,0 +1,781 @@
+import { useEffect, useState } from "react";
+import { ALL_LOCATIONS, filterCameras, locationGroups } from "../cameraGroups";
+import { api, camerasExportUrl } from "../api";
+import { useUI } from "../ui";
+import {
+  ALL_DAYS, DAY_LABELS, DEFAULT_WINDOW, DetectionSchedule, DetectionWindow,
+  EMPTY_SCHEDULE, MAX_WINDOWS, SCHEDULE_PRESETS,
+  describeWindow, schedulePayload, scheduleFromCamera,
+} from "../detectionSchedule";
+
+const EMPTY_FORM = {
+  // Режим по умолчанию — только запись (SPEC §2): аналитика включается явно
+  // на выбранных камерах, а не на каждой добавленной.
+  name: "", rtsp_url: "", sub_rtsp_url: "", location: "", enabled: true, mode: "record_only",
+  onvif_enabled: false, onvif_host: "", onvif_port: 80, onvif_username: "", onvif_password: "",
+  // SPEC §5: собственная глубина хранения. Пустая строка — «следовать за
+  // глобальной настройкой»; в payload уходит null, а не 0 (см. submit).
+  retention_days: "",
+  // SPEC §6: расписание детекции. Выключенное — «детекция круглосуточно»
+  // (в payload уходит null, см. submit).
+  detection_schedule: EMPTY_SCHEDULE as DetectionSchedule,
+  // SPEC §6: «запись только при движении (опционально)». Выключено по
+  // умолчанию: режим удаляет уже записанное, и включаться должен явно.
+  record_on_motion: false,
+};
+
+/** Редактор расписания детекции камеры (SPEC §6: «расписание детекции
+ *  (день/ночь, рабочие часы)»).
+ *
+ *  Показывается только для режима `analytics`: расписание управляет слоем
+ *  аналитики и на запись не влияет (§2), а у камеры `record_only` его не к
+ *  чему применять — поле там только сбивало бы с толку. */
+function DetectionScheduleEditor({ value, onChange }: {
+  value: DetectionSchedule; onChange: (s: DetectionSchedule) => void;
+}) {
+  const setWindow = (i: number, patch: Partial<DetectionWindow>) =>
+    onChange({ ...value, windows: value.windows.map((w, j) => (j === i ? { ...w, ...patch } : w)) });
+
+  const toggleDay = (i: number, day: number) => {
+    const days = value.windows[i].days;
+    setWindow(i, { days: days.includes(day) ? days.filter(d => d !== day) : [...days, day].sort((a, b) => a - b) });
+  };
+
+  return (
+    <div className="field">
+      <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <input type="checkbox" style={{ width: "auto" }} checked={value.enabled}
+          onChange={e => onChange({
+            ...value,
+            enabled: e.target.checked,
+            // Включение с нулём окон означало бы «не детектировать никогда»
+            // (schedulePayload превращает это в null, но пустая форма без
+            // единой строки просто непонятна) — сразу даём первое окно.
+            windows: e.target.checked && value.windows.length === 0 ? [DEFAULT_WINDOW] : value.windows,
+          })} />
+        Детекция по расписанию
+      </label>
+      <div className="hint">
+        Выключено — детекция идёт круглосуточно. Расписание касается только
+        аналитики: запись ведётся всегда. Вне окна камера не декодируется
+        вовсе, поэтому «только ночью» экономит процессор в разы.
+      </div>
+
+      {value.enabled && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+            {SCHEDULE_PRESETS.map(p => (
+              <button key={p.label} type="button" className="btn sm secondary"
+                onClick={() => onChange({ enabled: true, windows: p.windows.map(w => ({ ...w })) })}>
+                {p.label}
+              </button>
+            ))}
+          </div>
+
+          {value.windows.map((w, i) => (
+            <div key={i} className="sched-window">
+              <div className="sched-row">
+                <input type="time" value={w.start} style={{ width: 110 }}
+                  onChange={e => setWindow(i, { start: e.target.value })} />
+                <span className="muted">—</span>
+                <input type="time" value={w.end} style={{ width: 110 }}
+                  onChange={e => setWindow(i, { end: e.target.value })} />
+                <div className="sched-days">
+                  {DAY_LABELS.map((label, d) => (
+                    <button key={d} type="button"
+                      className={`btn sm ${w.days.includes(d) ? "" : "secondary"}`}
+                      onClick={() => toggleDay(i, d)}>{label}</button>
+                  ))}
+                </div>
+                <button type="button" className="btn sm danger" title="Удалить окно"
+                  onClick={() => onChange({ ...value, windows: value.windows.filter((_, j) => j !== i) })}>✕</button>
+              </div>
+              {/* Подпись обязательна для ночных окон: без неё 22:00–06:00
+                  выглядит опечаткой, и его «исправляют» на 06:00–22:00 —
+                  то есть ровно на противоположное. */}
+              <div className="hint">{describeWindow(w)}</div>
+            </div>
+          ))}
+
+          {value.windows.length < MAX_WINDOWS && (
+            <button type="button" className="btn sm secondary"
+              onClick={() => onChange({ ...value, windows: [...value.windows, { ...DEFAULT_WINDOW, days: [...ALL_DAYS] }] })}>
+              + Добавить интервал
+            </button>
+          )}
+          {value.windows.length === 0 && (
+            <div className="hint">
+              Ни одного интервала — расписание не будет сохранено, детекция
+              останется круглосуточной.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function Cameras() {
+  const { toast, confirm } = useUI();
+  const [cams, setCams] = useState<any[]>([]);
+  const [form, setForm] = useState(EMPTY_FORM);
+  const [editing, setEditing] = useState<number | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<string>("");
+  const [discovering, setDiscovering] = useState(false);
+  const [discovered, setDiscovered] = useState<any[] | null>(null);
+  const [subnet, setSubnet] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [bulkAdding, setBulkAdding] = useState(false);
+  const [bulkResult, setBulkResult] = useState<any | null>(null);
+  const [loadingProfiles, setLoadingProfiles] = useState(false);
+  const [profiles, setProfiles] = useState<any[] | null>(null);
+  const [tab, setTab] = useState<"form" | "scan" | "io">("form");
+  // SPEC §3: импорт/экспорт конфигурации камер
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<any | null>(null);
+  const [exportSecrets, setExportSecrets] = useState(false);
+  const [filter, setFilter] = useState("");
+  // Выбранная группа локаций (SPEC §3). Пусто — весь парк.
+  const [group, setGroup] = useState(ALL_LOCATIONS);
+  // Учётные данные для поиска в сети — свои, а не из формы камеры. Раньше
+  // массовое добавление брало логин и пароль из полей редактируемой камеры,
+  // и чтобы найти камеры в сети, приходилось сперва включить на ней галку
+  // «ONVIF-события движения» — настройку, к поиску отношения не имеющую.
+  const [scanUser, setScanUser] = useState("");
+  const [scanPass, setScanPass] = useState("");
+
+  const load = () => api.cameras().then((list: any[]) => {
+    setCams(list);
+    // Камера, которую правили, исчезла (удалена здесь или в другой вкладке)
+    // — выходим из режима редактирования. Иначе форма продолжала бы слать
+    // PUT на несуществующий id и отвечать «Камера не найдена» на каждое
+    // сохранение, а список при этом стоял бы пустой.
+    setEditing(prev => {
+      if (prev !== null && !list.some(c => c.id === prev)) {
+        setForm(EMPTY_FORM);
+        return null;
+      }
+      return prev;
+    });
+  }).catch(() => {});
+  useEffect(() => { load(); }, []);
+
+  /** Открывает камеру в форме, подтянув её RTSP-адрес (он не приходит в списке). */
+  const startEdit = async (c: any) => {
+    setEditing(c.id);
+    setTestResult("");
+    const base = {
+      name: c.name, rtsp_url: "", sub_rtsp_url: "", location: c.location, enabled: c.enabled,
+      mode: c.mode || "record_only",
+      retention_days: c.retention_days == null ? "" : String(c.retention_days),
+      // Расписание возвращается в форму как есть: иначе сохранение любой
+      // другой правки камеры стирало бы его — та же ошибка, что была с
+      // ONVIF-полями.
+      detection_schedule: scheduleFromCamera(c.detection_schedule),
+      // По той же причине, что и расписание: не вернув флаг в форму,
+      // сохранение любой другой правки выключало бы режим.
+      record_on_motion: !!c.record_on_motion,
+      onvif_enabled: !!c.onvif_enabled, onvif_host: c.onvif_host || "",
+      onvif_port: c.onvif_port || 80, onvif_username: c.onvif_username || "",
+      onvif_password: "",
+    };
+    setForm(base);
+    try {
+      const { rtsp_url } = await api.camRtsp(c.id);
+      setForm(f => ({ ...f, rtsp_url }));
+    } catch (e: any) {
+      // Адрес не отдался — честно говорим об этом, а не оставляем пустое
+      // поле молча: сохранение с пустым адресом отвергнет валидатор, и
+      // причина была бы неочевидна.
+      toast(`Не удалось получить RTSP-адрес камеры: ${e.message}`, "err");
+    }
+  };
+
+  const submit = async () => {
+    try {
+      // Пустое поле глубины хранения — это null («следовать за глобальной»),
+      // а не 0: бэкенд отвергает 0 (ge=1), и без приведения сохранение
+      // камеры без собственного срока падало бы с 422.
+      const payload = {
+        ...form,
+        retention_days: form.retention_days === "" ? null : Number(form.retention_days),
+        // Выключенное расписание и расписание без окон — оба null
+        // («круглосуточно»). Пустой список окон означал бы на сервере
+        // «не детектировать никогда».
+        detection_schedule: schedulePayload(form.detection_schedule),
+      };
+      if (editing) await api.camUpdate(editing, payload);
+      else await api.camAdd(payload);
+      setForm(EMPTY_FORM);
+      setEditing(null);
+      load();
+      toast(editing ? "Камера обновлена" : "Камера добавлена", "ok");
+    } catch (e: any) {
+      toast(e.message, "err");
+      // «Камера не найдена» на PUT значит, что правившаяся камера исчезла.
+      // Форма обязана выйти из режима редактирования, иначе каждое
+      // следующее сохранение упирается в тот же 404 без единой подсказки,
+      // что делать.
+      if (editing && /не найдена/i.test(e.message || "")) {
+        setEditing(null);
+        setForm(EMPTY_FORM);
+        load();
+      }
+    }
+  };
+
+  const discoverOnvif = async () => {
+    setDiscovering(true); setDiscovered(null);
+    try {
+      // Пустой диапазон = только WS-Discovery (multicast). Он не проходит
+      // через NAT docker-сети, поэтому подсказка в поле объясняет, что при
+      // пустом результате нужно указать подсеть.
+      const r = await api.onvifDiscover(subnet.trim() || undefined);
+      setDiscovered(r.devices || []);
+      if (!r.devices?.length) {
+        toast(
+          subnet.trim()
+            ? "Камеры в этом диапазоне не найдены"
+            : "Камеры не найдены. Укажите диапазон подсети — multicast-поиск не проходит через сеть Docker",
+          "err",
+        );
+      }
+    } catch (e: any) { toast(e.message, "err"); }
+    finally { setDiscovering(false); }
+  };
+
+  // ТЗ 18.7, вторая часть: "получение профилей потоков" — GetProfiles,
+  // затем GetStreamUri по выбранному профилю автозаполняет RTSP URL формы
+  // (аналогично тому, как автообнаружение уже автозаполняет host/port).
+  const loadProfiles = async () => {
+    setLoadingProfiles(true); setProfiles(null);
+    try {
+      const r = await api.onvifProfiles(form.onvif_host, form.onvif_port, form.onvif_username, form.onvif_password);
+      setProfiles(r.profiles || []);
+      if (!r.profiles?.length) toast("Профили потоков не найдены", "err");
+    } catch (e: any) { toast(e.message, "err"); }
+    finally { setLoadingProfiles(false); }
+  };
+
+  // Массовое добавление: имя, основной поток и субпоток каждой камеры
+  // запрашиваются бэкендом у неё самой (OSD → ONVIF-скоуп → модель → IP),
+  // поэтому здесь достаточно передать адрес и учётные данные.
+  const bulkAdd = async () => {
+    setBulkAdding(true); setBulkResult(null);
+    try {
+      const cameras = (discovered || [])
+        .filter(d => selected.includes(d.host))
+        .map(d => ({
+          host: d.host,
+          port: d.port || 80,
+          username: scanUser,
+          password: scanPass,
+          scopes: d.scopes || [],
+        }));
+      const r = await api.onvifBulkAdd(cameras);
+      setBulkResult(r);
+      setSelected([]);
+      load();
+      if (r.added.length) toast(`Добавлено камер: ${r.added.length}`, "ok");
+      else toast("Ни одной камеры добавить не удалось", "err");
+    } catch (e: any) { toast(e.message, "err"); }
+    finally { setBulkAdding(false); }
+  };
+
+  const pickProfile = async (token: string) => {
+    try {
+      const r = await api.onvifStreamUri(form.onvif_host, form.onvif_port, form.onvif_username, form.onvif_password, token);
+      if (r.uri) { setForm({ ...form, rtsp_url: r.uri }); toast("RTSP URL заполнен из профиля", "ok"); }
+    } catch (e: any) { toast(e.message, "err"); }
+  };
+
+  const remove = async (id: number) => {
+    if (!(await confirm("Удалить камеру?"))) return;
+    try {
+      await api.camDelete(id);
+      load();
+      toast("Камера удалена", "ok");
+    } catch (e: any) { toast(e.message, "err"); }
+  };
+
+  // SPEC §3: импорт конфигурации. Загрузка идёт в два шага — сначала
+  // проверка (dry_run), и только по её итогу оператор подтверждает запись.
+  // Файл на 200 камер, применённый вслепую, разом переписывает весь парк,
+  // а показать, что именно изменится, стоит одного запроса.
+  const runImport = async (f: File, dryRun: boolean) => {
+    setImporting(true);
+    try {
+      const r = await api.camerasImport(f, dryRun);
+      setImportResult({ ...r, filename: f.name });
+      if (!r.ok) toast(`Файл не принят: ошибок ${r.errors.length}`, "err");
+      else if (dryRun) toast(`Проверка пройдена: добавится ${r.created}, обновится ${r.updated}`, "ok");
+      else {
+        toast(`Импорт применён: добавлено ${r.created}, обновлено ${r.updated}`, "ok");
+        setImportFile(null);
+        load();
+      }
+    } catch (e: any) {
+      setImportResult(null);
+      toast(e.message, "err");
+    } finally { setImporting(false); }
+  };
+
+  // SPEC §3 «Группировка/пагинация для больших объектов (100+ камер)».
+  // Группы считаются из уже полученного списка — отдельного запроса к API
+  // не нужно, и раскладка не расходится со списком, который под ней.
+  const groups = locationGroups(cams);
+  const shown = filterCameras(cams, group, filter);
+
+  return (
+    <div>
+      <h2>Управление камерами</h2>
+
+      {/* Две независимые задачи — завести камеру вручную и найти камеры в
+          сети — разведены по вкладкам. Подряд на одной странице они дают
+          скролл, в котором список камер уходит за экран. */}
+      <div className="tabs">
+        <button className={tab === "form" ? "active" : ""} onClick={() => setTab("form")}>
+          {editing ? `Редактирование: ${form.name || "камера"}` : "Добавить камеру"}
+        </button>
+        <button className={tab === "scan" ? "active" : ""} onClick={() => setTab("scan")}>
+          Поиск камер в сети (ONVIF)
+        </button>
+        <button className={tab === "io" ? "active" : ""} onClick={() => setTab("io")}>
+          Импорт / экспорт
+        </button>
+      </div>
+
+      {tab === "form" && (
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 24, alignItems: "start" }}>
+          <div>
+            <div className="section">
+              <h4>Основное</h4>
+              <div className="field">
+                <label>Название</label>
+                <input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
+              </div>
+              <div className="field">
+                <label>Локация</label>
+                <input value={form.location} onChange={e => setForm({ ...form, location: e.target.value })} />
+              </div>
+              <div className="field">
+                <label>Режим камеры</label>
+                <select value={form.mode} onChange={e => setForm({
+                  ...form,
+                  mode: e.target.value,
+                  // Перевод в «только запись» снимает и запись по движению:
+                  // без источника движения бэкенд её не примет (400), и
+                  // форма падала бы с ошибкой на несвязанной правке.
+                  record_on_motion: e.target.value === "analytics" && form.record_on_motion,
+                })}>
+                  <option value="record_only">Только запись — непрерывный архив, без распознавания</option>
+                  <option value="analytics">Аналитика — запись плюс детекция и распознавание лиц</option>
+                </select>
+                <div className="hint">
+                  Запись ведётся в обоих режимах. Аналитика заметно нагружает процессор,
+                  поэтому её включают на нескольких выбранных камерах — предел задаётся
+                  в «Настройках» (по умолчанию 2).
+                </div>
+              </div>
+              <div className="field">
+                <label>Глубина хранения этой камеры, суток</label>
+                <input type="number" min={1} max={3650} value={form.retention_days}
+                  placeholder="как в общих настройках"
+                  onChange={e => setForm({ ...form, retention_days: e.target.value })} />
+                <div className="hint">
+                  Пусто — камера следует за глобальной глубиной хранения из «Настроек»
+                  и продолжит следовать за ней при её изменении.
+                </div>
+              </div>
+              {/* Только для аналитики: расписание управляет слоем аналитики
+                  и записи не касается (§2). */}
+              {form.mode === "analytics" && (
+                <DetectionScheduleEditor value={form.detection_schedule}
+                  onChange={s => setForm({ ...form, detection_schedule: s })} />
+              )}
+              {/* SPEC §6 «запись только при движении». Показывается только
+                  для аналитики: источник движения есть лишь у камер,
+                  которые кто-то декодирует. */}
+              {form.mode === "analytics" && (
+                <div className="field">
+                  <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <input type="checkbox" style={{ width: "auto" }}
+                      checked={form.record_on_motion}
+                      onChange={e => setForm({ ...form, record_on_motion: e.target.checked })} />
+                    Хранить только запись с движением
+                  </label>
+                  <div className="hint">
+                    Камера пишется непрерывно (остановить запись по движению нельзя —
+                    слой записи независим от аналитики), но фрагменты, в которых
+                    аналитика движения не видела, удаляются из архива досрочно, не
+                    дожидаясь глубины хранения. Промежутки, когда аналитика не
+                    работала — перезапуск, пауза по расписанию, отвал потока, —
+                    сохраняются целиком: «не смотрели» не то же самое, что
+                    «движения не было».
+                  </div>
+                </div>
+              )}
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                <input type="checkbox" style={{ width: "auto" }} checked={form.enabled}
+                  onChange={e => setForm({ ...form, enabled: e.target.checked })} />
+                Активна
+              </label>
+            </div>
+          </div>
+
+          <div>
+            <div className="section">
+              <h4>Потоки</h4>
+              <div className="field">
+                <label>RTSP основного потока — запись и просмотр</label>
+                <input value={form.rtsp_url} onChange={e => setForm({ ...form, rtsp_url: e.target.value })}
+                  placeholder="rtsp://user:pass@ip:554/stream" />
+              </div>
+              <div className="field">
+                <label>RTSP субпотока — только для детекции</label>
+                <input value={form.sub_rtsp_url} onChange={e => setForm({ ...form, sub_rtsp_url: e.target.value })}
+                  placeholder="640x360, необязательно" />
+                <div className="hint">
+                  В архив пишется всегда основной поток. Субпоток используется
+                  только слоем аналитики и только если он не ниже 640×480.
+                </div>
+              </div>
+              <button className="btn secondary sm" disabled={!form.rtsp_url || testing}
+                onClick={async () => {
+                  setTesting(true); setTestResult("");
+                  try {
+                    const r = await api.testRtsp(form.rtsp_url);
+                    setTestResult(r.ok ? `OK — ${r.info?.split("\n")[0] || "поток доступен"}` : `Ошибка: ${r.error}`);
+                  } catch (e: any) { setTestResult(`Ошибка: ${e.message}`); }
+                  finally { setTesting(false); }
+                }}>{testing ? "Проверка..." : "Проверить RTSP"}</button>
+              {testResult && <div className="hint" style={{ marginTop: 6 }}>{testResult}</div>}
+            </div>
+
+            <div className="section">
+              <h4>ONVIF</h4>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
+                <input type="checkbox" style={{ width: "auto" }} checked={form.onvif_enabled}
+                  onChange={e => setForm({ ...form, onvif_enabled: e.target.checked })} />
+                События движения от камеры (вместо анализа кадров)
+              </label>
+              {form.onvif_enabled && (
+                <>
+                  <div className="grid" style={{ gridTemplateColumns: "2fr 1fr" }}>
+                    <div className="field"><label>Адрес камеры</label>
+                      <input value={form.onvif_host} placeholder="192.168.1.64"
+                        onChange={e => setForm({ ...form, onvif_host: e.target.value })} /></div>
+                    <div className="field"><label>Порт</label>
+                      <input type="number" value={form.onvif_port}
+                        onChange={e => setForm({ ...form, onvif_port: +e.target.value })} /></div>
+                    <div className="field"><label>Логин</label>
+                      <input value={form.onvif_username}
+                        onChange={e => setForm({ ...form, onvif_username: e.target.value })} /></div>
+                    <div className="field"><label>Пароль{editing ? " (пусто — не менять)" : ""}</label>
+                      <input type="password" value={form.onvif_password}
+                        onChange={e => setForm({ ...form, onvif_password: e.target.value })} /></div>
+                  </div>
+                  <button type="button" className="btn secondary sm"
+                    disabled={!form.onvif_host || loadingProfiles} onClick={loadProfiles}>
+                    {loadingProfiles ? "Запрос..." : "Получить профили потоков"}
+                  </button>
+                  {profiles && profiles.length > 0 && (
+                    <div style={{ marginTop: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      {profiles.map((p, i) => (
+                        <button key={i} type="button" className="btn secondary sm"
+                          onClick={() => pickProfile(p.token)}>{p.name || p.token}</button>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="toolbar" style={{ marginTop: 16, marginBottom: 0, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+          <button className="btn" onClick={submit}>{editing ? "Сохранить" : "Добавить камеру"}</button>
+          {editing && (
+            <button className="btn secondary"
+              onClick={() => { setEditing(null); setForm(EMPTY_FORM); setTestResult(""); }}>
+              Отмена
+            </button>
+          )}
+        </div>
+      </div>
+      )}
+
+      {tab === "scan" && (
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div className="section">
+          <h4>Где и под какой учётной записью искать</h4>
+          <div className="grid" style={{ gridTemplateColumns: "2fr 1fr 1fr" }}>
+            <div className="field">
+              <label>Диапазон поиска (CIDR)</label>
+              <input value={subnet} placeholder="192.168.105.0/24"
+                onChange={e => setSubnet(e.target.value)} />
+            </div>
+            <div className="field"><label>Логин камер</label>
+              <input value={scanUser} onChange={e => setScanUser(e.target.value)} /></div>
+            <div className="field"><label>Пароль камер</label>
+              <input type="password" value={scanPass} onChange={e => setScanPass(e.target.value)} /></div>
+          </div>
+          <div className="hint" style={{ marginBottom: 10 }}>
+            Multicast-поиск (WS-Discovery) не проходит через сеть Docker и обычно
+            ничего не находит — укажите подсеть, в которой стоят камеры. Например,
+            если камера доступна по 192.168.105.19, введите 192.168.105.0/24.
+            Перебор до 1024 адресов, только приватные диапазоны. Логин и пароль
+            должны подходить ко всем отмеченным камерам.
+          </div>
+          <button type="button" className="btn" disabled={discovering} onClick={discoverOnvif}>
+            {discovering ? "Поиск..." : "Найти камеры в сети"}
+          </button>
+        </div>
+
+        {discovered && discovered.length > 0 && (
+          <div className="section">
+            <h4>Найдено камер: {discovered.length}</h4>
+            <div className="toolbar">
+              <button type="button" className="btn secondary sm"
+                onClick={() => setSelected(
+                  selected.length === discovered.length ? [] : discovered.map(d => d.host))}>
+                {selected.length === discovered.length ? "Снять все" : "Выбрать все"}
+              </button>
+              <span className="muted" style={{ fontSize: 12 }}>выбрано: {selected.length}</span>
+              <button type="button" className="btn" style={{ marginLeft: "auto" }}
+                disabled={!selected.length || bulkAdding} onClick={bulkAdd}>
+                {bulkAdding ? "Добавление..." : `Добавить выбранные (${selected.length})`}
+              </button>
+            </div>
+            <div className="hint" style={{ marginBottom: 8 }}>
+              Имя, основной поток и субпоток подтянутся с каждой камеры автоматически.
+              «В форму» переносит один адрес в карточку камеры для ручной настройки.
+            </div>
+            {/* Сетка, а не столбик: в реальной сети находятся десятки камер.
+                Ограничение по высоте с прокруткой не даёт списку вытеснить
+                кнопку добавления за экран. */}
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(310px, 1fr))",
+              gap: 6, maxHeight: 320, overflowY: "auto", padding: 6,
+              border: "1px solid var(--border)", borderRadius: 6,
+            }}>
+              {discovered.map((d, i) => {
+                const scope = d.scopes?.find((s: string) => s.includes("/name/"));
+                const label = scope ? decodeURIComponent(scope.split("/name/")[1]) : null;
+                const isSelected = selected.includes(d.host);
+                return (
+                  <label key={i} title={label ? `${d.host} — ${label}` : d.host}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 6, cursor: "pointer",
+                      padding: "5px 7px", borderRadius: 4, minWidth: 0,
+                      background: isSelected ? "#1e3a5f" : "transparent",
+                    }}>
+                    <input type="checkbox" checked={isSelected} style={{ width: "auto" }}
+                      onChange={e => setSelected(e.target.checked
+                        ? [...selected, d.host]
+                        : selected.filter(h => h !== d.host))} />
+                    {/* Адрес и имя — разные элементы, а не один обрезаемый:
+                        пока они лежали в общем span с ellipsis, длинное имя
+                        камеры съедало сам IP и в списке оставалось «192.1…». */}
+                    <span style={{ fontFamily: "monospace", fontSize: 12, flexShrink: 0 }}>{d.host}</span>
+                    {label && (
+                      <span className="muted" style={{
+                        fontSize: 11, minWidth: 0,
+                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      }}>{label}</span>
+                    )}
+                    <button type="button" className="btn secondary"
+                      style={{ marginLeft: "auto", padding: "1px 7px", fontSize: 11, flexShrink: 0 }}
+                      onClick={ev => {
+                        ev.preventDefault();
+                        setForm({ ...form, onvif_enabled: true, onvif_host: d.host, onvif_port: d.port || 80,
+                                  onvif_username: scanUser, onvif_password: scanPass });
+                        setTab("form");
+                      }}>
+                      в форму
+                    </button>
+                  </label>
+                );
+              })}
+            </div>
+            {bulkResult && (
+              <div style={{ marginTop: 10, fontSize: 12 }}>
+                {bulkResult.added.length > 0 && (
+                  <div style={{ color: "var(--green)" }}>
+                    Добавлено: {bulkResult.added.map((a: any) =>
+                      `${a.name}${a.has_substream ? "" : " (без субпотока)"}`).join(", ")}
+                  </div>
+                )}
+                {bulkResult.skipped.length > 0 && (
+                  <div className="muted">
+                    Пропущено: {bulkResult.skipped.map((s: any) => `${s.host} — ${s.reason}`).join("; ")}
+                  </div>
+                )}
+                {bulkResult.failed.length > 0 && (
+                  <div style={{ color: "var(--red)" }}>
+                    Не удалось: {bulkResult.failed.map((f: any) => `${f.host} — ${f.error}`).join("; ")}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      )}
+
+      {/* SPEC §3: импорт/экспорт конфигурации камер (CSV/JSON). Ради этого
+          объект на 250 камер переносится с тестового стенда на боевой
+          сервер файлом, а не двумя сотнями заполнений формы. */}
+      {tab === "io" && (
+      <div className="card">
+        <h3 style={{ marginTop: 0 }}>Экспорт конфигурации</h3>
+        <p className="muted" style={{ marginTop: 0 }}>
+          Выгружаются все {cams.length} камер: имя, локация, режим, RTSP-адреса,
+          глубина хранения, параметры ONVIF, расписание детекции и зоны
+          детекции (ROI). Расписание и зоны занимают по одной колонке в виде
+          JSON — правьте их в интерфейсе камеры, а не в Excel.
+          Пароли в RTSP-адресах по умолчанию
+          заменены на <code>***</code> — такой файл безопасно передавать и хранить,
+          а при загрузке обратно пароль уже заведённой камеры сохраняется.
+        </p>
+        <label className="row" style={{ gap: 6, marginBottom: 10 }}>
+          <input type="checkbox" checked={exportSecrets}
+            onChange={e => setExportSecrets(e.target.checked)} />
+          <span>Выгрузить пароли камер открытым текстом (действие пишется в журнал аудита)</span>
+        </label>
+        <div className="row">
+          <a className="btn" href={camerasExportUrl("csv", exportSecrets)}>Скачать CSV</a>
+          <a className="btn secondary" href={camerasExportUrl("json", exportSecrets)}>Скачать JSON</a>
+        </div>
+
+        <h3 style={{ marginTop: 24 }}>Импорт конфигурации</h3>
+        <p className="muted" style={{ marginTop: 0 }}>
+          Принимается CSV или JSON того же формата. Камера опознаётся по полю
+          <code> name</code>: известное имя — обновление, новое — добавление.
+          Файл применяется целиком: если хоть в одной строке ошибка, не
+          применяется ни одна. Колонки, которой в файле нет, изменение не
+          коснётся: файл прежней версии без <code>detection_schedule</code>,
+          <code> roi</code> и <code>record_on_motion</code> не снимет расписание,
+          зоны и режим записи по движению с уже заведённых камер.
+          Пустая ячейка в этих колонках — наоборот, снимает настройку.
+        </p>
+        <div className="row">
+          <input type="file" accept=".csv,.json,text/csv,application/json"
+            onChange={e => { setImportFile(e.target.files?.[0] || null); setImportResult(null); }} />
+          <button className="btn secondary" disabled={!importFile || importing}
+            onClick={() => importFile && runImport(importFile, true)}>
+            {importing ? "Проверка…" : "Проверить файл"}
+          </button>
+          <button className="btn" disabled={!importFile || importing}
+            onClick={async () => {
+              if (!importFile) return;
+              if (!(await confirm("Применить конфигурацию из файла? Существующие камеры с совпадающими именами будут перезаписаны."))) return;
+              runImport(importFile, false);
+            }}>
+            Применить
+          </button>
+        </div>
+        {importResult && (
+          <div style={{ marginTop: 12, fontSize: 13 }}>
+            <div className={importResult.ok ? "" : "muted"}>
+              Файл <strong>{importResult.filename}</strong>: строк {importResult.total},
+              {" "}добавить {importResult.created}, обновить {importResult.updated}
+              {importResult.dry_run ? " (проверка, изменения не применены)" : ""}
+            </div>
+            {importResult.errors?.length > 0 && (
+              <ul style={{ color: "var(--red)", marginBottom: 0 }}>
+                {importResult.errors.map((e: any, i: number) => (
+                  <li key={i}>
+                    {e.row ? `строка ${e.row}` : "файл"}
+                    {e.name ? ` (${e.name})` : ""}: {e.error}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+      </div>
+      )}
+
+      <div className="card">
+        <div className="toolbar">
+          <strong>Камеры: {cams.length}</strong>
+          <span className="muted" style={{ fontSize: 12 }}>
+            в сети {cams.filter(c => c.status === "online").length},
+            аналитика {cams.filter(c => c.mode === "analytics").length}
+          </span>
+          {/* SPEC §3 «Группировка/пагинация для больших объектов (100+
+              камер)». Пагинации здесь сознательно нет: замерено на 250
+              камерах — список целиком это 84.7 КБ и ~9 мс, страница
+              открывается за 555 мс, то есть листать нечего ради скорости.
+              Не хватало другого — разложить парк по объекту: вопрос
+              оператора звучит как «покажи корпус 7», и текстовый фильтр
+              отвечает на него только если помнить точное написание.
+              Группа и фильтр работают вместе, а не вместо друг друга. */}
+          <select value={group} onChange={e => setGroup(e.target.value)}
+            style={{ marginLeft: "auto", maxWidth: 220 }}
+            title="Группа камер по локации">
+            <option value={ALL_LOCATIONS}>Все локации ({cams.length})</option>
+            {groups.map(g => (
+              <option key={g.location} value={g.location}>{g.location} ({g.count})</option>
+            ))}
+          </select>
+          <input value={filter} onChange={e => setFilter(e.target.value)}
+            placeholder="Фильтр по имени, локации или ID"
+            style={{ maxWidth: 280 }} />
+        </div>
+        <div className="table-scroll">
+          <table>
+            <thead><tr>
+              <th style={{ width: 56 }}>ID</th><th>Название</th><th>Локация</th>
+              <th style={{ width: 130 }}>Режим</th><th style={{ width: 90 }}>Статус</th>
+              <th style={{ width: 90 }}>Активна</th><th style={{ width: 150 }}></th>
+            </tr></thead>
+            <tbody>
+              {shown.map(c => (
+                <tr key={c.id}>
+                  <td className="muted">{c.id}</td>
+                  <td>
+                    {c.name}
+                    {c.has_substream && <span className="muted" style={{ fontSize: 10, marginLeft: 6 }} title="У камеры есть субпоток для детекции">SUB</span>}
+                    {c.onvif_enabled && <span className="muted" style={{ fontSize: 10, marginLeft: 6 }} title="Движение — по событиям ONVIF">ONVIF</span>}
+                    {/* SPEC §6: режим удаляет записанное, и по списку камер
+                        должно быть видно, на каких он включён, без захода
+                        в форму каждой. */}
+                    {c.record_on_motion && <span className="muted" style={{ fontSize: 10, marginLeft: 6 }} title="В архиве остаются только фрагменты с движением">ДВИЖ</span>}
+                  </td>
+                  <td className="muted">{c.location || "—"}</td>
+                  <td>{c.mode === "analytics" ? "Аналитика" : "Только запись"}</td>
+                  <td><span className={`badge ${c.status}`}>{c.status}</span></td>
+                  <td>
+                    <label style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                      <input type="checkbox" style={{ width: "auto" }} checked={c.enabled} onChange={async e => {
+                        try { await api.camToggle(c.id, e.target.checked); load(); toast(e.target.checked ? "Камера включена" : "Камера отключена", "ok"); }
+                        catch (err: any) { toast(err.message, "err"); }
+                      }} />
+                      {c.enabled ? "да" : "нет"}
+                    </label>
+                  </td>
+                  <td>
+                    <button className="btn secondary sm"
+                      onClick={() => { startEdit(c); setTab("form"); }}>Изм.</button>
+                    <button className="btn danger sm" onClick={() => remove(c.id)} style={{ marginLeft: 4 }}>Удалить</button>
+                  </td>
+                </tr>
+              ))}
+              {shown.length === 0 && (
+                <tr><td colSpan={7} className="empty">
+                  {cams.length ? "Ничего не найдено по фильтру" : "Камер нет"}
+                </td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}

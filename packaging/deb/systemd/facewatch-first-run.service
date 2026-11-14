@@ -1,0 +1,24 @@
+[Unit]
+Description=FaceWatch: подготовка секретов, БД и TLS перед стартом сервисов
+Documentation=file:///usr/share/doc/facewatch/README.md
+# Скрипт создаёт роль, базу и расширение pgvector — без живого postgres он
+# не сделает ничего полезного. Requires, а не Wants: если СУБД не
+# поднялась, сервисы не должны стартовать с пустой конфигурацией и
+# сыпать отказами подключения в journal.
+After=postgresql.service
+Requires=postgresql.service
+PartOf=facewatch.target
+
+[Service]
+# Скрипт идемпотентен (SPEC §26: «повторный запуск скрипта первого запуска
+# безопасен»), поэтому он же выполняется и в postinst, и на каждой
+# загрузке: второй и последующие проходы ничего не меняют, но чинят
+# ситуацию, когда при установке postgres ещё не отвечал.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/facewatch-first-run
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=facewatch.target

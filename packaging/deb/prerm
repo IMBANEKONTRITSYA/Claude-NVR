@@ -1,0 +1,31 @@
+#!/bin/sh
+# prerm пакета facewatch.
+set -e
+
+case "$1" in
+remove|deconfigure)
+    # Останавливаются только при удалении. На апгрейде (`$1` = upgrade)
+    # сервисы намеренно НЕ трогаются здесь: их перезапустит postinst уже с
+    # новым кодом, а лишняя остановка добавила бы к апгрейду простой записи
+    # длиной во всю распаковку пакета (несколько минут на ~3 ГБ дерева).
+    if [ -d /run/systemd/system ]; then
+        systemctl stop facewatch.target >/dev/null 2>&1 || true
+        # Таймер бэкапа гасится первым и отдельно: он не в facewatch.target,
+        # и оставленный включённым он после удаления пакета будил бы
+        # несуществующий юнит каждые сутки.
+        systemctl stop facewatch-backup.timer >/dev/null 2>&1 || true
+        systemctl disable facewatch-backup.timer >/dev/null 2>&1 || true
+        for u in facewatch-backend facewatch-worker facewatch-upscaler \
+                 facewatch-mediamtx facewatch-first-run facewatch-backup; do
+            systemctl stop "$u.service" >/dev/null 2>&1 || true
+        done
+        systemctl disable facewatch.target facewatch-backend.service \
+            facewatch-worker.service facewatch-upscaler.service \
+            facewatch-mediamtx.service facewatch-first-run.service >/dev/null 2>&1 || true
+    fi
+    ;;
+upgrade|failed-upgrade)
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,20 @@
+[Unit]
+Description=FaceWatch: ежесуточная резервная копия базы (SPEC §11)
+Documentation=file:///usr/share/doc/facewatch/BACKUP.md
+
+[Timer]
+# «Автоматическое раз в сутки» (§11). Час совпадает с расписанием
+# cron-контейнера docker-compose (BACKUP_SCHEDULE=0 3 * * *), чтобы
+# поведение двух режимов развёртывания §26 не расходилось на ровном месте.
+OnCalendar=*-*-* 03:00:00
+# Сервер видеонаблюдения работает 24/7, но выключения бывают: если машина
+# стояла в 03:00, дамп снимается сразу после загрузки, а не пропускается
+# до следующих суток.
+Persistent=true
+# Разброс до 15 минут: на объекте с несколькими серверами FaceWatch они
+# иначе пойдут в СУБД и на диски одновременно.
+RandomizedDelaySec=15m
+Unit=facewatch-backup.service
+
+[Install]
+WantedBy=timers.target
