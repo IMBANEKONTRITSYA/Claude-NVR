@@ -237,9 +237,20 @@ async def export_fragment(
     # Каталог удаляется задачей ответа — то есть после того, как файл
     # полностью ушёл клиенту. Удалить его здесь означало бы отдавать
     # FileResponse на уже удалённый файл.
+    # Сколько видео в окне на самом деле есть. Без этого ответ 200 ничего не
+    # говорил о разрывах: на объекте окно 10 с через обрыв камеры отдавалось
+    # файлом 5.8 с (DEPLOY_FINDINGS D05). Скачивание из интерфейса идёт
+    # навигацией браузера и заголовков не видит — там разрыв показывает
+    # шкала архива; заголовки — для внешних клиентов REST API (§12) и для
+    # проверки экспорта без ffprobe.
+    covered_sec = sum(p.duration for p in pieces)
     return FileResponse(
         out_path,
         media_type="video/mp4",
         filename=out_name,
+        headers={
+            "X-Archive-Window-Seconds": f"{window_sec:.3f}",
+            "X-Archive-Covered-Seconds": f"{covered_sec:.3f}",
+        },
         background=BackgroundTask(export_svc.cleanup_workdir, workdir),
     )
