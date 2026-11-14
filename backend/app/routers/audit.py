@@ -7,6 +7,7 @@ from openpyxl import Workbook
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from ..db import get_db
+from ..timeparams import NaiveUtc
 from ..models import AuditLog
 from ..auth import require_role, require_role_query
 from ..pagination import PageParams
@@ -33,8 +34,8 @@ def _base_query(username: str | None, action: str | None, date_from: datetime | 
 async def list_audit(
     username: str | None = None,
     action: str | None = None,
-    date_from: datetime | None = None,
-    date_to: datetime | None = None,
+    date_from: NaiveUtc | None = None,
+    date_to: NaiveUtc | None = None,
     page: PageParams = Depends(),
     _=Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
@@ -85,7 +86,7 @@ def _row_tuple(r):
 async def export_csv(
     _=Depends(_require_audit_export),
     username: str | None = None, action: str | None = None,
-    date_from: datetime | None = None, date_to: datetime | None = None,
+    date_from: NaiveUtc | None = None, date_to: NaiveUtc | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     rows = await _all_rows(db, username, action, date_from, date_to)
@@ -108,7 +109,7 @@ async def export_csv(
 async def export_xlsx(
     _=Depends(_require_audit_export),
     username: str | None = None, action: str | None = None,
-    date_from: datetime | None = None, date_to: datetime | None = None,
+    date_from: NaiveUtc | None = None, date_to: NaiveUtc | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     rows = await _all_rows(db, username, action, date_from, date_to)
