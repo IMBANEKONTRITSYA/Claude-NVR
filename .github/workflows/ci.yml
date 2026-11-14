@@ -371,7 +371,15 @@ jobs:
         # модели в CI недопустимо долгий.
         run: |
           python -m pip install --upgrade pip
-          pip install numpy opencv-python-headless sqlalchemy psycopg2-binary redis pytest
+          # Версии — из upscaler/requirements.txt, а не «последние». Без
+          # закрепления джоба 2026-10-03 подтянула SQLAlchemy 2.1, у которой
+          # драйвер по умолчанию для postgresql:// сменился с psycopg2 на
+          # psycopg 3: `import upscaler` падал на create_engine, conftest
+          # ронял весь прогон, и джоба краснела на любом PR без связи с
+          # его правкой. Образ сервиса ставит закреплённые версии — CI
+          # обязан проверять их же. torch/GFPGAN-стек не ставится намеренно
+          # (тесты его подменяют, см. upscaler/tests).
+          pip install $(grep -E '^(numpy|opencv-python-headless|redis|sqlalchemy|psycopg2-binary)==' requirements.txt) pytest
       - name: Run upscaler tests
         working-directory: upscaler
         run: pytest tests/ -q

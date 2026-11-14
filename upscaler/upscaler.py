@@ -93,26 +93,69 @@ class FaceEvent(Base):
 # ---------------------------------------------------------------------------
 # Бэкенды улучшения
 
+
+class GfpganUnavailable(RuntimeError):
+    """Модель GFPGAN не загружена в этом процессе (нет пакета или весов).
+
+    Отдельный тип, а не общий Exception: `enhance()` обязан отличать его от
+    падения модели на конкретном кадре. Первое — постоянное состояние, о
+    нём сообщается один раз; второе — разовое, и его надо видеть.
+    """
+
+
 _gfpgan = None
+# Загрузка модели провалилась — в этом процессе она больше не пробуется.
+# Кэшируется ИМЕННО провал, а не только успех: профиль пакета `core`
+# (packaging/build-deb.sh) ставится без torch/GFPGAN осознанно, а
+# UPSCALE_BACKEND в facewatch.env.template остаётся `gfpgan`, то есть
+# «модели нет, бэкенд запрошен» — это штатное состояние поддерживаемого
+# развёртывания, а не авария. Без этого флага предзагрузка в main() теряла
+# смысл: она падала, провал никто не запоминал, и каждое событие заново
+# шло в `from gfpgan import ...`. Питон провалившийся импорт не кэширует —
+# модуль снимается из sys.modules, — поэтому попытка повторялась целиком,
+# и на каждое лицо в журнал уезжал одинаковый traceback (замерено: 339
+# байт на событие, ~5.8 МБ/час при 5 FPS в режиме `all`). Сам апскейл при
+# этом работал: результат давал OpenCV-fallback, и именно поэтому дефект
+# не был виден по результату — только по журналу.
+_gfpgan_failed = False
 
 
 def _load_gfpgan():
-    global _gfpgan
+    """Возвращает загруженный GFPGANer либо None, если модель недоступна.
+
+    None вместо исключения — чтобы вызывающая сторона отличала «модели нет»
+    (постоянное состояние процесса, молчаливый откат на OpenCV) от «модель
+    есть, но упала на этом кадре» (разовый случай, его видно в журнале).
+    """
+    global _gfpgan, _gfpgan_failed
     if _gfpgan is not None:
         return _gfpgan
-    from gfpgan import GFPGANer
-    _gfpgan = GFPGANer(
-        model_path=GFPGAN_MODEL_URL,
-        upscale=2,
-        arch="clean",
-        channel_multiplier=2,
-        bg_upsampler=None,
-    )
+    if _gfpgan_failed:
+        return None
+    try:
+        from gfpgan import GFPGANer
+        _gfpgan = GFPGANer(
+            model_path=GFPGAN_MODEL_URL,
+            upscale=2,
+            arch="clean",
+            channel_multiplier=2,
+            bg_upsampler=None,
+        )
+    except Exception:
+        _gfpgan_failed = True
+        logger.warning(
+            "GFPGAN недоступен, апскейл идёт OpenCV-fallback'ом; "
+            "сообщение выводится один раз за процесс",
+            exc_info=True,
+        )
+        return None
     return _gfpgan
 
 
 def enhance_gfpgan(img: np.ndarray) -> np.ndarray:
     restorer = _load_gfpgan()
+    if restorer is None:
+        raise GfpganUnavailable("модель GFPGAN не загружена")
     _, _, restored = restorer.enhance(img, has_aligned=False, only_center_face=True, paste_back=True)
     return restored if restored is not None else enhance_opencv(img)
 
@@ -131,8 +174,14 @@ def enhance(img: np.ndarray) -> tuple[np.ndarray, str]:
     if UPSCALE_BACKEND == "gfpgan":
         try:
             return enhance_gfpgan(img), "gfpgan"
+        except GfpganUnavailable:
+            # Модели нет — про это уже сказано один раз при загрузке.
+            # Здесь молчим: иначе тот же текст уезжал бы на каждое лицо.
+            pass
         except Exception:
-            logger.warning("GFPGAN недоступен, fallback на OpenCV", exc_info=True)
+            # Модель есть, но не справилась с ЭТИМ кадром. Такое стоит
+            # видеть поштучно: оно зависит от картинки, а не от сборки.
+            logger.warning("GFPGAN не справился с кадром, fallback на OpenCV", exc_info=True)
     return enhance_opencv(img), "opencv"
 
 
@@ -244,11 +293,11 @@ def main():
     _lower_priority()
     logger.info("старт апскейлера", extra={"backend": UPSCALE_BACKEND})
     if UPSCALE_BACKEND == "gfpgan":
-        try:
-            _load_gfpgan()
+        # Предзагрузка здесь — чтобы цена первого кадра не досталась первому
+        # событию. Про неудачу `_load_gfpgan()` сообщает сам (один раз) и
+        # запоминает её, поэтому `enhance()` дальше не ходит в импорт вовсе.
+        if _load_gfpgan() is not None:
             logger.info("модель GFPGAN загружена")
-        except Exception:
-            logger.warning("не удалось загрузить GFPGAN заранее", exc_info=True)
     # Таймаут blpop — верхняя граница задержки реакции на SIGTERM: пока
     # висит блокирующее чтение очереди, установленный из обработчика сигнала
     # флаг не проверяется. 2с с запасом укладываются в grace period
