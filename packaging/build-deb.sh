@@ -68,12 +68,16 @@ case "$PROFILE" in full|core) ;; *) echo "профиль должен быть f
 # shellcheck source=packaging/versions.env
 . "$REPO_ROOT/packaging/versions.env"
 
-# Версия MediaMTX — из docker-compose.yml, а не из versions.env: слой записи
-# тестируется в CI против бинарника ровно этой версии, и разъехавшись, пакет
-# повёз бы на объект непроверенный сервер.
-COMPOSE_MTX="$(grep -oP 'image:\s*bluenviron/mediamtx:\K\S+' "$REPO_ROOT/docker-compose.yml" | head -1)"
+# Версия MediaMTX — из mediamtx/Dockerfile, а не из versions.env: слой
+# записи тестируется в CI против бинарника ровно этой версии, и разъехавшись,
+# пакет повёз бы на объект непроверенный сервер. Раньше версия читалась из
+# `image: bluenviron/mediamtx:X` в docker-compose.yml; с переходом на
+# собираемый образ-обёртку (D01) эта строка исчезла, grep не находил ничего,
+# и сборка пакета падала. `|| true` — чтобы пустой результат дошёл до
+# понятного сообщения ниже, а не оборвал скрипт молча через pipefail.
+COMPOSE_MTX="$(grep -oP '^FROM\s+bluenviron/mediamtx:\K[0-9.]+' "$REPO_ROOT/mediamtx/Dockerfile" | head -1 || true)"
 if [ "$COMPOSE_MTX" != "$MEDIAMTX_VERSION" ]; then
-    echo "MediaMTX: docker-compose.yml=$COMPOSE_MTX, versions.env=$MEDIAMTX_VERSION." >&2
+    echo "MediaMTX: mediamtx/Dockerfile=${COMPOSE_MTX:-<не найдено>}, versions.env=$MEDIAMTX_VERSION." >&2
     echo "Обновите обе точки вместе с MEDIAMTX_SHA256 — иначе пакет и CI проверяют разные серверы." >&2
     exit 1
 fi
