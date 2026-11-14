@@ -276,6 +276,14 @@ services:
     # Dockerfile/образ не нужен (ТЗ 12: ежедневный автобэкап + ручной запуск).
     image: postgres:16-alpine
     container_name: facewatch-backup
+    # crond в роли PID 1 игнорирует SIGTERM: ядро не доставляет PID 1
+    # сигналы, для которых он не поставил обработчик, а BusyBox crond его не
+    # ставит. `docker compose stop` поэтому ждал 10 с и добивал контейнер
+    # SIGKILL'ом (код 137, DEPLOY_FINDINGS D09). init: true ставит PID 1
+    # docker-init (tini), который пересылает сигнал: проверено в отдельном
+    # PID-namespace — crond без него жив через 3 с после SIGTERM, под tini
+    # завершается за 0.01 с.
+    init: true
     logging: *default-logging
     depends_on:
       postgres:

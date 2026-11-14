@@ -26,7 +26,8 @@ EnvironmentFile=/etc/facewatch/backend.env
 # Только loopback: наружу приложение отдаёт nginx, он же держит TLS,
 # rate limiting и заголовки безопасности (SPEC §14).
 ExecStart=@PREFIX@/venv/backend/bin/uvicorn app.main:app \
-    --host 127.0.0.1 --port 8000 --log-config app/logging_config.json
+    --host 127.0.0.1 --port 8000 --log-config app/logging_config.json \
+    --timeout-graceful-shutdown 5
 # SPEC §13. Сторож живости внутри процесса выходит с кодом 17 на
 # заблокированном цикле событий — Restart=always отрабатывает и его.
 Restart=always
