@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { api, mediaUrl } from "../api";
 import { useWebSocket } from "../useWebSocket";
 import { isAlertEvent, playAlertBeep, shouldBeep } from "../alertSound";
+import { serverTimeMs } from "../timeZone";
 
 const PAGE = 60;
 
@@ -99,7 +100,9 @@ export function Wall() {
   });
 
   const ago = (iso: string) => {
-    const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+    // ts приходит UTC без суффикса (worker: ev.ts.isoformat()); new Date()
+    // прочёл бы его как местное и состарил бы событие на смещение пояса.
+    const s = Math.max(0, Math.floor((Date.now() - serverTimeMs(iso)) / 1000));
     if (s < 60) return `${s} сек`;
     if (s < 3600) return `${Math.floor(s / 60)} мин`;
     return `${Math.floor(s / 3600)} ч`;

@@ -13,9 +13,7 @@ import {
   Position,
   TimelineRange,
   TimelineSegment,
-  clockLabel,
   coverageBars,
-  dayWindow,
   formatArchiveTime,
   fractionToTime,
   locateAt,
@@ -25,6 +23,9 @@ import {
   recordedLabel,
   timeToFraction,
 } from "../archiveTimeline";
+import {
+  dayWindowUtc, formatMs, formatServerTime, localInputToUtc, todayInZone, utcToLocalInput,
+} from "../timeZone";
 
 /** Миниатюра кадра сегмента (ТЗ §7).
  *
@@ -284,9 +285,12 @@ export function Archive() {
   // Границы экспортируемого фрагмента (ТЗ §5). Держатся отдельно от
   // фильтров поиска: оператор ищет по часам, а выгружает минуты.
   const [exp, setExp] = useState({ from: "", to: "" });
-  // Сутки шкалы. В шкале архива, а не в поясе браузера: `video_segments`
-  // хранит UTC, и «сегодня» здесь — те же сутки, что и в записях.
-  const [day, setDay] = useState(() => new Date().toISOString().slice(0, 10));
+  // Сутки шкалы — в поясе объекта (настройка display_timezone), а не в
+  // UTC: до этого «сутки 28.10» на объекте в UTC+5 начинались в 05:00 по
+  // местным часам, и ночная запись оказывалась на шкале соседних суток.
+  // Поля дат на странице держат настенное время пояса; в UTC оно
+  // переводится только на границе с API (timeZone.ts).
+  const [day, setDay] = useState(() => todayInZone());
   const [tl, setTl] = useState<{
     ranges: TimelineRange[]; segments: TimelineSegment[];
     recorded_sec: number; truncated: boolean;
@@ -296,7 +300,10 @@ export function Archive() {
   const [pos, setPos] = useState<Position | null>(null);
   const [clockMs, setClockMs] = useState(NaN);
 
-  const { fromMs, toMs } = useMemo(() => dayWindow(day), [day]);
+  const { fromMs, toMs } = useMemo(() => {
+    const w = dayWindowUtc(day);
+    return { fromMs: parseArchiveTime(w.from), toMs: parseArchiveTime(w.to) };
+  }, [day]);
 
   useEffect(() => { api.cameras().then(setCams); search(); }, []);
 
@@ -329,17 +336,17 @@ export function Archive() {
   // Выбор сегмента подставляет его границы как начальное окно экспорта —
   // дальше оператор сужает их до нужного события.
   //
-  // Значения берутся из ответа API как есть и уходят обратно как есть, без
-  // преобразования часовых поясов: столбцы `video_segments` наивные и
-  // хранят UTC, и любой промежуточный `new Date()` сдвинул бы окно на
-  // смещение пояса браузера — выгрузился бы не тот отрезок.
+  // Границы из ответа API (UTC) показываются в поясе объекта и уходят в
+  // экспорт обратно в UTC (exportUrl). Через `new Date()` их не пропускать:
+  // строку без пояса браузер читает как местную, и выгрузился бы не тот
+  // отрезок — на смещение пояса браузера.
   useEffect(() => {
     if (!sel) return;
-    setExp({ from: String(sel.started_at).slice(0, 19), to: String(sel.ended_at ?? "").slice(0, 19) });
+    setExp({ from: utcToLocalInput(sel.started_at), to: utcToLocalInput(sel.ended_at) });
     // Выбранная строка — это ещё и «покажи мне вот это место шкалы»:
     // камера и сутки подтягиваются под неё, а сама позиция ставится
     // эффектом ниже, когда шкала этих суток загрузится.
-    setDay(String(sel.started_at).slice(0, 10));
+    setDay(utcToLocalInput(sel.started_at).slice(0, 10));
     setF(prev => (String(prev.camera_id) === String(sel.camera_id)
       ? prev : { ...prev, camera_id: String(sel.camera_id) }));
   }, [sel]);
@@ -354,7 +361,10 @@ export function Archive() {
 
   const search = async () => {
     const params: Record<string, string> = {};
-    Object.entries(f).forEach(([k, v]) => { if (v) params[k] = v; });
+    Object.entries(f).forEach(([k, v]) => {
+      if (!v) return;
+      params[k] = k === "date_from" || k === "date_to" ? localInputToUtc(v) : v;
+    });
     setSegs(await api.archive(params));
   };
 
@@ -367,8 +377,8 @@ export function Archive() {
   const exportUrl = (cameraId: number, from: string, to: string) => {
     const q = new URLSearchParams({
       camera_id: String(cameraId),
-      date_from: from,
-      date_to: to,
+      date_from: localInputToUtc(from),
+      date_to: localInputToUtc(to),
       token: getToken() ?? "",
     });
     return `/api/archive/export?${q}`;
@@ -418,7 +428,7 @@ export function Archive() {
               {segs.map(s => (
                 <tr key={s.id} style={{ cursor: "pointer", background: sel?.id === s.id ? "#222" : undefined }} onClick={() => setSel(s)}>
                   <td><SegThumb id={s.id} /></td>
-                  <td>{new Date(s.started_at).toLocaleString("ru-RU")}</td>
+                  <td>{formatServerTime(s.started_at)}</td>
                   <td>#{s.camera_id}</td>
                   <td>{s.event_type}</td>
                   <td>{s.duration_sec}с</td>
@@ -439,7 +449,7 @@ export function Archive() {
               <input type="date" value={day} onChange={e => setDay(e.target.value)}
                      style={{ width: 160 }} />
               <span className="empty" style={{ fontSize: 12 }}>
-                {clockLabel(clockMs)}
+                {formatMs(clockMs)}
               </span>
               {tl && (
                 <span className="empty" style={{ fontSize: 12 }}>
@@ -533,11 +543,11 @@ export function Archive() {
                   и ошибаются. */}
               <div className="seg-player-bar" style={{ marginTop: 6 }}>
                 <button className="btn sm" disabled={!Number.isFinite(clockMs)}
-                        onClick={() => setExp(p => ({ ...p, from: formatArchiveTime(clockMs) }))}>
+                        onClick={() => setExp(p => ({ ...p, from: utcToLocalInput(clockMs) }))}>
                   Начало отсюда
                 </button>
                 <button className="btn sm" disabled={!Number.isFinite(clockMs)}
-                        onClick={() => setExp(p => ({ ...p, to: formatArchiveTime(clockMs) }))}>
+                        onClick={() => setExp(p => ({ ...p, to: utcToLocalInput(clockMs) }))}>
                   Конец здесь
                 </button>
               </div>

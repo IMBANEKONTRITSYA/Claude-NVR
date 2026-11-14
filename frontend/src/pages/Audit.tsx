@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, getToken } from "../api";
 import { Pager } from "../Pager";
+import { formatServerTime, localInputToUtc } from "../timeZone";
 
 export function Audit() {
   const [rows, setRows] = useState<any[]>([]);
@@ -16,8 +17,9 @@ export function Audit() {
     const usp = new URLSearchParams();
     if (user) usp.set("username", user);
     if (action) usp.set("action", action);
-    if (from) usp.set("date_from", from);
-    if (to) usp.set("date_to", to);
+    // Поля datetime-local — настенное время в поясе объекта; API — UTC.
+    if (from) usp.set("date_from", localInputToUtc(from));
+    if (to) usp.set("date_to", localInputToUtc(to));
     usp.set("page", String(page));
     usp.set("page_size", String(PAGE_SIZE));
     api.raw(`/api/audit?${usp.toString()}`).then((r: any) => { setRows(r.items); setTotal(r.total); }).catch(() => {});
@@ -36,8 +38,9 @@ export function Audit() {
     const usp = new URLSearchParams({ token: getToken() || "" });
     if (user) usp.set("username", user);
     if (action) usp.set("action", action);
-    if (from) usp.set("date_from", from);
-    if (to) usp.set("date_to", to);
+    // Поля datetime-local — настенное время в поясе объекта; API — UTC.
+    if (from) usp.set("date_from", localInputToUtc(from));
+    if (to) usp.set("date_to", localInputToUtc(to));
     return `/api/audit/export.${ext}?${usp.toString()}`;
   };
 
@@ -61,7 +64,7 @@ export function Audit() {
           <tbody>
             {rows.map(r => (
               <tr key={r.id}>
-                <td>{new Date(r.ts).toLocaleString("ru-RU")}</td>
+                <td>{formatServerTime(r.ts)}</td>
                 <td>{r.username} <span className="muted">({r.role})</span></td>
                 <td>{r.action}</td>
                 <td>{r.method}</td>

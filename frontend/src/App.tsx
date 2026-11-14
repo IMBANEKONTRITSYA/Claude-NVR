@@ -1,6 +1,7 @@
 import { NavLink, Route, Routes, Navigate, useLocation, useNavigate } from "react-router-dom";
 import { Suspense, lazy, useCallback, useEffect, useState } from "react";
 import { api, getRole, getToken, getUser, isPasswordExpired } from "./api";
+import { setDisplayTimeZone } from "./timeZone";
 import { Login } from "./pages/Login";
 import { useInactivityLogout } from "./useInactivityLogout";
 import { canAccess, SECTION_ROLES, type Section } from "./access";
@@ -57,6 +58,19 @@ function Layout({ children }: { children: any }) {
     api.logout().finally(() => nav("/login?reason=inactive"));
   }, [nav]);
   useInactivityLogout(true, inactivityLogout);
+  // Пояс показа времени (настройка display_timezone) — до отрисовки
+  // страницы: иначе таблицы архива и журнала на долю секунды мелькали бы в
+  // UTC. Не загрузился — показ в UTC, как в API, а не в поясе браузера:
+  // время объекта не должно зависеть от того, откуда открыли интерфейс.
+  // Смена пояса в настройках применяется там же (Settings.tsx): страницы
+  // читают пояс при отрисовке, а открыта в SPA одна страница за раз.
+  const [tzReady, setTzReady] = useState(false);
+  useEffect(() => {
+    api.getClientSettings()
+      .then((c: any) => { setDisplayTimeZone(c?.display_timezone); })
+      .catch(() => {})
+      .finally(() => setTzReady(true));
+  }, []);
   return (
     <div className="layout">
       <aside className="sidebar">
@@ -105,7 +119,7 @@ function Layout({ children }: { children: any }) {
           <button className="btn secondary" style={{ width: "100%" }} onClick={logout}>Выйти</button>
         </div>
       </aside>
-      <main className="main">{children}</main>
+      <main className="main">{tzReady ? children : null}</main>
     </div>
   );
 }

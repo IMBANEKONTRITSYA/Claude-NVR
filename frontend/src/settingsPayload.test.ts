@@ -10,7 +10,7 @@ const BACKEND_KEYS = [
   "retention_days", "motion_threshold", "similarity_threshold", "detection_fps",
   "event_cooldown_sec", "alert_cooldown_sec", "telegram_bot_token",
   "telegram_chat_id", "smtp_host", "smtp_port", "smtp_user", "smtp_password",
-  "smtp_tls", "smtp_from", "alert_email_to", "alert_sound_enabled",
+  "smtp_tls", "smtp_from", "alert_email_to", "alert_sound_enabled", "display_timezone",
   "frame_skip", "motion_prefilter", "idle_fps", "face_model", "upscale_mode",
   "cluster_interval_min", "detect_width", "record_segment_min",
   "analytics_cameras_max", "disk_min_free_pct", "disk_warn_pct", "disk_crit_pct",
@@ -23,6 +23,7 @@ const FULL_FORM = {
   smtp_host: "smtp.object.local", smtp_port: "465", smtp_user: "nvr",
   smtp_password: "pass", smtp_tls: "ssl", smtp_from: "nvr@object.local",
   alert_email_to: "guard@object.local", alert_sound_enabled: "1",
+  display_timezone: "Asia/Yekaterinburg",
   frame_skip: "1", motion_prefilter: "1", idle_fps: "2", face_model: "buffalo_s",
   upscale_mode: "avatar", cluster_interval_min: "15", detect_width: "640",
   record_segment_min: "5", analytics_cameras_max: "2", disk_min_free_pct: "5",
@@ -32,6 +33,13 @@ const FULL_FORM = {
 describe("тело PUT /api/settings", () => {
   it("шлёт ровно те ключи, которые принимает бэкенд", () => {
     expect(Object.keys(settingsPayload(FULL_FORM)).sort()).toEqual([...BACKEND_KEYS].sort());
+  });
+
+  it("пустой пояс не отправляется, а не сбрасывается в пустую строку", () => {
+    // Пустая строка дала бы 400 на сохранение всей формы; отсутствующий
+    // ключ бэкенд оставляет прежним.
+    expect("display_timezone" in JSON.parse(JSON.stringify(settingsPayload({ ...FULL_FORM, display_timezone: "" })))).toBe(false);
+    expect(settingsPayload(FULL_FORM).display_timezone).toBe("Asia/Yekaterinburg");
   });
 
   it("приводит строки формы к числам", () => {

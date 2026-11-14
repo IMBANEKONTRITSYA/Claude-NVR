@@ -21,3 +21,6 @@ psutil==6.0.0
 # из DOCTYPE (billion laughs). Тот же пакет и по той же причине использует
 # worker/onvif_client.py.
 defusedxml==0.7.1
+# Пояс показа времени (services/display_timezone.py): база IANA для zoneinfo
+# там, где в системе её нет (slim-образы, portable-рантайм пакета).
+tzdata==2025.2

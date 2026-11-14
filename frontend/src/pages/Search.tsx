@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { api, mediaUrl, getToken } from "../api";
 import { useUI } from "../ui";
+import { formatServerTime, localInputToUtc } from "../timeZone";
 
 export function Search() {
   const { toast } = useUI();
@@ -26,8 +27,8 @@ export function Search() {
       const fd = new FormData();
       fd.append("file", file);
       fd.append("threshold", String(threshold));
-      if (dateFrom) fd.append("date_from", dateFrom);
-      if (dateTo) fd.append("date_to", dateTo);
+      if (dateFrom) fd.append("date_from", localInputToUtc(dateFrom));
+      if (dateTo) fd.append("date_to", localInputToUtc(dateTo));
       if (status) fd.append("status", status);
       const r = await api.searchFace(fd);
       setResults(r);
@@ -100,7 +101,7 @@ export function Search() {
                   <td>{r.name}</td>
                   <td>{r.status || "—"}</td>
                   <td>#{r.camera_id}</td>
-                  <td>{r.ts ? new Date(r.ts).toLocaleString("ru-RU") : "—"}</td>
+                  <td>{formatServerTime(r.ts)}</td>
                   <td><b style={{ color: r.similarity >= 0.6 ? "var(--green)" : "var(--orange)" }}>{(r.similarity * 100).toFixed(1)}%</b></td>
                   <td><button className="btn secondary" onClick={() => openSegment(r.segment_id)}>В архив</button></td>
                 </tr>

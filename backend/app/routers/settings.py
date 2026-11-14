@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from ..services.display_timezone import is_valid_timezone
 from ..db import get_db
 from ..models import Setting
 from ..auth import get_current_user, require_role
@@ -96,6 +97,9 @@ SCHEMA: dict[str, tuple] = {
     "disk_min_free_pct": (int, 1, 50),
     "disk_warn_pct": (int, 50, 99),
     "disk_crit_pct": (int, 50, 99),
+    # Пояс, в котором интерфейс показывает и принимает время (имя IANA).
+    # Хранение и API остаются в UTC — см. services/display_timezone.py.
+    "display_timezone": (str,),
 }
 
 ENUMS = {
@@ -108,7 +112,9 @@ ENUMS = {
 
 # Настройки, видимые интерфейсу под любой ролью (см. GET /api/settings/client).
 # Белый список: добавление ключа сюда — осознанное решение «это не секрет».
-CLIENT_SETTING_KEYS = frozenset({"alert_sound_enabled"})
+# display_timezone — здесь потому, что время показывают все роли (Стена у
+# наблюдателя тоже), а GET /api/settings — admin-only.
+CLIENT_SETTING_KEYS = frozenset({"alert_sound_enabled", "display_timezone"})
 
 assert not (CLIENT_SETTING_KEYS & SECRET_SETTING_KEYS), (
     "секретная настройка не может отдаваться через /api/settings/client"
@@ -152,6 +158,7 @@ class SettingsUpdate(BaseModel):
     disk_min_free_pct: int | None = None
     disk_warn_pct: int | None = None
     disk_crit_pct: int | None = None
+    display_timezone: str | None = None
 
 
 def _visible(rows) -> dict[str, str]:
@@ -204,6 +211,8 @@ async def update_settings(payload: SettingsUpdate, _=Depends(require_role("admin
             lo, hi = spec[1], spec[2]
             if not (lo <= casted <= hi):
                 raise HTTPException(400, f"{key} должно быть в диапазоне [{lo}, {hi}]")
+        if key == "display_timezone" and not is_valid_timezone(casted):
+            raise HTTPException(400, "display_timezone: неизвестный часовой пояс (ожидается имя IANA, например Europe/Moscow)")
         allowed = ENUMS.get(key)
         if allowed and casted not in allowed:
             raise HTTPException(400, f"{key}: допустимые значения — {', '.join(sorted(allowed))}")
