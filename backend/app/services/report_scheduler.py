@@ -27,6 +27,7 @@ from sqlalchemy import select
 
 from ..db import SessionLocal
 from ..models import ReportSchedule, Setting
+from .display_timezone import DEFAULT_TIMEZONE, load_display_timezone, local_to_utc, utc_to_local
 from .encryption import decrypt_setting, SECRET_SETTING_KEYS
 from .mailer import MailerError, send_email
 from .reports import build_report, kind_title
@@ -72,11 +73,24 @@ def previous_slot(sched: ReportSchedule, now: datetime) -> datetime | None:
     return None
 
 
-def is_due(sched: ReportSchedule, now: datetime) -> bool:
-    """Пора ли отправлять: слот наступил и ещё не закрыт."""
+def slot_utc(sched: ReportSchedule, now: datetime, tz: str = DEFAULT_TIMEZONE) -> datetime | None:
+    """Последний наступивший слот в UTC без пояса; `now` — тоже UTC.
+
+    «08:00» в расписании — время ОБЪЕКТА (настройка display_timezone), а не
+    часов процесса. Раньше слот считался от `datetime.now()`, а в контейнере
+    часы идут в UTC: на объекте в UTC+5 «утренний отчёт в 08:00» приходил в
+    13:00. Поэтому слот строится по стенному времени объекта и переводится
+    в UTC — в том же поясе хранится и `last_sent_at`, как всё время в БД.
+    """
+    slot = previous_slot(sched, utc_to_local(now, tz))
+    return None if slot is None else local_to_utc(slot, tz)
+
+
+def is_due(sched: ReportSchedule, now: datetime, tz: str = DEFAULT_TIMEZONE) -> bool:
+    """Пора ли отправлять: слот наступил и ещё не закрыт. `now` — UTC."""
     if not sched.enabled or sched.period not in PERIODS:
         return False
-    slot = previous_slot(sched, now)
+    slot = slot_utc(sched, now, tz)
     if slot is None:
         return False
     return sched.last_sent_at is None or sched.last_sent_at < slot
@@ -124,7 +138,7 @@ async def run_due(now: datetime | None = None, session_factory=None) -> int:
     Причина отказа сохраняется в `last_error` и видна в интерфейсе — без
     этого «отчёт не приходит» диагностировался бы только по логам сервера.
     """
-    now = now or datetime.now()
+    now = now or datetime.utcnow()
     sent = 0
     async with (session_factory or SessionLocal)() as db:
         # FOR UPDATE держит строки до конца прохода: §17 допускает вторую
@@ -136,7 +150,8 @@ async def run_due(now: datetime | None = None, session_factory=None) -> int:
         rows = (await db.execute(
             select(ReportSchedule).where(ReportSchedule.enabled.is_(True)).with_for_update()
         )).scalars().all()
-        due = [s for s in rows if is_due(s, now)]
+        tz = await load_display_timezone(db)
+        due = [s for s in rows if is_due(s, now, tz)]
         if not due:
             return 0
         cfg = await _smtp_config(db)
@@ -159,7 +174,7 @@ async def run_due(now: datetime | None = None, session_factory=None) -> int:
             if ok:
                 # Момент СЛОТА, а не now: иначе тик, случившийся на минуту
                 # позже, сдвигал бы точку отсчёта и слот мог закрыться дважды.
-                sched.last_sent_at = previous_slot(sched, now)
+                sched.last_sent_at = slot_utc(sched, now, tz)
                 sched.last_error = None
                 sent += 1
                 logger.info("отчёт отправлен по расписанию",

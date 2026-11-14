@@ -12,6 +12,7 @@ from ..models import AuditLog
 from ..auth import require_role, require_role_query
 from ..pagination import PageParams
 from ..services import csv_export
+from ..services.display_timezone import format_local, load_display_timezone, zone_header
 
 
 router = APIRouter(prefix="/api/audit", tags=["audit"])
@@ -78,8 +79,14 @@ async def _all_rows(db: AsyncSession, username, action, date_from, date_to, hard
 HEADER = ["Время", "Пользователь", "Роль", "Действие", "Метод", "Путь", "Код", "IP"]
 
 
-def _row_tuple(r):
-    return [r.ts.isoformat() if r.ts else "", r.username, r.role, r.action, r.method, r.path, r.status_code, r.ip or ""]
+def _header(tz: str) -> list[str]:
+    # Время в выгрузке — в поясе объекта, и пояс назван в заголовке:
+    # файл читают без интерфейса под рукой (services/display_timezone.py).
+    return [zone_header(HEADER[0], tz), *HEADER[1:]]
+
+
+def _row_tuple(r, tz: str):
+    return [format_local(r.ts, tz), r.username, r.role, r.action, r.method, r.path, r.status_code, r.ip or ""]
 
 
 @router.get("/export.csv")
@@ -90,11 +97,12 @@ async def export_csv(
     db: AsyncSession = Depends(get_db),
 ):
     rows = await _all_rows(db, username, action, date_from, date_to)
+    tz = await load_display_timezone(db)
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(HEADER)
+    w.writerow(_header(tz))
     for r in rows:
-        w.writerow(_row_tuple(r))
+        w.writerow(_row_tuple(r, tz))
     buf.seek(0)
     # Байты, а не строка: кодировку журнала задаёт `csv_export.encode`
     # (UTF-8 с BOM — иначе Excel читает кириллические «Время»,
@@ -113,12 +121,13 @@ async def export_xlsx(
     db: AsyncSession = Depends(get_db),
 ):
     rows = await _all_rows(db, username, action, date_from, date_to)
+    tz = await load_display_timezone(db)
     wb = Workbook()
     ws = wb.active
     ws.title = "Аудит"
-    ws.append(HEADER)
+    ws.append(_header(tz))
     for r in rows:
-        ws.append(_row_tuple(r))
+        ws.append(_row_tuple(r, tz))
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
