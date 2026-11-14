@@ -31,3 +31,6 @@ dump.rdb
 # Тесты и бенчмарки запускают его из своего каталога (cwd=), это страховка.
 auto.crt
 auto.key
+
+# Личные настройки Claude Code (не общие для проекта)
+.claude/settings.local.json
