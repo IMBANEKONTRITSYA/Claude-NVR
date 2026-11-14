@@ -41,6 +41,32 @@ class RedactedAccessFormatter(AccessFormatter):
         )
         return super().formatMessage(recordcopy)
 
+
+def _redact(value):
+    return _TOKEN_QS_RE.sub(r"\1REDACTED", value) if isinstance(value, str) else value
+
+
+class RedactTokenFilter(logging.Filter):
+    """Вырезает значение ?token=... из ЛЮБОЙ записи, прошедшей через обработчик.
+
+    `RedactedAccessFormatter` выше закрывает только `uvicorn.access`, а
+    рукопожатие WebSocket uvicorn пишет другим логгером — `uvicorn.error`:
+    `"WebSocket /ws/faces?token=<JWT>" [accepted]` (и `403` на отказе).
+    Стена (§15) и статусы камер открывают WS с токеном в query на каждом
+    входе, поэтому действующий JWT оседал в журнале backend на каждой
+    вкладке оператора (DEPLOY_FINDINGS D10, развёртывание 2026-10-28).
+    Фильтр стоит на обработчике, а не на логгере: так его не обходит ни
+    одно имя логгера, которое uvicorn заведёт в следующей версии.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(_redact(a) for a in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {k: _redact(v) for k, v in record.args.items()}
+        return True
+
 # Стандартные атрибуты LogRecord — всё, что сверх них в record.__dict__,
 # считается пользовательским полем (передано через logging.info(..., extra={...})).
 _STANDARD_ATTRS = frozenset(
