@@ -1,4 +1,5 @@
 import os
+import time
 import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
@@ -12,7 +13,7 @@ from ..auth import require_role, require_role_query, get_current_user, get_user_
 from ..schemas import (OnvifBulkAddRequest, OnvifDescribeRequest, CameraIn, CameraOut,
                        OnvifProfilesRequest, OnvifStreamUriRequest, PtzMoveIn,
                        PtzPresetGotoIn, PtzPresetSaveIn, ROIIn, RtspTest)
-from ..services import camera_config, csv_export
+from ..services import camera_config, csv_export, live_preview
 from ..services.encryption import encrypt, decrypt
 from ..services.pubsub import get_redis
 
@@ -242,20 +243,33 @@ async def put_roi(cam_id: int, payload: ROIIn, _=Depends(require_role("admin", "
 
 
 @router.get("/{cam_id}/snapshot")
-async def snapshot(cam_id: int, _=Depends(get_user_from_query_token)):
-    """Последний кадр камеры (Стена, дашборд) — токен в query, потому что
-    <img src> не умеет слать заголовок Authorization.
+async def snapshot(cam_id: int, _=Depends(get_user_from_query_token), db: AsyncSession = Depends(get_db)):
+    """Кадр камеры (Стена, дашборд, запасной путь живого просмотра) — токен
+    в query, потому что <img src> не умеет слать заголовок Authorization.
 
     Роль не проверяется намеренно: матрица прав ТЗ разрешает живой просмотр
     всем трём ролям, тот же контракт, что у hls_auth(). Но существование
     учётной записи проверяется по БД, а не одной лишь подписью токена, —
     иначе удалённый пользователь продолжал бы смотреть кадры со всех камер
     до истечения access-токена.
+
+    Кадр — свежий кадр аналитики, а у камер без неё (record_only) — снимок
+    с RTSP-пути MediaMTX по запросу (services/live_preview.py, D04). Камера
+    сверяется с БД до снимка: он запускает ffmpeg, и перебор чужих номеров
+    иначе запускал бы его на каждый.
     """
-    path = os.path.join(settings.MEDIA_PATH, "snapshots", f"cam{cam_id}_latest.jpg")
-    if not os.path.exists(path):
+    cam = await db.get(Camera, cam_id)
+    if cam is None:
+        raise HTTPException(404, "Камера не найдена")
+    path = await live_preview.snapshot_for(cam_id)
+    if path is None:
         raise HTTPException(404, "Нет кадра")
-    return FileResponse(path, media_type="image/jpeg")
+    age = max(0, int(time.time() - os.path.getmtime(path)))
+    # no-store: плитка сама перезапрашивает кадр, а кэш браузера держал бы
+    # старый под тем же адресом. Возраст — чтобы подпись «кадр N с назад»
+    # не гадала.
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store", "X-Snapshot-Age": str(age)})
 
 
 @router.get("/{cam_id}/hls")

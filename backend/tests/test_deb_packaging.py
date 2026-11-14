@@ -553,3 +553,28 @@ def test_build_script_guards_both_produced_nginx_files():
             rf"grep -q 'facewatch-backend\\\|facewatch-mediamtx'[^\n]*{re.escape(produced)}",
             script,
         ), f"в build-deb.sh нет сторожа docker-имён для собранного {produced}"
+
+
+def test_mediamtx_unit_does_not_read_the_shared_env():
+    """Юнит MediaMTX не читает общий facewatch.env.
+
+    MediaMTX (наследие rtsp-simple-server) разбирает переменные окружения с
+    префиксом RTSP_ как свои настройки. В facewatch.env лежит
+    RTSP_ENCRYPTION_KEY — ключ шифрования учёток камер, — и MediaMTX,
+    получив его, не стартует: «RTSP_ENCRYPTION: json: Unmarshal(nil
+    *conf.alias)» (снято на 1.16.1). Сейчас юнит читает свой mediamtx.env, и
+    это разделение — не вкус, а условие запуска слоя записи; сторож держит
+    его от «упрощения» до одного общего файла.
+    """
+    unit = (PKG / "deb" / "systemd" / "facewatch-mediamtx.service").read_text(encoding="utf-8")
+    env_files = re.findall(r"^EnvironmentFile=-?(\S+)", unit, re.MULTILINE)
+    assert env_files, "у юнита MediaMTX нет EnvironmentFile — откуда пароль Control API?"
+    assert all(not f.endswith("/facewatch.env") for f in env_files), (
+        f"юнит MediaMTX читает {env_files}: RTSP_ENCRYPTION_KEY из facewatch.env уронит его при старте"
+    )
+    # mediamtx.env пишет скрипт первого запуска — проверяется его here-doc.
+    first_run = (PKG / "deb" / "scripts" / "facewatch-first-run").read_text(encoding="utf-8")
+    m = re.search(r'cat > "\$ETC/mediamtx\.env" <<EOF\n(.*?)\nEOF', first_run, re.S)
+    assert m, "не найдено, где facewatch-first-run пишет mediamtx.env"
+    bad = [l for l in m.group(1).splitlines() if re.match(r"\s*RTSP_", l)]
+    assert not bad, f"в mediamtx.env переменные RTSP_*: {bad}"
