@@ -95,13 +95,17 @@ def test_forecast_uses_measured_consumption_when_available(client, admin_headers
                                                            make_camera, seed_segments):
     """Прогноз считается по фактическому расходу, а не по номиналу.
 
-    Смысловая проверка фичи: 10 ГБ за последние сутки при свободных
-    `disk_free_gb` дают ровно `disk_free_gb / 10` дней. Если бы прогноз
-    брался с номинала (2 Mbps × 10.8 = 21.6 ГБ/сутки на камеру), число
-    было бы примерно вдвое меньше.
+    Смысловая проверка фичи: 10 ГБ записи, покрывающей сутки, при свободных
+    `disk_free_gb` дают `disk_free_gb / 10` дней. Если бы прогноз брался с
+    номинала (2 Mbps × 10.8 = 21.6 ГБ/сутки на камеру), число было бы
+    примерно вдвое меньше.
+
+    До цикла 65 здесь засевались два пятиминутных сегмента — и тест
+    закреплял дефект D07: 10 ГБ за 10 минут считались «10 ГБ в сутки».
     """
     cam = make_camera("storage-measured")
-    seed_segments(cam["id"], [5 * GB, 5 * GB])
+    seed_segments(cam["id"], [5 * GB], hours_ago_start=23.9)
+    seed_segments(cam["id"], [5 * GB], hours_ago_start=0.2)
 
     d = client.get("/api/system/storage", headers=admin_headers).json()
     assert d["forecast_source"] == "measured"
@@ -119,11 +123,13 @@ def test_old_segments_do_not_count_toward_daily_consumption(client, admin_header
     суток, который в `measured` попасть не должен.
     """
     cam = make_camera("storage-window")
-    seed_segments(cam["id"], [3 * GB], hours_ago_start=1)
+    seed_segments(cam["id"], [1 * GB], hours_ago_start=2)
+    seed_segments(cam["id"], [2 * GB], hours_ago_start=0.5)
     fresh = client.get("/api/system/storage", headers=admin_headers).json()
     seed_segments(cam["id"], [50 * GB], hours_ago_start=48)
     after = client.get("/api/system/storage", headers=admin_headers).json()
 
+    assert fresh["forecast_source"] == "measured", "проверка без измеренного расхода ничего не доказывает"
     assert after["measured_gb_per_day"] == pytest.approx(fresh["measured_gb_per_day"], abs=0.1)
     # Но в общий объём архива старый сегмент входит.
     assert after["archive_gb"] > fresh["archive_gb"] + 40
@@ -295,3 +301,68 @@ def test_camera_retention_bounds_are_enforced(client, admin_headers, make_camera
         assert r.status_code == 422, f"retention_days={bad} → {r.status_code}"
         if r.status_code == 200:
             make_camera.adopt(r.json()["id"])
+
+
+def test_half_an_hour_of_recording_is_not_a_daily_rate(client, admin_headers,
+                                                       make_camera, seed_segments):
+    """D07: полчаса записи — это полчаса, а не сутки.
+
+    DEPLOY_FINDINGS 2026-10-28: после нескольких минут записи прогноз
+    обещал «сотни суток» — сумма байт за полчаса шла как суточный расход.
+    1 ГБ за ~30 минут — это ~48 ГБ в сутки, а не 1.
+    """
+    cam = make_camera("storage-30min")
+    sizes = [GB // 6] * 6                      # шесть пятиминуток подряд ≈ 1 ГБ
+    for i, size in enumerate(sizes):
+        seed_segments(cam["id"], [size], hours_ago_start=0.6 - i * 5 / 60)
+    d = client.get("/api/system/storage", headers=admin_headers).json()
+    assert d["forecast_source"] == "measured"
+    assert d["forecast_basis_hours"] == pytest.approx(0.5, abs=0.05)
+    assert d["measured_gb_per_day"] == pytest.approx(48.0, rel=0.1), (
+        f"{d['measured_gb_per_day']} ГБ/сутки — полчаса записи посчитаны за сутки"
+    )
+
+
+def test_a_few_minutes_fall_back_to_nominal(client, admin_headers, make_camera, seed_segments):
+    """Меньше 10 минут записи — номинал: по одному сегменту прогноз не строят."""
+    cam = make_camera("storage-5min")
+    seed_segments(cam["id"], [GB // 6], hours_ago_start=0.2)
+    d = client.get("/api/system/storage", headers=admin_headers).json()
+    if d["forecast_basis_hours"] < 10 / 60:
+        assert d["forecast_source"] == "nominal"
+
+
+def test_measured_rate_formula():
+    from app.services.storage import measured_bytes_per_day
+    assert measured_bytes_per_day(GB, 1800) == pytest.approx(48 * GB)
+    assert measured_bytes_per_day(GB, 300) is None           # мало записи
+    assert measured_bytes_per_day(0, 3600) is None
+    assert measured_bytes_per_day(10 * GB, 2 * 86400) == pytest.approx(10 * GB)  # окно не длиннее суток
+
+
+def _fake_proc(tmp_path, version: str, mounts: str):
+    (tmp_path / "version").write_text(version)
+    (tmp_path / "mounts").write_text(mounts)
+    return str(tmp_path / "version"), str(tmp_path / "mounts")
+
+
+def test_wsl_virtual_disk_is_flagged(tmp_path):
+    from app.services.storage import wsl_virtual_disk_note
+    v, m = _fake_proc(tmp_path, "Linux version 6.6.87.2-microsoft-standard-WSL2 ...",
+                      "overlay / overlay rw 0 0\n/dev/sdd /media ext4 rw,relatime 0 0\n")
+    note = wsl_virtual_disk_note("/media", v, m)
+    assert note and "WSL2" in note
+
+
+def test_windows_folder_bind_mount_is_not_flagged(tmp_path):
+    """Каталог Windows, смонтированный в контейнер, показывает настоящее место."""
+    from app.services.storage import wsl_virtual_disk_note
+    v, m = _fake_proc(tmp_path, "Linux version 6.6.87.2-microsoft-standard-WSL2 ...",
+                      "overlay / overlay rw 0 0\nC:\\134 /media 9p rw 0 0\n")
+    assert wsl_virtual_disk_note("/media", v, m) is None
+
+
+def test_plain_linux_is_not_flagged(tmp_path):
+    from app.services.storage import wsl_virtual_disk_note
+    v, m = _fake_proc(tmp_path, "Linux version 6.8.0-45-generic (Ubuntu)", "/dev/sda1 / ext4 rw 0 0\n")
+    assert wsl_virtual_disk_note("/var/lib/facewatch/media", v, m) is None
